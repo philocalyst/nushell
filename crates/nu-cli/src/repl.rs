@@ -7,7 +7,7 @@ use crate::prompt_update::{
 };
 use crate::{
     NuHighlighter, NuValidator, NushellPrompt,
-    completions::{NarrowingCache, NuCompleter},
+    completions::{NarrowingCache, NuCompleter, flush_completion_warnings},
     hints::ExternalHinter,
     prompt_update,
     reedline_config::{KeybindingsMode, add_menus, create_keybindings},
@@ -795,6 +795,9 @@ fn loop_iteration(ctx: LoopContext) -> (bool, Stack, Reedline) {
     let mut stack = Arc::unwrap_or_clone(stack_arc);
 
     perf!("line_editor setup", start_time, use_color);
+
+    // Flush queued deprecation warnings.
+    flush_completion_warnings(engine_state, &stack);
 
     let line_editor_input_time = Instant::now();
     match input {

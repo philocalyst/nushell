@@ -6,6 +6,7 @@ use nu_protocol::{FromValue, shell_error::generic::GenericError};
 use crate::completions::{
     Buffer, CommandCompletion, CommandScope, Completer, CompletionEngine, DeclaredInputs,
     DirectoryCompletion, EnvVarCompletion, FileCompletion, SemanticSuggestion, VariableCompletion,
+    flush_completion_warnings,
 };
 
 #[derive(Debug, Clone, FromValue)]
@@ -135,7 +136,7 @@ completions, which is the supported way to develop and test a completer from ins
             }
 
             return Ok(CompletionEngine::new(engine_state, stack)
-                .completer_input_at(&buffer, cursor_position, DeclaredInputs::all())
+                .completer_input_at(&buffer, cursor_position, DeclaredInputs::all(), None)
                 .into_pipeline_data());
         }
 
@@ -187,6 +188,9 @@ completions, which is the supported way to develop and test a completer from ins
             &buffer,
             cursor_position,
         );
+
+        // Flush warnings now.
+        flush_completion_warnings(engine_state, stack);
 
         let result_values: Vec<Value> = completions
             .into_iter()
