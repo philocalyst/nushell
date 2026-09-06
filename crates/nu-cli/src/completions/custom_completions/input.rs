@@ -269,8 +269,8 @@ impl DeclaredInputs {
     }
 }
 
-/// The token the cursor is on, as `{text, kind, span}`.
-fn token_value(context: &Context) -> Value {
+/// Token text/span/kind; `replacing` overrides token span for menus.
+fn token_value(context: &Context, replacing: Option<reedline::Span>) -> Value {
     let span = context.span;
     let tokens = context
         .contexts
@@ -278,36 +278,54 @@ fn token_value(context: &Context) -> Value {
         .map(|level| context_tokens(context, level))
         .unwrap_or_default();
 
-    locate(&tokens, context.buffer.len())
+    let at_cursor = locate(&tokens, context.buffer.len())
         .map(|(index, _)| index)
         .or_else(|| tokens.len().checked_sub(1))
-        .and_then(|index| tokens.get(index))
-        .map(|token| token.to_value(span))
-        .unwrap_or_else(|| Value::nothing(span))
+        .and_then(|index| tokens.get(index));
+
+    let Some(range) = replacing else {
+        return at_cursor
+            .map(|token| token.to_value(span))
+            .unwrap_or_else(|| Value::nothing(span));
+    };
+
+    // Only the text up to the cursor is parsed, so that is as far as the range can be read.
+    let end = range.end.min(context.buffer.len());
+    Token {
+        text: Some(Cow::Borrowed(
+            context.buffer.get(range.start..end).unwrap_or_default(),
+        )),
+        kind: at_cursor.map_or("value", |token| token.kind),
+        at: Some((range.start, range.end)),
+    }
+    .to_value(span)
 }
 
-/// Where the cursor is: `cursor`, `target`, and the resolved site.
-fn place_of(context: &Context) -> Value {
+/// Place with cursor, target, and site.
+fn place_of(context: &Context, replacing: Option<reedline::Span>) -> Value {
     let span = context.span;
-    let replacing = to_reedline_span(context.span, context.offset);
+    let target = replacing.unwrap_or_else(|| to_reedline_span(context.span, context.offset));
     place_value(
         context,
         Value::int(context.buffer.len() as i64, span),
-        span_record(replacing.start, replacing.end, span),
+        span_record(target.start, target.end, span),
     )
 }
 
-/// The record a completer receives, carrying exactly the fields it declared (see
-/// [`DeclaredInputs`]). Each is bound to the like-named parameter.
-pub(crate) fn completer_input(context: &Context, wanted: DeclaredInputs) -> Value {
+/// Input record with only declared fields.
+pub(crate) fn completer_input(
+    context: &Context,
+    wanted: DeclaredInputs,
+    replacing: Option<reedline::Span>,
+) -> Value {
     let span = context.span;
     let mut record = Record::new();
 
     if wanted.token {
-        record.insert("token", token_value(context));
+        record.insert("token", token_value(context, replacing));
     }
     if wanted.place {
-        record.insert("place", place_of(context));
+        record.insert("place", place_of(context, replacing));
     }
     if wanted.buffer {
         record.insert("buffer", Value::string(context.buffer, span));

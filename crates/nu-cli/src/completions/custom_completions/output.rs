@@ -23,11 +23,6 @@ pub(crate) fn report(message: impl AsRef<str>) {
     log::error!("nu::shell::completion: {}", message.as_ref());
 }
 
-/// Log a non-fatal compatibility warning without disrupting line editing.
-pub(crate) fn warn(message: impl AsRef<str>) {
-    log::warn!("nu::shell::completion: {}", message.as_ref());
-}
-
 /// Convert a completer result field, logging conversion failures.
 fn read_part<T: FromValue>(value: Value, what: &str) -> Option<T> {
     T::from_value(value)
@@ -55,29 +50,26 @@ impl From<Text> for String {
     }
 }
 
-/// A record a completer returns, read strictly: only the keys it declares are accepted, so
-/// a misspelled one is reported rather than silently doing nothing. Implemented solely by
-/// [`returned_record!`], which derives [`Self::KEYS`] from the same fields [`FromValue`]
-/// reads, so the two cannot drift apart.
+/// Record returned by completer with exact accepted keys.
 trait ReturnedRecord: FromValue {
     /// What to call it in a message.
     const LABEL: &'static str;
     /// Every key accepted, whether read into a field or merely tolerated.
     const KEYS: &'static [&'static str];
 
-    /// Read one, reporting an unknown key or a value that does not fit.
+    /// Read one; unknown keys warned and ignored.
     fn read(value: Value) -> Option<Self> {
-        if let Ok(record) = value.as_record()
-            && let Some(unknown) = record
+        if let Ok(record) = value.as_record() {
+            for unknown in record
                 .columns()
-                .find(|column| !Self::KEYS.contains(&column.as_str()))
-        {
-            report(format!(
-                "a {} has no `{unknown}` field; expected one of {}",
-                Self::LABEL,
-                Self::KEYS.join(", ")
-            ));
-            return None;
+                .filter(|column| !Self::KEYS.contains(&column.as_str()))
+            {
+                report(format!(
+                    "a {} has no `{unknown}` field, so it is ignored; expected one of {}",
+                    Self::LABEL,
+                    Self::KEYS.join(", ")
+                ));
+            }
         }
 
         read_part(value, Self::LABEL)
@@ -226,7 +218,8 @@ impl Returned {
                 .find(|column| !ENVELOPE_KEYS.contains(&column.as_str()))
             {
                 report(format!(
-                    "a completion envelope has no `{unknown}` field; expected one of {}",
+                    "a completion envelope has no `{unknown}` field, so it is ignored; \
+                     expected one of {}",
                     ENVELOPE_KEYS.join(", ")
                 ));
             }
@@ -248,18 +241,10 @@ impl Returned {
         match value {
             Value::Nothing { .. } => None,
             Value::List { vals, .. } => bare(vals.into_owned()),
-            record @ Value::Record { .. } => bare(vec![record]),
-            // A list is many suggestions and a record is one, so a bare value is neither —
-            // a mistake, not a shorthand. Its elements would have coerced inside a list.
-            other => {
-                report(format!(
-                    "a completer must return a list of completions, a record of \
-                     {{completions?, options?, fallback?}} or one suggestion, or null to \
-                     decline; got {}",
-                    other.get_type()
-                ));
-                bare(Vec::new())
-            }
+            // A list is many suggestions and anything else is one. A picker returns the item
+            // it was given, not a list of one: `input list` and `fzf` both answer with a bare
+            // string, and rejecting it would cost the completion the user just chose.
+            one => bare(vec![one]),
         }
     }
 }
