@@ -40,16 +40,12 @@ fn documented_completer_examples_declare_a_typed_token() -> Result {
     Ok(())
 }
 
-fn completion_log(source: &str) -> Result<String> {
+/// Everything `source` wrote to stderr, run with no logging beyond `extra`.
+fn completion_stderr(source: &str, extra: &[&str]) -> Result<String> {
     let output = Command::new(cargo_bin!())
-        .args([
-            "--no-config-file",
-            "--no-std-lib",
-            "--log-level",
-            "error",
-            "-c",
-            source,
-        ])
+        .args(["--no-config-file", "--no-std-lib"])
+        .args(extra)
+        .args(["-c", source])
         .output()?;
 
     assert!(
@@ -60,15 +56,15 @@ fn completion_log(source: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
+fn completion_log(source: &str) -> Result<String> {
+    completion_stderr(source, &["--log-level", "error"])
+}
+
 /// Malformed completer results are logged without failing the shell.
 #[rstest]
 #[case::block_failed(
     "error make { msg: 'completer exploded' }",
     &["failed to eval completer block", "completer exploded"]
-)]
-#[case::not_a_list(
-    "'not a list'",
-    &["must return a list of completions", "got string"]
 )]
 #[case::completions_field_unusable(
     "{completions: 'nope'}",
@@ -94,6 +90,55 @@ fn a_completers_mistake_is_explained_in_the_log(
             "the log never mentioned {fragment:?}\nfull log: {log}"
         );
     }
+    Ok(())
+}
+
+/// Unknown field still offered.
+#[test]
+fn a_suggestion_with_an_unknown_field_is_still_offered() -> Result {
+    let source = completing_with("", "[{value: alpha, display: 'alpha (a)'}]");
+
+    assert_eq!(test().run::<Vec<String>>(&source)?, ["alpha"]);
+    Ok(())
+}
+
+/// Bare value is one suggestion.
+#[test]
+fn a_bare_value_is_read_as_one_suggestion() -> Result {
+    let source = completing_with("", "'alpha'");
+
+    assert_eq!(test().run::<Vec<String>>(&source)?, ["alpha"]);
+    Ok(())
+}
+
+/// Legacy positional bridge warns once.
+#[test]
+fn the_legacy_positional_bridge_warns_once_without_a_log_level() -> Result {
+    let complete = "'use-it a' | commandline complete | ignore";
+    let stderr = completion_stderr(
+        &format!(
+            "def comp [context: string, pos: int] {{ [alpha] }}\n\
+             def use-it [arg: string@comp] {{ $arg }}\n\
+             {complete}\n{complete}"
+        ),
+        &[],
+    )?;
+
+    assert!(
+        stderr.contains("Positional completer input deprecated"),
+        "the bridge warned silently: {stderr}"
+    );
+    assert!(
+        stderr.contains("`context`, `pos`"),
+        "the warning never named the parameters to migrate: {stderr}"
+    );
+    assert_eq!(
+        stderr
+            .matches("Positional completer input deprecated")
+            .count(),
+        1,
+        "a completer must not warn again on every use: {stderr}"
+    );
     Ok(())
 }
 

@@ -384,8 +384,9 @@ fn custom_completions_override_span(
 // A string field takes anything that coerces, as it did before it was declared.
 #[case::coerced_description("{value: alpha, description: 5}", vec!["alpha", "beta"])]
 #[case::coerced_extra("{value: alpha, extra: [1 2]}", vec!["alpha", "beta"])]
-// A key no suggestion has is reported, and costs that suggestion only.
-#[case::unknown_key("{value: alpha, discription: hi}", vec!["beta"])]
+// Unknown keys ignored; carapace display field tolerated.
+#[case::unknown_key("{value: alpha, discription: hi}", vec!["alpha", "beta"])]
+#[case::carapace_display("{value: alpha, display: 'alpha (a)'}", vec!["alpha", "beta"])]
 // `--detailed` emits these beside a suggestion, so its output pipes straight back in.
 #[case::echoed_keys("{value: alpha, kind: {Value: string}, type: string}", vec!["alpha", "beta"])]
 fn a_malformed_part_costs_only_that_part(#[case] first: &str, #[case] expected: Vec<&str>) {
@@ -1130,19 +1131,95 @@ fn external_completer_is_interactive_through_the_command_it_calls() {
     );
 }
 
-/// Suppress completions for invalid values
+/// Interactive completer caches answer per line.
 #[test]
-fn customcompletions_invalid() {
+fn an_interactive_completer_runs_once_per_line() {
     let (_, _, mut engine, mut stack) = new_engine();
-    let command = "
-        def comp [] { 123 }
+    let command = "\
+        @interactive
+        def comp [token] { [$'($token.text)(random chars --length 8)'] }
         def my-command [arg: string@comp] {}";
     assert!(support::merge_input(command.as_bytes(), &mut engine, &mut stack).is_ok());
     let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
 
-    let completion_str = "my-command foo";
+    let answered = |completer: &mut NuCompleter, line: &str| {
+        let suggestions = completer.complete_blocking(line, line.len());
+        assert_eq!(suggestions.len(), 1, "the picker answered {suggestions:?}");
+        suggestions[0].value.clone()
+    };
+
+    let asked = answered(&mut completer, "my-command ");
+    assert_eq!(
+        answered(&mut completer, "my-command "),
+        asked,
+        "the picker was put back on screen for a line it had already answered"
+    );
+    assert_ne!(
+        answered(&mut completer, "my-command a"),
+        asked,
+        "a different line is a new question"
+    );
+}
+
+/// Cancelled interactive completer offers nothing.
+#[rstest]
+#[case::block_failed("error make {msg: 'cancelled'}")]
+#[case::returned_null("null")]
+fn a_cancelled_interactive_completer_offers_nothing(#[case] body: &str) {
+    // A command-wide completer, so declining would fall through to file completion.
+    let (_, _, mut engine, mut stack) = new_engine();
+    let command = format!(
+        "@interactive
+         def comp [token] {{ {body} }}
+         @complete comp
+         def my-command [arg: string] {{}}"
+    );
+    assert!(support::merge_input(command.as_bytes(), &mut engine, &mut stack).is_ok());
+    let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
+
+    let line = "my-command ";
+    let suggestions = completer.complete_blocking(line, line.len());
+    assert!(
+        suggestions.is_empty(),
+        "a cancelled picker was answered with {suggestions:?}"
+    );
+}
+
+/// Cancelled external interactive completer offers nothing.
+#[test]
+fn a_cancelled_interactive_external_completer_offers_nothing() {
+    let (_, _, mut engine, mut stack) = new_engine();
+    let config = "\
+        @interactive
+        def pick [buffer] { error make {msg: 'cancelled'} }
+        $env.config.completions.external.completer = {|buffer| pick $buffer }";
+    assert!(support::merge_input(config.as_bytes(), &mut engine, &mut stack).is_ok());
+    let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
+
+    let line = "some-external ";
+    let suggestions = completer.complete_blocking(line, line.len());
+    assert!(
+        suggestions.is_empty(),
+        "a cancelled picker was answered with {suggestions:?}"
+    );
+}
+
+/// Bare value is one completion.
+#[rstest]
+#[case::string("'123'")]
+#[case::int("123")]
+fn a_bare_value_is_one_completion(#[case] body: &str) {
+    let (_, _, mut engine, mut stack) = new_engine();
+    let command = format!(
+        "def comp [] {{ {body} }}
+         def my-command [arg: string@comp] {{}}"
+    );
+    assert!(support::merge_input(command.as_bytes(), &mut engine, &mut stack).is_ok());
+    let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
+
+    let completion_str = "my-command 12";
     let suggestions = completer.complete_blocking(completion_str, completion_str.len());
-    assert!(suggestions.is_empty());
+    match_suggestions(&vec!["123"], &suggestions);
 }
 
 #[test]
@@ -1543,14 +1620,14 @@ fn external_completer_wraps_builtin_commandline_complete() {
     match_suggestions_by_string(&expected, &suggestions);
 }
 
-/// Suppress completions when external completer returns invalid value
+/// A bare value from an external completer is one suggestion, the way a picker answers.
 #[test]
-fn external_completer_invalid() {
+fn external_completer_bare_value() {
     let block = "{|input| 123}";
     let input = "foo ";
 
     let suggestions = run_external_completion(block, input);
-    assert!(suggestions.is_empty());
+    match_suggestions(&vec!["123"], &suggestions);
 }
 
 #[test]
