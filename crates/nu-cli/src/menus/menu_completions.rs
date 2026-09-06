@@ -69,12 +69,8 @@ impl Completer for NuMenuCompleter {
             || !block.signature.optional_positional.is_empty();
         if declares_positional {
             let wanted = DeclaredInputs::from_signature(&block.signature);
-            let record = CompletionEngine::new(&self.engine_state, &self.stack).completer_input_at(
-                &buffer,
-                cursor,
-                wanted,
-                Some(replacing),
-            );
+            let record = CompletionEngine::new(&self.engine_state, &self.stack)
+                .menu_input_at(&buffer, cursor, wanted, replacing);
             bind_declared_inputs(
                 &mut self.stack,
                 &block.signature,

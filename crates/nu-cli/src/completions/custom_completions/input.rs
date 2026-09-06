@@ -5,7 +5,6 @@ use crate::completions::{
 };
 use nu_parser::{FlatShape, flatten_expression};
 use nu_protocol::{Record, Signature, Span, SyntaxShape, Value, ast::Expr, record};
-use std::borrow::Cow;
 
 /// A `{start, end}` record of byte offsets into the commandline.
 fn span_record(start: usize, end: usize, span: Span) -> Value {
@@ -18,37 +17,36 @@ fn span_record(start: usize, end: usize, span: Span) -> Value {
     )
 }
 
-/// One token of a context's command.
-struct Token<'a> {
-    /// The typed text; absent for a nesting token.
-    text: Option<Cow<'a, str>>,
+/// Token kind and span.
+struct Token {
     /// `head`, `flag`, `block`, or `value`.
     kind: &'static str,
     /// Byte range the token occupies on the line; absent for alias-expanded tokens.
     at: Option<(usize, usize)>,
 }
 
-impl<'a> Token<'a> {
+impl Token {
     /// A token spanning `start..end` of the line.
     fn on_line(
-        buffer: &'a str,
+        buffer: &str,
         (start, end): (usize, usize),
         is_first: bool,
         is_flag_shape: bool,
     ) -> Self {
-        let text = buffer.get(start..end).unwrap_or_default();
         Self {
-            kind: Self::classify(text, is_first, is_flag_shape),
-            text: Some(Cow::Borrowed(text)),
+            kind: Self::classify(
+                buffer.get(start..end).unwrap_or_default(),
+                is_first,
+                is_flag_shape,
+            ),
             at: Some((start, end)),
         }
     }
 
     /// A token an alias expansion produced.
-    fn expanded(text: Cow<'a, str>, is_first: bool, is_flag_shape: bool) -> Self {
+    fn expanded(text: &str, is_first: bool, is_flag_shape: bool) -> Self {
         Self {
-            kind: Self::classify(&text, is_first, is_flag_shape),
-            text: Some(text),
+            kind: Self::classify(text, is_first, is_flag_shape),
             at: None,
         }
     }
@@ -56,7 +54,6 @@ impl<'a> Token<'a> {
     /// The closure or subexpression the cursor descends into.
     fn nesting(range: (usize, usize)) -> Self {
         Self {
-            text: None,
             kind: "block",
             at: Some(range),
         }
@@ -72,27 +69,15 @@ impl<'a> Token<'a> {
             "value"
         }
     }
-
-    /// A row of the `token` view: what the cursor is on.
-    fn to_value(&self, span: Span) -> Value {
-        Value::record(
-            record! {
-                "text" => self.text.as_ref().map(|text| Value::string(text.as_ref(), span)).unwrap_or_else(|| Value::nothing(span)),
-                "kind" => Value::string(self.kind, span),
-                "span" => self.at.map(|(start, end)| span_record(start, end, span)).unwrap_or_else(|| Value::nothing(span)),
-            },
-            span,
-        )
-    }
 }
 
 /// The tokens of one context's command.
-fn context_tokens<'a>(context: &'a Context, level: &CompletionContext) -> Vec<Token<'a>> {
+fn context_tokens(context: &Context, level: &CompletionContext) -> Vec<Token> {
     let cursor = context.buffer.len();
     let element_span = level.element.map(|element| element.span);
 
     // Clever: Pre-allocate a reasonable capacity to avoid reallocation overhead.
-    let mut tokens: Vec<Token<'a>> = Vec::with_capacity(16);
+    let mut tokens: Vec<Token> = Vec::with_capacity(16);
 
     let flattened = level
         .element
@@ -142,8 +127,8 @@ fn context_tokens<'a>(context: &'a Context, level: &CompletionContext) -> Vec<To
                 is_flag_shape,
             ));
         } else {
-            let text_string = String::from_utf8_lossy(contents);
-            tokens.push(Token::expanded(text_string, is_first, is_flag_shape));
+            let text = String::from_utf8_lossy(contents);
+            tokens.push(Token::expanded(&text, is_first, is_flag_shape));
         }
     }
 
@@ -269,63 +254,56 @@ impl DeclaredInputs {
     }
 }
 
-/// Token text/span/kind; `replacing` overrides token span for menus.
-fn token_value(context: &Context, replacing: Option<reedline::Span>) -> Value {
+/// Token text/span/kind for replacement range.
+fn token_value(context: &Context) -> Value {
     let span = context.span;
+    let replacing = to_reedline_span(span, context.offset);
     let tokens = context
         .contexts
         .last()
         .map(|level| context_tokens(context, level))
         .unwrap_or_default();
 
-    let at_cursor = locate(&tokens, context.buffer.len())
+    let kind = locate(&tokens, context.buffer.len())
         .map(|(index, _)| index)
         .or_else(|| tokens.len().checked_sub(1))
-        .and_then(|index| tokens.get(index));
+        .and_then(|index| tokens.get(index))
+        .map_or("value", |token| token.kind);
 
-    let Some(range) = replacing else {
-        return at_cursor
-            .map(|token| token.to_value(span))
-            .unwrap_or_else(|| Value::nothing(span));
-    };
+    let (start, end) = (replacing.start, replacing.end.min(context.buffer.len()));
+    let text = context.buffer.get(start..end).unwrap_or_default();
 
-    // Only the text up to the cursor is parsed, so that is as far as the range can be read.
-    let end = range.end.min(context.buffer.len());
-    Token {
-        text: Some(Cow::Borrowed(
-            context.buffer.get(range.start..end).unwrap_or_default(),
-        )),
-        kind: at_cursor.map_or("value", |token| token.kind),
-        at: Some((range.start, range.end)),
-    }
-    .to_value(span)
-}
-
-/// Place with cursor, target, and site.
-fn place_of(context: &Context, replacing: Option<reedline::Span>) -> Value {
-    let span = context.span;
-    let target = replacing.unwrap_or_else(|| to_reedline_span(context.span, context.offset));
-    place_value(
-        context,
-        Value::int(context.buffer.len() as i64, span),
-        span_record(target.start, target.end, span),
+    Value::record(
+        record! {
+            "text" => Value::string(text, span),
+            "kind" => Value::string(kind, span),
+            "span" => span_record(start, end, span),
+        },
+        span,
     )
 }
 
-/// Input record with only declared fields.
-pub(crate) fn completer_input(
-    context: &Context,
-    wanted: DeclaredInputs,
-    replacing: Option<reedline::Span>,
-) -> Value {
+/// Place: cursor, target, and resolved site.
+fn place_of(context: &Context) -> Value {
+    let span = context.span;
+    let replacing = to_reedline_span(span, context.offset);
+    place_value(
+        context,
+        Value::int(context.buffer.len() as i64, span),
+        span_record(replacing.start, replacing.end, span),
+    )
+}
+
+/// Record for completer with only declared fields.
+pub(crate) fn completer_input(context: &Context, wanted: DeclaredInputs) -> Value {
     let span = context.span;
     let mut record = Record::new();
 
     if wanted.token {
-        record.insert("token", token_value(context, replacing));
+        record.insert("token", token_value(context));
     }
     if wanted.place {
-        record.insert("place", place_of(context, replacing));
+        record.insert("place", place_of(context));
     }
     if wanted.buffer {
         record.insert("buffer", Value::string(context.buffer, span));

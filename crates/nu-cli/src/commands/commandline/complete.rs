@@ -136,7 +136,7 @@ completions, which is the supported way to develop and test a completer from ins
             }
 
             return Ok(CompletionEngine::new(engine_state, stack)
-                .completer_input_at(&buffer, cursor_position, DeclaredInputs::all(), None)
+                .completer_input_at(&buffer, cursor_position, DeclaredInputs::all())
                 .into_pipeline_data());
         }
 

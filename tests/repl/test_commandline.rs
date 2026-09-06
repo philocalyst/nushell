@@ -444,14 +444,16 @@ place: {cursor: 0, target: {start: 0, end: 0}, kind: command}, buffer: \"\"}",
     )
 }
 
-/// A target may run across tokens: completing a cell path replaces the whole path, so the
-/// target is wider than the single `token` the cursor sits on.
+/// A target may run across tokens, and the `token` runs with it: completing a cell path
+/// replaces the whole path, so the whole path is what is being completed. A completer that
+/// echoes `$token.text` back leaves the line as it found it, rather than dropping the
+/// `na.` its answer would have overwritten.
 #[test]
 fn commandline_test_complete_input_target_spans_tokens() -> TestResult {
     run_test(
         "'ls | get na.fo' | commandline complete --input\n\
         | {token: $in.token.text, target: $in.place.target} | to nuon",
-        "{token: fo, target: {start: 9, end: 14}}",
+        "{token: \"na.fo\", target: {start: 9, end: 14}}",
     )
 }
 
