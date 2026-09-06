@@ -95,6 +95,14 @@ fn find_pipeline_element_by_position<'a>(
     }
 }
 
+/// True if expr owns trailing gap after its span.
+fn owns_trailing_gap(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Call(_) | Expr::ExternalCall(_, _) | Expr::AttributeBlock(_)
+    )
+}
+
 /// Whether `pos` is inside `span` or at its trailing edge.
 pub(crate) fn touches(span: Span, position: usize) -> bool {
     span.contains(position) || span.end == position
@@ -548,7 +556,6 @@ struct CompletionWorker {
     request_tx: mpsc::Sender<CompletionQuery>,
     result_rx: mpsc::Receiver<Completed>,
     pending: Option<CompletionQuery>,
-    latest: Option<Completed>,
 }
 
 /// The completion behaviour configured in `$env.config.completions`.
@@ -809,8 +816,15 @@ pub(crate) struct CompletionSite<'a> {
 }
 
 impl<'a> CompletionSite<'a> {
-    /// A site with just its kind and span; the rest is filled in later.
-    fn new(kind: SiteKind<'a>, span: Span) -> Self {
+    /// Site at cursor; asserts span contains cursor.
+    fn at(cursor: usize, kind: SiteKind<'a>, span: Span) -> Self {
+        debug_assert!(
+            touches(span, cursor),
+            "a {} site spans {}..{}, which the cursor at {cursor} is not on",
+            kind.resolved().kind(),
+            span.start,
+            span.end,
+        );
         Self {
             kind,
             span,
@@ -848,7 +862,7 @@ impl Dispatched {
 
     /// Merge one source's outcome and report whether it answered.
     fn absorb(&mut self, attempt: Fetched) -> bool {
-        let answered = !attempt.needs_fallback();
+        let answered = attempt.answered();
         self.merge(attempt.into());
         answered
     }
@@ -857,8 +871,8 @@ impl Dispatched {
 impl From<Fetched> for Dispatched {
     fn from(fetched: Fetched) -> Self {
         Self {
-            cacheable: fetched.is_cacheable(),
-            fallback: fetched.is_fallthrough(),
+            cacheable: fetched.is_reusable(),
+            fallback: !fetched.answered(),
             suggestions: fetched.into_suggestions(),
         }
     }
@@ -949,8 +963,23 @@ impl<'engine> CompletionEngine<'engine> {
         self.dispatch_completions_at(line, position).suggestions
     }
 
-    /// Input record for completer; `replacing` for menu range.
-    pub fn completer_input_at(
+    /// Input record for completer; replacement is parsed site.
+    pub fn completer_input_at(&self, line: &str, position: usize, wanted: DeclaredInputs) -> Value {
+        self.input_at(line, position, wanted, None)
+    }
+
+    /// Input record for menu; replacement comes from editor.
+    pub fn menu_input_at(
+        &self,
+        line: &str,
+        position: usize,
+        wanted: DeclaredInputs,
+        replacing: reedline::Span,
+    ) -> Value {
+        self.input_at(line, position, wanted, Some(replacing))
+    }
+
+    fn input_at(
         &self,
         line: &str,
         position: usize,
@@ -973,7 +1002,12 @@ impl<'engine> CompletionEngine<'engine> {
             text: sliced_line,
             offset,
         };
-        let site = self.resolve_completion_site(&block, &working_set, buffer, sliced_line);
+        let mut site = self.resolve_completion_site(&block, &working_set, buffer, sliced_line);
+
+        if let Some(replacing) = replacing {
+            site.span = Span::new(offset + replacing.start, offset + replacing.end);
+            site = self.finalize_site(site, buffer, sliced_line);
+        }
 
         completer_input(
             &self
@@ -985,7 +1019,6 @@ impl<'engine> CompletionEngine<'engine> {
                 )
                 .at_site(&site),
             wanted,
-            replacing,
         )
     }
 
@@ -1474,12 +1507,14 @@ impl<'engine> CompletionEngine<'engine> {
         absolute_position: usize,
         working_set: &'a StateWorkingSet,
     ) -> CompletionSite<'a> {
-        // Cursor in whitespace after a completed value (`1 ⌶`) is an operator position.
-        if absolute_position > expression.span.end && is_operator_lhs(&expression.expr) {
-            return CompletionSite::new(
-                SiteKind::Operator { lhs: expression },
-                Span::point(absolute_position),
-            );
+        // Cursor past expression: only calls/attribute blocks own trailing gap.
+        if absolute_position > expression.span.end && !owns_trailing_gap(&expression.expr) {
+            let kind = if is_operator_lhs(&expression.expr) {
+                SiteKind::Operator { lhs: expression }
+            } else {
+                SiteKind::File
+            };
+            return CompletionSite::at(absolute_position, kind, Span::point(absolute_position));
         }
 
         // Default to file completion; overridden below where the expression warrants it.
@@ -1493,7 +1528,9 @@ impl<'engine> CompletionEngine<'engine> {
             Expr::AttributeBlock(attribute_block) => {
                 self.resolve_attribute_site(attribute_block, absolute_position)
             }
-            Expr::Var(_) => CompletionSite::new(SiteKind::Variable, expression.span),
+            Expr::Var(_) => {
+                CompletionSite::at(absolute_position, SiteKind::Variable, expression.span)
+            }
             // `$foo` alone is the variable; `$foo.bar` or `$foo.` is a cell path.
             Expr::FullCellPath(full_cell_path) => {
                 let has_dot = working_set
@@ -1508,7 +1545,7 @@ impl<'engine> CompletionEngine<'engine> {
                     }
                 };
 
-                CompletionSite::new(kind, expression.span)
+                CompletionSite::at(absolute_position, kind, expression.span)
             }
             // Operator site only on its token; otherwise resolve value side.
             Expr::BinaryOp(left_hand_side, operator, right_hand_side) => {
@@ -1522,7 +1559,8 @@ impl<'engine> CompletionEngine<'engine> {
                     Some(side) => {
                         self.resolve_expression_site(side, absolute_position, working_set)
                     }
-                    None => CompletionSite::new(
+                    None => CompletionSite::at(
+                        absolute_position,
                         SiteKind::Operator {
                             lhs: left_hand_side.as_ref(),
                         },
@@ -1530,7 +1568,7 @@ impl<'engine> CompletionEngine<'engine> {
                     ),
                 }
             }
-            _ => CompletionSite::new(SiteKind::File, expression.span),
+            _ => CompletionSite::at(absolute_position, SiteKind::File, expression.span),
         }
     }
 
@@ -1544,7 +1582,8 @@ impl<'engine> CompletionEngine<'engine> {
         absolute_position: usize,
     ) -> CompletionSite<'a> {
         if absolute_position <= head.span.end {
-            return CompletionSite::new(
+            return CompletionSite::at(
+                absolute_position,
                 SiteKind::command(expression),
                 command_name_span(head.span, expression.span),
             );
@@ -1560,7 +1599,8 @@ impl<'engine> CompletionEngine<'engine> {
             })
             .unwrap_or((arguments.len(), Span::point(absolute_position)));
 
-        CompletionSite::new(
+        CompletionSite::at(
+            absolute_position,
             SiteKind::ExternalArg {
                 call: expression,
                 index,
@@ -1578,7 +1618,8 @@ impl<'engine> CompletionEngine<'engine> {
     ) -> CompletionSite<'a> {
         // Cursor in (or right after) the command head: complete the command name.
         if absolute_position <= call.head.end {
-            return CompletionSite::new(
+            return CompletionSite::at(
+                absolute_position,
                 SiteKind::command(expression),
                 command_name_span(call.head, expression.span),
             );
@@ -1605,7 +1646,8 @@ impl<'engine> CompletionEngine<'engine> {
         if let Some(operator_left_hand_side) =
             self.row_condition_operator_lhs(call, working_set, absolute_position)
         {
-            return CompletionSite::new(
+            return CompletionSite::at(
+                absolute_position,
                 SiteKind::Operator {
                     lhs: operator_left_hand_side,
                 },
@@ -1635,7 +1677,8 @@ impl<'engine> CompletionEngine<'engine> {
 
         if let Some(flag_ref) = self.pending_flag_value(call, working_set) {
             // `arg_slot` past the last argument: no node exists yet; `ArgValueCompletion` reads `None`.
-            CompletionSite::new(
+            CompletionSite::at(
+                absolute_position,
                 SiteKind::FlagValue {
                     call,
                     element: expression,
@@ -1645,7 +1688,8 @@ impl<'engine> CompletionEngine<'engine> {
                 point,
             )
         } else if token_is_flag {
-            CompletionSite::new(
+            CompletionSite::at(
+                absolute_position,
                 SiteKind::FlagName {
                     call,
                     element: expression,
@@ -1653,7 +1697,8 @@ impl<'engine> CompletionEngine<'engine> {
                 trailing_token,
             )
         } else {
-            CompletionSite::new(
+            CompletionSite::at(
+                absolute_position,
                 SiteKind::Positional {
                     call,
                     element: expression,
@@ -1770,7 +1815,7 @@ impl<'engine> CompletionEngine<'engine> {
             Argument::Spread(_) => (SiteKind::File, argument.span()),
         };
 
-        CompletionSite::new(kind, span)
+        CompletionSite::at(absolute_position, kind, span)
     }
 
     fn resolve_attribute_site<'a>(
@@ -1783,11 +1828,19 @@ impl<'engine> CompletionEngine<'engine> {
             .iter()
             .find(|attribute| touches(attribute.expr.span, absolute_position))
         {
-            return CompletionSite::new(SiteKind::AttributeName, attribute.expr.span);
+            return CompletionSite::at(
+                absolute_position,
+                SiteKind::AttributeName,
+                attribute.expr.span,
+            );
         }
 
         if touches(attribute_block.item.span, absolute_position) {
-            return CompletionSite::new(SiteKind::AttributableItem, attribute_block.item.span);
+            return CompletionSite::at(
+                absolute_position,
+                SiteKind::AttributableItem,
+                attribute_block.item.span,
+            );
         }
 
         // Past the last attribute is the item's slot; earlier gaps type another attribute.
@@ -1796,7 +1849,7 @@ impl<'engine> CompletionEngine<'engine> {
             _ => SiteKind::AttributeName,
         };
 
-        CompletionSite::new(kind, Span::point(absolute_position))
+        CompletionSite::at(absolute_position, kind, Span::point(absolute_position))
     }
 
     fn resolve_fallback_site<'a>(
@@ -1823,7 +1876,7 @@ impl<'engine> CompletionEngine<'engine> {
             SiteKind::Command { node: None }
         };
 
-        CompletionSite::new(kind, Span::point(absolute_position))
+        CompletionSite::at(absolute_position, kind, Span::point(absolute_position))
     }
     fn complete_argument_value(
         &self,
@@ -1848,7 +1901,7 @@ impl<'engine> CompletionEngine<'engine> {
                                 "`{}` cannot be used as a completer: it runs no block",
                                 context.working_set.get_decl(decl_id).name()
                             );
-                            Fetched::Cacheable(vec![])
+                            Fetched::answering(vec![]).worth_keeping()
                         }
                     }
                 }
@@ -1995,7 +2048,7 @@ impl<'engine> CompletionEngine<'engine> {
                 prefix: b"",
                 ..*context
             }),
-            None => Fetched::Absent,
+            None => Fetched::absent(),
         }
     }
 
@@ -2020,18 +2073,15 @@ impl<'engine> CompletionEngine<'engine> {
     }
 }
 
-pub struct NuCompleter {
-    /// Shared rather than borrowed: the background worker thread takes a handle.
+    pub struct NuCompleter {
     engine_state: Arc<EngineState>,
     stack: Arc<Stack>,
     options: CompletionOptions,
     cache: NarrowingCache,
-    /// The [`CacheEnv`] of every entry this completer stores/reads; computed once per
-    /// completer, not on [`CompletionEngine`] (which non-caching callers also build).
     cache_env: CacheEnv,
     worker: Option<CompletionWorker>,
-    /// Cached interactive answer for current line.
-    asked: Option<(CompletionQuery, Suggestions)>,
+    /// Latest answer and its query.
+    latest: Option<Completed>,
 }
 
 impl NuCompleter {
@@ -2055,13 +2105,12 @@ impl NuCompleter {
             cache,
             cache_env,
             worker: None,
-            asked: None,
+            latest: None,
         }
     }
 
     fn fresh_for(&self, query: &CompletionQuery) -> Option<Suggestions> {
-        if let Some(worker) = self.worker.as_ref()
-            && let Some(latest) = &worker.latest
+        if let Some(latest) = &self.latest
             && &latest.query == query
         {
             return Some(latest.suggestions.clone());
@@ -2111,25 +2160,20 @@ impl NuCompleter {
             request_tx,
             result_rx,
             pending: None,
-            latest: None,
         }
     }
 
     fn fold_completed(&mut self, done: Completed) -> bool {
-        let Self {
-            cache,
-            cache_env,
-            worker,
-            ..
-        } = self;
-        let Some(worker) = worker.as_mut() else {
-            return false;
-        };
-        let settled = worker.pending.as_ref() == Some(&done.query);
+        let settled = self
+            .worker
+            .as_mut()
+            .is_some_and(|worker| worker.pending.as_ref() == Some(&done.query));
+
         if done.cacheable {
-            cache.store(done.query.clone(), *cache_env, done.suggestions.clone());
+            self.cache
+                .store(done.query.clone(), self.cache_env, done.suggestions.clone());
         }
-        worker.latest = Some(done);
+        self.latest = Some(done);
         settled
     }
 
@@ -2219,27 +2263,15 @@ impl ReedlineCompleter for NuCompleter {
             return CompletionResult::fresh(suggestions).with_partial(partial);
         }
 
-        // An `@interactive` completer runs here, on the line-editor thread, so it owns the
-        // terminal: the background worker suppresses stdin, but a picker like `fzf` or
-        // `input list` needs the TTY. This blocks the line editor for as long as the picker
-        // is up — exactly as a menu `source` does — and its result is never cached, since an
-        // interactive completer is not a pure function. Every other completer stays on the
-        // worker: non-blocking, and cacheable.
-        //
-        // Running inline (not on the suppressed worker) is what keeps the picker usable: with
-        // stdin live, `input list` passes `require_stdin` and restores reedline's raw mode via
-        // `RawModeGuard`, and `fzf` gets `/dev/tty` and restores its own termios on exit. That
-        // is the same terminal contract a menu `source` relies on, so no extra guard is needed.
+        // Interactive completers run on UI thread to own terminal.
         let engine = CompletionEngine::isolated(&self.engine_state, Arc::clone(&self.stack), false);
         if engine.interactive_completer_at(line, pos) {
-            let suggestions = match self.asked.as_ref() {
-                Some((asked, answer)) if asked == &query => answer.clone(),
-                _ => {
-                    let (suggestions, _cacheable) = engine.suggestions_for(&query);
-                    self.asked = Some((query, suggestions.clone()));
-                    suggestions
-                }
-            };
+            let (suggestions, _cacheable) = engine.suggestions_for(&query);
+            self.latest = Some(Completed {
+                query,
+                suggestions: suggestions.clone(),
+                cacheable: false,
+            });
             let partial = partial_of(line, &suggestions);
             return CompletionResult::fresh(suggestions).with_partial(partial);
         }
@@ -2292,6 +2324,114 @@ mod completer_tests {
         let delta = StateWorkingSet::new(&engine).render();
         engine.merge_delta(delta).expect("merge_delta");
         Arc::new(engine)
+    }
+
+    /// Corpus covering resolver branches.
+    const CORPUS: &[&str] = &[
+        "ls",
+        "ls foo",
+        "ls foo bar",
+        "ls --long",
+        "ls --long foo",
+        "ls -a foo",
+        "^ls foo",
+        "sudo ls foo",
+        "ls | where size > 1",
+        "ls | where size > 1 ",
+        "ls foo ",
+        "1 + 2 ",
+        "$env.PATH ",
+        "ls | where size > ",
+        "ls | where size >",
+        "ls | where name == foo and size > 2",
+        "1 + 2",
+        "1 + ",
+        "1 ",
+        "$env.PATH",
+        "$env.",
+        "$nu",
+        "each { |x| $x.name }",
+        "let x = (ls | where name == foo)",
+        "def foo [] { ls }",
+        "@example\ndef foo [] {}",
+        "use std/util [",
+        "ls é foo",
+        "",
+        " ",
+    ];
+
+    /// All sites must contain cursor.
+    #[test]
+    fn every_site_holds_the_cursor() {
+        let engine_state = test_engine();
+        let engine = CompletionEngine::new(&engine_state, &Stack::new());
+
+        for line in CORPUS {
+            for cursor in (0..=line.len()).filter(|at| line.is_char_boundary(*at)) {
+                let contents = &line[..cursor];
+                let mut working_set = StateWorkingSet::new(&engine_state);
+                let offset = working_set.next_span_start();
+                let block = parse(&mut working_set, Some("sweep"), contents.as_bytes(), false);
+                let buffer = Buffer {
+                    text: contents,
+                    offset,
+                };
+
+                let site = engine.resolve_completion_site(&block, &working_set, buffer, contents);
+                assert!(
+                    touches(site.span, cursor + offset),
+                    "{line:?} at {cursor}: a {} site spans {}..{}, off the cursor at {}",
+                    site.kind.resolved().kind(),
+                    site.span.start,
+                    site.span.end,
+                    cursor + offset,
+                );
+            }
+        }
+    }
+
+    /// Token text/span equals target shown to completer.
+    #[test]
+    fn the_token_is_what_the_answer_replaces() {
+        let engine_state = test_engine();
+        let engine = CompletionEngine::new(&engine_state, &Stack::new());
+
+        let range = |record: &Value, field: &str| {
+            let span = record.get_data_by_key(field).expect("a span field");
+            let at = |end| {
+                span.get_data_by_key(end)
+                    .and_then(|value| value.as_int().ok())
+                    .expect("an offset") as usize
+            };
+            (at("start"), at("end"))
+        };
+
+        for line in CORPUS {
+            for cursor in (0..=line.len()).filter(|at| line.is_char_boundary(*at)) {
+                let contents = &line[..cursor];
+                let input = engine.completer_input_at(contents, cursor, DeclaredInputs::all());
+
+                let token = input.get_data_by_key("token").expect("a token");
+                let place = input.get_data_by_key("place").expect("a place");
+                let text = token
+                    .get_data_by_key("text")
+                    .and_then(|value| value.coerce_into_string().ok())
+                    .expect("the token's text");
+
+                let at = range(&token, "span");
+                let target = range(&place, "target");
+                assert_eq!(
+                    at,
+                    (target.0, target.1.min(contents.len())),
+                    "{line:?} at {cursor}: the token is not the target the completer saw"
+                );
+                assert_eq!(
+                    Some(text.as_str()),
+                    contents.get(at.0..at.1),
+                    "{line:?} at {cursor}: the token is not the text it spans"
+                );
+            }
+        }
     }
 
     fn q(s: &str) -> CompletionQuery {
