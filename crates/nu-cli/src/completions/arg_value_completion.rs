@@ -89,7 +89,7 @@ impl<'a> ArgValueCompletion<'a> {
                     matcher.add_semantic_suggestion(suggestion);
                 }
 
-                Some(Fetched::Cacheable(matcher.suggestion_results()))
+                Some(Fetched::answering(matcher.suggestion_results()).worth_keeping())
             }
             Ok(None) => None, // fallback to type based completion, file completion, etc.
             Err(error) => {
@@ -119,13 +119,13 @@ impl<'a> ArgValueCompletion<'a> {
     ) -> Fetched {
         let expression = self.arg_expr();
         let Some((module_name, span)) = self.find_module_name_and_span() else {
-            return Fetched::Pure(vec![]);
+            return Fetched::answering(vec![]);
         };
 
         let Some((module_id, temp_working_set)) =
             self.resolve_module(working_set, module_name, span)
         else {
-            return Fetched::Pure(vec![]);
+            return Fetched::answering(vec![]);
         };
 
         let mut exportable_completion = ExportableCompletion {
@@ -142,14 +142,16 @@ impl<'a> ArgValueCompletion<'a> {
                     completion_context,
                     &mut exportable_completion,
                 ),
-                _ => Fetched::Pure(vec![]),
+                _ => Fetched::answering(vec![]),
             },
             // No expression at all or any other scalar shape (`Expr::String`, plus `Expr::Nothing`
             // for the `null` keyword): search exports by the raw prefix text.
             _ => exportable_completion.fetch(completion_context),
         };
 
-        fetched_result.caching()
+        // Reaching here may have parsed a module off disk, so the answer is worth keeping
+        // even where the source that gave it was cheap.
+        fetched_result.worth_keeping()
     }
 
     fn find_module_name_and_span(&self) -> Option<(&[u8], Span)> {
@@ -252,7 +254,7 @@ impl<'a> ArgValueCompletion<'a> {
             Some(SyntaxShape::Filepath | SyntaxShape::GlobPattern) => complete_file(),
             // fallback to file completion if necessary
             _ if self.need_fallback => complete_file(),
-            _ => Fetched::Pure(vec![]),
+            _ => Fetched::answering(vec![]),
         }
     }
 }

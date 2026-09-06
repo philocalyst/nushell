@@ -8,61 +8,68 @@ pub trait Completer {
     fn fetch(&mut self, ctx: &Context) -> Fetched;
 }
 
-/// The outcome of one source's [`Completer::fetch`]. Caching and fallback are encoded in
-/// the variant, so a declining result cannot carry suggestions.
+/// Result from one completion source.
 #[derive(Debug, Default)]
-pub enum Fetched {
-    /// Cheap engine-state result: never cached, never falls back.
-    Pure(Vec<SemanticSuggestion>),
-    /// Impure source result (filesystem, `PATH`, user/plugin code); worth caching.
-    Cacheable(Vec<SemanticSuggestion>),
-    /// Suggestions contributed while allowing the next source to run.
-    Fallthrough(Vec<SemanticSuggestion>),
-    /// Impure source declined: fall back, but cache the attempt.
-    Declined,
-    /// Dismissed picker answered empty with no fallback.
-    Abandoned,
-    /// No source ran: fall back cheaply.
-    #[default]
-    Absent,
+pub struct Fetched {
+    suggestions: Vec<SemanticSuggestion>,
+    /// Source answered; no fallback.
+    answered: bool,
+    /// Worth caching between keystrokes.
+    reusable: bool,
 }
 
 impl Fetched {
-    /// The suggestions this outcome carries; declining outcomes carry none.
+    /// No source ran here.
+    pub(crate) fn absent() -> Self {
+        Self::default()
+    }
+
+    /// Answer with `suggestions`; empty still counts as answered.
+    pub(crate) fn answering(suggestions: Vec<SemanticSuggestion>) -> Self {
+        Self {
+            suggestions,
+            answered: true,
+            reusable: false,
+        }
+    }
+
+    /// Contribute suggestions and allow fallback.
+    pub(crate) fn contributing(suggestions: Vec<SemanticSuggestion>) -> Self {
+        Self {
+            suggestions,
+            answered: false,
+            reusable: true,
+        }
+    }
+
+    /// Decline; next source answers.
+    pub(crate) fn declining() -> Self {
+        Self {
+            suggestions: Vec::new(),
+            answered: false,
+            reusable: true,
+        }
+    }
+
+    /// Mark answer cacheable.
+    pub(crate) fn worth_keeping(mut self) -> Self {
+        self.reusable = true;
+        self
+    }
+
+    /// The suggestions this outcome carries.
     pub(crate) fn into_suggestions(self) -> Vec<SemanticSuggestion> {
-        match self {
-            Self::Pure(suggestions)
-            | Self::Cacheable(suggestions)
-            | Self::Fallthrough(suggestions) => suggestions,
-            Self::Declined | Self::Abandoned | Self::Absent => Vec::new(),
-        }
+        self.suggestions
     }
 
-    /// Impure source ran; result worth reusing between keystrokes.
-    pub(crate) fn is_cacheable(&self) -> bool {
-        matches!(
-            self,
-            Self::Cacheable(_) | Self::Fallthrough(_) | Self::Declined
-        )
+    /// Did source answer?
+    pub(crate) fn answered(&self) -> bool {
+        self.answered
     }
 
-    /// Whether the next source should still be tried.
-    pub(crate) fn needs_fallback(&self) -> bool {
-        matches!(self, Self::Fallthrough(_) | Self::Declined | Self::Absent)
-    }
-
-    /// Whether this source contributed suggestions and asked to continue.
-    pub(crate) fn is_fallthrough(&self) -> bool {
-        matches!(self, Self::Fallthrough(_))
-    }
-
-    /// Mark cheap results cacheable when the caller did expensive work.
-    pub(crate) fn caching(self) -> Self {
-        match self {
-            Self::Pure(suggestions) => Self::Cacheable(suggestions),
-            Self::Absent => Self::Declined,
-            already => already,
-        }
+    /// Cacheable between keystrokes?
+    pub(crate) fn is_reusable(&self) -> bool {
+        self.reusable
     }
 }
 
@@ -204,26 +211,25 @@ impl From<Suggestion> for SemanticSuggestion {
 mod tests {
     use super::*;
 
-    /// Declined outcomes carry no suggestions.
     #[test]
-    fn fallback_variants_carry_no_suggestions() {
-        assert!(Fetched::Declined.into_suggestions().is_empty());
-        assert!(Fetched::Absent.into_suggestions().is_empty());
-        assert!(Fetched::Abandoned.into_suggestions().is_empty());
+    fn declining_carries_no_suggestions() {
+        assert!(!Fetched::declining().answered());
+        assert!(Fetched::declining().into_suggestions().is_empty());
+        assert!(!Fetched::absent().answered());
     }
 
     #[test]
-    fn abandoned_answers_without_suggesting_anything() {
-        assert!(!Fetched::Abandoned.needs_fallback());
-        assert!(!Fetched::Abandoned.is_cacheable());
+    fn answering_with_nothing_still_answers() {
+        let dismissed = Fetched::answering(vec![]);
+        assert!(dismissed.answered());
+        assert!(!dismissed.is_reusable());
+        assert!(dismissed.into_suggestions().is_empty());
     }
 
-    /// Fallthrough keeps its suggestions while continuing the chain.
     #[test]
-    fn fallthrough_needs_fallback_but_keeps_its_suggestions() {
-        let fetched = Fetched::Fallthrough(vec![SemanticSuggestion::default()]);
-        assert!(fetched.is_fallthrough());
-        assert!(fetched.needs_fallback());
+    fn contributing_keeps_its_suggestions_and_the_site_open() {
+        let fetched = Fetched::contributing(vec![SemanticSuggestion::default()]);
+        assert!(!fetched.answered());
         assert_eq!(fetched.into_suggestions().len(), 1);
     }
 }
