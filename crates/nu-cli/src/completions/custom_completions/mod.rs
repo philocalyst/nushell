@@ -162,7 +162,9 @@ impl LegacyInputs {
         self.values.get(index).and_then(Clone::clone)
     }
 
-    /// Queue deprecation warning.
+    /// Warn that this completer runs on the bridge. Unlike the mistakes [`report`] logs,
+    /// this one costs nothing today and everything once the bridge is removed, so it is
+    /// raised where a user will actually see it: queued for [`flush_completion_warnings`].
     fn deprecate(&self, names: &[String]) {
         let (plural, still) = match names.len() {
             1 => ("", "still receives its old positional value"),
@@ -187,10 +189,14 @@ impl LegacyInputs {
     }
 }
 
-/// Pending deprecation warnings.
+/// Deprecations raised while completing, each with the hash that keeps a duplicate out.
+///
+/// Completion runs while the line editor owns the terminal — for a background query, on
+/// another thread — so a warning printed here would land in the middle of the line being
+/// typed. They wait here for the next caller that can safely print instead.
 static PENDING: Mutex<Vec<(u64, ShellWarning)>> = Mutex::new(Vec::new());
 
-/// Queue warning if unseen.
+/// Queue a deprecation, unless the same one is already waiting.
 fn queue(warning: ShellWarning) {
     let mut hasher = DefaultHasher::new();
     warning.hash(&mut hasher);
@@ -204,7 +210,9 @@ fn queue(warning: ShellWarning) {
     }
 }
 
-/// Flush pending warnings.
+/// Print the deprecations completion raised, now that printing is safe: the REPL calls this
+/// once the line editor hands back the line, and `commandline complete` when it returns.
+/// Each is still shown only once a session, through [`ReportMode::FirstUse`].
 pub fn flush_completion_warnings(engine_state: &EngineState, stack: &Stack) {
     // Taken, not printed under the lock: a background completion may be queueing into it.
     let pending = match PENDING.lock() {
@@ -275,12 +283,13 @@ fn block_of(command: &dyn Command) -> Option<BlockId> {
         .or_else(|| block_of(command.as_alias()?.command.as_deref()?))
 }
 
-/// User-defined completer.
+/// A user-defined completer: a block called with the input record. Parameter,
+/// command-wide, and external completers share this one implementation.
 pub(crate) struct UserCompletion {
     block_id: BlockId,
     captures: Vec<(VarId, Value)>,
     narrowing: Narrowing,
-    /// Interactive picker.
+    /// Whether this completer is `@interactive`: it takes the terminal and asks the user.
     interactive: bool,
 }
 
@@ -355,7 +364,7 @@ impl UserCompletion {
         bind_declared_inputs(
             &mut callee_stack,
             &block.signature,
-            completer_input(ctx, wanted, None),
+            completer_input(ctx, wanted),
             legacy,
         );
 
@@ -374,26 +383,38 @@ impl UserCompletion {
     }
 }
 
+impl UserCompletion {
+    /// Null return: delegate unless interactive picker was dismissed.
+    fn declined(&self) -> Fetched {
+        if self.interactive {
+            Fetched::answering(vec![])
+        } else {
+            Fetched::declining()
+        }
+    }
+
+    /// Block failed: answer empty unless external fallback is sane.
+    fn failed(&self) -> Fetched {
+        if self.interactive || matches!(self.narrowing, Narrowing::Engine) {
+            Fetched::answering(vec![])
+        } else {
+            Fetched::declining()
+        }
+    }
+}
+
 impl Completer for UserCompletion {
     fn fetch(&mut self, ctx: &Context) -> Fetched {
         let value = match self.eval(ctx) {
             Ok(value) => value,
             Err(err) => {
                 report(format!("failed to eval completer block: {err}"));
-                if self.interactive {
-                    return Fetched::Abandoned;
-                }
-                return match self.narrowing {
-                    Narrowing::Engine => Fetched::Cacheable(vec![]),
-                    Narrowing::Completer => Fetched::Declined,
-                };
+                return self.failed().worth_keeping();
             }
         };
 
         match CompleterOutput::read(value, ctx, self.narrowing) {
-            None if self.interactive => Fetched::Abandoned,
-            // `null` declines, letting the next source answer.
-            None => Fetched::Declined,
+            None => self.declined(),
             Some(output) => output.into_fetched(ctx),
         }
     }
