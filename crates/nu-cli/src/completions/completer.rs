@@ -616,7 +616,7 @@ enum SiteCompleter {
 }
 
 /// Whether `decl` names an `@interactive` command, seeing through aliases as execution does.
-fn decl_is_interactive(working_set: &StateWorkingSet, decl_id: DeclId) -> bool {
+pub(crate) fn decl_is_interactive(working_set: &StateWorkingSet, decl_id: DeclId) -> bool {
     fn command_is_interactive(command: &dyn Command) -> bool {
         command
             .attributes()
@@ -633,7 +633,7 @@ fn decl_is_interactive(working_set: &StateWorkingSet, decl_id: DeclId) -> bool {
 /// Whether the configured external completer closure runs an `@interactive` command. A closure
 /// cannot carry the attribute itself, so we see through it to the command producing its result
 /// — the terminal call of its block — exactly as a named completer carries the attribute.
-fn closure_is_interactive(working_set: &StateWorkingSet, closure: &Closure) -> bool {
+pub(crate) fn closure_is_interactive(working_set: &StateWorkingSet, closure: &Closure) -> bool {
     let block = working_set.get_block(closure.block_id);
     matches!(
         block
@@ -949,8 +949,14 @@ impl<'engine> CompletionEngine<'engine> {
         self.dispatch_completions_at(line, position).suggestions
     }
 
-    /// The record a user completer declaring `wanted` would receive, without running one.
-    pub fn completer_input_at(&self, line: &str, position: usize, wanted: DeclaredInputs) -> Value {
+    /// Input record for completer; `replacing` for menu range.
+    pub fn completer_input_at(
+        &self,
+        line: &str,
+        position: usize,
+        wanted: DeclaredInputs,
+        replacing: Option<reedline::Span>,
+    ) -> Value {
         let cursor = line.floor_char_boundary(position.min(line.len()));
         let sliced_line = &line[..cursor];
 
@@ -979,6 +985,7 @@ impl<'engine> CompletionEngine<'engine> {
                 )
                 .at_site(&site),
             wanted,
+            replacing,
         )
     }
 
@@ -1277,7 +1284,9 @@ impl<'engine> CompletionEngine<'engine> {
             .completer
             .as_ref()
             .is_some_and(|completer| {
-                dispatched.absorb(UserCompletion::closure(completer).fetch(completion_context))
+                dispatched.absorb(
+                    UserCompletion::closure(working_set, completer).fetch(completion_context),
+                )
             });
 
         // Subcommands extending this call suppress the file fallback.
@@ -1501,12 +1510,26 @@ impl<'engine> CompletionEngine<'engine> {
 
                 CompletionSite::new(kind, expression.span)
             }
-            Expr::BinaryOp(left_hand_side, operator, _) => CompletionSite::new(
-                SiteKind::Operator {
-                    lhs: left_hand_side.as_ref(),
-                },
-                operator.span,
-            ),
+            // Operator site only on its token; otherwise resolve value side.
+            Expr::BinaryOp(left_hand_side, operator, right_hand_side) => {
+                let value_side = match absolute_position {
+                    before if before < operator.span.start => Some(left_hand_side),
+                    after if after > operator.span.end => Some(right_hand_side),
+                    _ => None,
+                };
+
+                match value_side {
+                    Some(side) => {
+                        self.resolve_expression_site(side, absolute_position, working_set)
+                    }
+                    None => CompletionSite::new(
+                        SiteKind::Operator {
+                            lhs: left_hand_side.as_ref(),
+                        },
+                        operator.span,
+                    ),
+                }
+            }
             _ => CompletionSite::new(SiteKind::File, expression.span),
         }
     }
@@ -1962,7 +1985,7 @@ impl<'engine> CompletionEngine<'engine> {
                 .external
                 .completer
                 .as_ref()
-                .map(UserCompletion::closure),
+                .map(|closure| UserCompletion::closure(context.working_set, closure)),
             None => None,
         };
 
@@ -2007,6 +2030,8 @@ pub struct NuCompleter {
     /// completer, not on [`CompletionEngine`] (which non-caching callers also build).
     cache_env: CacheEnv,
     worker: Option<CompletionWorker>,
+    /// Cached interactive answer for current line.
+    asked: Option<(CompletionQuery, Suggestions)>,
 }
 
 impl NuCompleter {
@@ -2030,6 +2055,7 @@ impl NuCompleter {
             cache,
             cache_env,
             worker: None,
+            asked: None,
         }
     }
 
@@ -2206,7 +2232,14 @@ impl ReedlineCompleter for NuCompleter {
         // is the same terminal contract a menu `source` relies on, so no extra guard is needed.
         let engine = CompletionEngine::isolated(&self.engine_state, Arc::clone(&self.stack), false);
         if engine.interactive_completer_at(line, pos) {
-            let (suggestions, _cacheable) = engine.suggestions_for(&query);
+            let suggestions = match self.asked.as_ref() {
+                Some((asked, answer)) if asked == &query => answer.clone(),
+                _ => {
+                    let (suggestions, _cacheable) = engine.suggestions_for(&query);
+                    self.asked = Some((query, suggestions.clone()));
+                    suggestions
+                }
+            };
             let partial = partial_of(line, &suggestions);
             return CompletionResult::fresh(suggestions).with_partial(partial);
         }
