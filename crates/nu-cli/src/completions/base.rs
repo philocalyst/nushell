@@ -20,6 +20,8 @@ pub enum Fetched {
     Fallthrough(Vec<SemanticSuggestion>),
     /// Impure source declined: fall back, but cache the attempt.
     Declined,
+    /// Dismissed picker answered empty with no fallback.
+    Abandoned,
     /// No source ran: fall back cheaply.
     #[default]
     Absent,
@@ -32,7 +34,7 @@ impl Fetched {
             Self::Pure(suggestions)
             | Self::Cacheable(suggestions)
             | Self::Fallthrough(suggestions) => suggestions,
-            Self::Declined | Self::Absent => Vec::new(),
+            Self::Declined | Self::Abandoned | Self::Absent => Vec::new(),
         }
     }
 
@@ -207,6 +209,13 @@ mod tests {
     fn fallback_variants_carry_no_suggestions() {
         assert!(Fetched::Declined.into_suggestions().is_empty());
         assert!(Fetched::Absent.into_suggestions().is_empty());
+        assert!(Fetched::Abandoned.into_suggestions().is_empty());
+    }
+
+    #[test]
+    fn abandoned_answers_without_suggesting_anything() {
+        assert!(!Fetched::Abandoned.needs_fallback());
+        assert!(!Fetched::Abandoned.is_cacheable());
     }
 
     /// Fallthrough keeps its suggestions while continuing the chain.
