@@ -50,6 +50,23 @@ impl From<Text> for String {
     }
 }
 
+/// Warn on unknown keys in completer output.
+fn lint_keys(value: &Value, what: &str, keys: &[&str]) {
+    let Ok(record) = value.as_record() else {
+        return;
+    };
+
+    for unknown in record
+        .columns()
+        .filter(|column| !keys.contains(&column.as_str()))
+    {
+        report(format!(
+            "a {what} has no `{unknown}` field, so it is ignored; expected one of {}",
+            keys.join(", ")
+        ));
+    }
+}
+
 /// Record returned by completer with exact accepted keys.
 trait ReturnedRecord: FromValue {
     /// What to call it in a message.
@@ -57,21 +74,9 @@ trait ReturnedRecord: FromValue {
     /// Every key accepted, whether read into a field or merely tolerated.
     const KEYS: &'static [&'static str];
 
-    /// Read one; unknown keys warned and ignored.
+    /// Read one; unknown keys linted and ignored.
     fn read(value: Value) -> Option<Self> {
-        if let Ok(record) = value.as_record() {
-            for unknown in record
-                .columns()
-                .filter(|column| !Self::KEYS.contains(&column.as_str()))
-            {
-                report(format!(
-                    "a {} has no `{unknown}` field, so it is ignored; expected one of {}",
-                    Self::LABEL,
-                    Self::KEYS.join(", ")
-                ));
-            }
-        }
-
+        lint_keys(&value, Self::LABEL, Self::KEYS);
         read_part(value, Self::LABEL)
     }
 }
@@ -211,18 +216,8 @@ impl Returned {
         };
 
         if is_envelope {
+            lint_keys(&value, "completion envelope", &ENVELOPE_KEYS);
             let mut record = value.into_record().unwrap_or_default();
-
-            if let Some(unknown) = record
-                .columns()
-                .find(|column| !ENVELOPE_KEYS.contains(&column.as_str()))
-            {
-                report(format!(
-                    "a completion envelope has no `{unknown}` field, so it is ignored; \
-                     expected one of {}",
-                    ENVELOPE_KEYS.join(", ")
-                ));
-            }
 
             // Read each part independently.
             return Some(Self {
@@ -320,9 +315,9 @@ impl CompleterOutput {
         let fallback = self.fallback;
         let outcome = |suggestions| {
             if fallback {
-                Fetched::Fallthrough(suggestions)
+                Fetched::contributing(suggestions)
             } else {
-                Fetched::Cacheable(suggestions)
+                Fetched::answering(suggestions).worth_keeping()
             }
         };
 
