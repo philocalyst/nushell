@@ -2073,7 +2073,7 @@ impl<'engine> CompletionEngine<'engine> {
     }
 }
 
-    pub struct NuCompleter {
+pub struct NuCompleter {
     engine_state: Arc<EngineState>,
     stack: Arc<Stack>,
     options: CompletionOptions,
