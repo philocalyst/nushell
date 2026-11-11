@@ -1,0 +1,90 @@
+# External and command-wide completers: what they are handed, how their answers are read, and when
+# the files answer in their place. In the `completions` fixture, by prefix; `ext` sets the external
+# completer to the closure it names.
+{
+  fixture: completions
+  prelude: "$env.config.completions.algorithm = 'prefix'"
+  cases: [
+    {setup: "$env.config.completions.external.completer = {|buffer| ($buffer | split row ' ')}", cases: [
+      # https://github.com/nushell/nushell/issues/6378
+      {test: external_completer_trailing_space, line: "gh alias ", values: [gh alias ""]}
+      {test: external_completer_no_trailing_space, line: "gh alias", values: [gh alias]}
+      {test: external_completer_pass_flags, line: "gh api --", values: [gh api --]}
+    ]}
+    # The files answer when an external completer returns null (#15790, #16712).
+    {setup: "$env.config.completions.external.completer = {|input| null}", cases: [
+      {test: external_completer_fallback, line: "foo test", values: [test_a/ test_a_symlink/ test_b/], paths: true}
+      {test: external_completer_fallback, fixture: external_completions, line: "foo `dir with space/`", values: ["`dir with space/bar baz`" "`dir with space/foo`"]}
+      {test: external_completer_fallback, fixture: external_completions, line: "`dir with space/`", values: ["`dir with space/bar baz`" "`dir with space/foo`"]}
+    ]}
+    # A returned `span` is byte offsets; ends beyond what was shown clamp. A completer that says
+    # nothing of a space gets one after a finished argument.
+    {test: "external_completer_override_span::happy", setup: "$env.config.completions.external.completer = {|input| [{ value: foobarbaz, span: { start: 7, end: 20 } }]}", line: "foo | extcommand foobar", values: [foobarbaz], spans: [[7 20]]}
+    {test: "external_completer_override_span::no_start", setup: "$env.config.completions.external.completer = {|input| [{ value: foobarbaz, span: { end: 20 } }]}", line: "foo | extcommand foobar", values: [foobarbaz], spans: [[17 20]]}
+    {test: "external_completer_override_span::no_end", setup: "$env.config.completions.external.completer = {|input| [{ value: foobarbaz, span: { start: 7 } }]}", line: "foo | extcommand foobar", values: [foobarbaz], spans: [[7 23]]}
+    {test: "external_completer_override_span::bad_start", setup: "$env.config.completions.external.completer = {|input| [{ value: foobarbaz, span: { start: 100 } }]}", line: "foo | extcommand foobar", values: [foobarbaz], spans: [[23 23]], taken: "foo | extcommand foobarfoobarbaz "}
+    {test: "external_completer_override_span::bad_end", setup: "$env.config.completions.external.completer = {|input| [{ value: foobarbaz, span: { end: 100 } }]}", line: "foo | extcommand foobar", values: [foobarbaz], spans: [[17 23]]}
+    {test: external_completer_override_display_value, setup: "$env.config.completions.external.completer = {|input| [{ value: foo, display_override: blah }] }", line: "extcommand irrelevant", values: [foo], displays: [blah]}
+    # The external completer answers for the flags of `sudo`.
+    {test: external_completer_sudo, setup: "$env.config.completions.external.completer = {|input| ['--background']}", line: "sudo --back", values: [--background]}
+    {test: external_completer_wraps_builtin_commandline_complete, setup: "$env.config.completions.external.completer = {|token| $token.text | commandline complete | prepend 'bar' }", line: "foo ./test", values: [bar ./test_a/ ./test_a_symlink/ ./test_b/], paths: true}
+    # A word at the start of a statement that no command starts with is a program only when it is
+    # a path to one: the files of the working directory are offered for `./test`, not `test`.
+    {test: a_word_that_is_no_command_completes_to_files_only_as_a_path, line: "test_", values: []}
+    {test: a_word_that_is_no_command_completes_to_files_only_as_a_path, line: "./test_", has: [./test_a/], paths: true}
+    # A bare value from an external completer is one suggestion, the way a picker answers.
+    {test: external_completer_bare_value, setup: "$env.config.completions.external.completer = {|input| 123}", line: "foo ", values: ["123"]}
+    # The external completer sees the whole line: a Carapace-style one splits it into words.
+    {test: command_wide_completion_external, setup: "$env.config.completions.external.completer = {|buffer| $buffer | split row ' ' }\n@complete external\nextern \"gh\" []", line: "gh alias one two", values: [gh alias one two]}
+    # `generate completions` attaches positional completions this way, keeping how they parse.
+    {test: extern_external_argument_rest_completion, setup: "def \"nu-complete tool remotes\" [] { [{value: origin} {value: upstream}] }\n@complete external\nextern \"tool push\" [...args: external_arg@\"nu-complete tool remotes\"]", line: "tool push up", values: [upstream]}
+    # A cobra tool's completer passes these words, minus its name, to `<tool> __complete`.
+    {test: command_wide_completion_sees_every_word_of_an_extern, setup: "def \"nu-complete tool\" [place: record] { [{value: ($place.command | to nuon)}] }\n@complete \"nu-complete tool\"\nextern \"tool issue list\" [--state: string]", line: "tool issue list --state ", values: ["[\"tool issue list\", --state, \"\"]"]}
+    # Carapace and other external completers list the flags the signature declares too.
+    {test: command_wide_completion_external_skips_declared_flags, setup: "$env.config.completions.external.completer = {|buffer| [--short --porcelain] }\n@complete external\nextern \"gs\" [--short(-s)]", line: "gs --", values: [--short --porcelain]}
+    # https://github.com/nushell/nushell/issues/18007
+    {test: "command_wide_completion_custom::explicit_return", setup: "def \"nu-complete foo\" [buffer] { return (($buffer | split row ' ') ++ [some more]) }\n@complete \"nu-complete foo\"\ndef --wrapped \"foo\" [...rest] {}", line: "foo bar baz", values: [foo bar baz some more]}
+    {test: "command_wide_completion_custom::implicit_return", setup: "def \"nu-complete foo\" [buffer] { (($buffer | split row ' ') ++ [some more]) }\n@complete \"nu-complete foo\"\ndef --wrapped \"foo\" [...rest] {}", line: "foo bar baz", values: [foo bar baz some more]}
+    {test: command_wide_completion_wrapped_untyped_equals_flag_value, setup: "$env.config.completions.external = { enable: true, max_results: 100, completer: {|buffer| [$'[($buffer)]'] } }", line: "\n        def \"nu-complete wt\" [token] {\n            let last = $token.text\n            if ($last | str starts-with \"--base=\") {\n                [--base=releases/4.x.x --base=main]\n            } else {\n                [switch --base]\n            }\n        }\n        @complete \"nu-complete wt\"\n        def --wrapped \"wt\" [...args] {}\n        wt switch --base=rel", values: [--base=releases/4.x.x --base=main]}
+    # A command-wide completer that declines leaves the files to answer.
+    {test: "command_wide_completion_fallback::custom", fixture: "", setup: "def \"nu-complete foo\" [] { null }\n@complete \"nu-complete foo\"\ndef --wrapped \"foo\" [...rest] {}", line: "foo bar completions", values: [completions/], paths: true}
+    {test: "command_wide_completion_fallback::external", fixture: "", setup: "$env.config.completions.external = { enable: true, max_results: 100, completer: {|input| null } }\n@complete external\ndef --wrapped \"foo\" [...rest] {}", line: "foo bar completions", values: [completions/], paths: true}
+    {test: parameter_completion_overrides_command_wide_completion, setup: "$env.config.completions.external = { enable: true, max_results: 100, completer: {|buffer| [$'[($buffer)]'] } }", line: "\n        def \"nu-complete cmd\" [] {\n            [command wide completion]\n        }\n        def \"nu-complete cmd bar\" [] {\n            [bar specific]\n        }\n        @complete \"nu-complete cmd\"\n        def --wrapped \"cmd\" [\n            foo: string,\n            bar: string@\"nu-complete cmd bar\",\n            ...rest\n        ] {}\n        cmd one ", values: [bar specific]}
+    {setup: r#'
+      $env.config.completions.external = { enable: true, max_results: 100, completer: {|buffer| [$'[($buffer)]'] } }
+      def "nu-complete cmd" [token] { let last = $token.text; [command wide --with --external] | where $it starts-with $last }
+      def "nu-complete cmd bar" [] { [bar specific] }
+      @complete "nu-complete cmd"
+      def --wrapped "cmd" [--switch(-s), --flag(-f): string, foo: string, bar: string@"nu-complete cmd bar", ...rest] {}
+    '#, cases: [
+      {test: command_wide_completion_flag_completion, line: "cmd -", values: [--flag --switch --with --external], spans: [[4 5] [4 5] [4 5] [4 5]]}
+      {test: command_wide_completion_flag_completion, line: "cmd --flag ", values: [command wide --with --external], spans: [[11 11] [11 11] [11 11] [11 11]]}
+      {test: command_wide_completion_flag_completion, line: "cmd --flag=wi", values: [wide], spans: [[11 13]]}
+    ]}
+    # A `def --wrapped` rest parameter receives unknown `--x` tokens, so its completer answers for
+    # them next to the declared flags (#19097), past a positional and partly typed too; it overrides
+    # `@complete` unless it declines (`null`) or contributes (`fallback: true`).
+    {setup: "$env.config.completions.external = { enable: true, max_results: 100, completer: {|buffer| [$'[($buffer)]'] } }\ndef \"nu-complete what\" [] { [\"aaa\", \"--bbb\"] }\ndef --wrapped what [--verbose, ...args: string@\"nu-complete what\"] {}", cases: [
+      {test: wrapped_rest_completer_completes_flag_tokens, line: "what --", values: [--verbose --bbb], last_span: [5 7]}
+      {test: wrapped_rest_completer_completes_flag_tokens, line: "what aaa --b", values: [--bbb]}
+    ]}
+    {test: "wrapped_rest_completer_chains_to_command_wide_on_flag_tokens::answers", setup: "$env.config.completions.external = { enable: true, max_results: 100, completer: {|buffer| [$'[($buffer)]'] } }\ndef \"nu-complete rest\" [] { [aaa --bbb] }\ndef \"nu-complete wide\" [] { [\"--wide\"] }\n@complete \"nu-complete wide\"\ndef --wrapped both [...args: string@\"nu-complete rest\"] {}", line: "both --", values: [--bbb]}
+    {test: "wrapped_rest_completer_chains_to_command_wide_on_flag_tokens::contributes", setup: "$env.config.completions.external = { enable: true, max_results: 100, completer: {|buffer| [$'[($buffer)]'] } }\ndef \"nu-complete rest\" [] { {completions: [aaa --bbb], fallback: true} }\ndef \"nu-complete wide\" [] { [\"--wide\"] }\n@complete \"nu-complete wide\"\ndef --wrapped both [...args: string@\"nu-complete rest\"] {}", line: "both --", values: [--bbb --wide]}
+    {test: "wrapped_rest_completer_chains_to_command_wide_on_flag_tokens::declines", setup: "$env.config.completions.external = { enable: true, max_results: 100, completer: {|buffer| [$'[($buffer)]'] } }\ndef \"nu-complete rest\" [] { null }\ndef \"nu-complete wide\" [] { [\"--wide\"] }\n@complete \"nu-complete wide\"\ndef --wrapped both [...args: string@\"nu-complete rest\"] {}", line: "both --", values: [--wide]}
+    # The words before the last must each start a word of the command (`fod` does not), the last is
+    # fuzzy (`br` is in `bar` and `bcr`), and the external completer answers beside them.
+    {test: subcommand_vs_external_completer, setup: r#'
+      $env.config.completions.algorithm = "fuzzy"
+      $env.config.completions.external.completer = {|input| ["external"]}
+      def foo-test-command [] {}
+      def "foo-test-command bar" [] {}
+      def "foo-test-command aagap bcr" [] {}
+      def "food bar" [] {}
+    '#, cases: [
+      {line: "fod br", values: [external]}
+      {line: "foo bar", values: [external "food bar" "foo-test-command bar"]}
+      {line: "foo-test-command br", values: ["foo-test-command bar" "foo-test-command aagap bcr"]}
+      {line: "food br", values: [external "food bar"]}
+    ]}
+  ]
+}

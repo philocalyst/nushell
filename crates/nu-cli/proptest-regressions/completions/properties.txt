@@ -1,0 +1,13 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 662c30c5be02d34c477002c5570bf0bad58414fb6ee2982ff02379e9e479cadc # shrinks to ("a ", 2)
+cc 80d8148c545c5e3c5752a9b9c94f18860de038e30193e9d4a3d250b8b04b908a # shrinks to ((false, ""), "apr")
+cc b89fc8217ced1b49bf257b5dff97c78d7973f0db5d1352f049272a1629c67eb1 # shrinks to (" ", 1, Double, None)
+cc 16850a0ba469fee426d83495fb9152075f5f4b74db40649ffabb9363976e1326 # shrinks to "..inf"
+cc 3f5563a599f4510ea0eb798d19456b47c19072c12bb60d2fb7a22d8f2c5909a4 # shrinks to ((true, "ls "), "bet")
+cc cea3afbad357f909112e79ad938018dd247f734356f1093aee1970db9f6865e9 # shrinks to ("| ", 2)
+cc 543ca4276daa808586f826c7cf407292ff4d0d3ee0820f5f2ec2114e025ce91e # shrinks to (("( ", 1), false)

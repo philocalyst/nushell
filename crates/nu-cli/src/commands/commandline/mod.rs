@@ -7,6 +7,7 @@ mod set_prompt;
 
 pub use commandline_::Commandline;
 pub use complete::CommandlineComplete;
+pub(crate) use complete::extract_input_buffer;
 pub use edit::CommandlineEdit;
 pub use get_cursor::CommandlineGetCursor;
 pub use set_cursor::CommandlineSetCursor;

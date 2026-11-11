@@ -1,178 +1,98 @@
-use nu_engine::documentation::{FormatterValue, HelpStyle, get_flags_section};
-use nu_protocol::{Config, Span, engine::EngineState, levenshtein_distance};
-use nu_utils::IgnoreCaseExt;
-use reedline::{Completer, CompletionResult, Suggestion};
-use std::{fmt::Write, sync::Arc};
+use crate::completions::{ExampleIndex, example_preview};
+use nu_protocol::{
+    Config,
+    engine::{EngineState, Stack},
+};
+use reedline::{Completer, Completions, Preview, Reply, Request, Suggestion};
+use std::{
+    sync::{Arc, OnceLock},
+    thread,
+};
 
+/// The help menu: a search through the examples of every command, by what they do or what
+/// they say. Taking one puts it on the line in place of the command under the cursor, with
+/// the cursor on its first `<placeholder>`, ready to be completed.
+///
+/// The examples of the command being typed come first, then everyone else's.
 pub struct NuHelpCompleter {
     engine_state: Arc<EngineState>,
-    config: Arc<Config>,
+    stack: Stack,
+    /// The examples, built when the menu is first asked and shared with the next prompt's.
+    index: Arc<OnceLock<Arc<ExampleIndex>>>,
 }
 
 impl NuHelpCompleter {
-    pub fn new(engine_state: Arc<EngineState>, config: Arc<Config>) -> Self {
+    pub fn new(engine_state: Arc<EngineState>, _config: Arc<Config>) -> Self {
         Self {
             engine_state,
-            config,
+            stack: Stack::new(),
+            index: Arc::default(),
         }
-    }
-
-    fn completion_helper(&self, line: &str, pos: usize) -> Vec<Suggestion> {
-        let folded_line = line.to_folded_case();
-
-        let mut help_style = HelpStyle::default();
-        help_style.update_from_config(&self.engine_state, &self.config, Span::unknown());
-
-        let mut commands = self
-            .engine_state
-            .get_decls_sorted(false)
-            .into_iter()
-            .filter_map(|(_, decl_id)| {
-                let decl = self.engine_state.get_decl(decl_id);
-                (decl.name().to_folded_case().contains(&folded_line)
-                    || decl.description().to_folded_case().contains(&folded_line)
-                    || decl
-                        .search_terms()
-                        .into_iter()
-                        .any(|term| term.to_folded_case().contains(&folded_line))
-                    || decl
-                        .extra_description()
-                        .to_folded_case()
-                        .contains(&folded_line))
-                .then_some(decl)
-            })
-            .collect::<Vec<_>>();
-
-        commands.sort_by_cached_key(|decl| levenshtein_distance(line, decl.name()));
-
-        commands
-            .into_iter()
-            .map(|decl| {
-                let mut long_desc = String::new();
-
-                let description = decl.description();
-                if !description.is_empty() {
-                    long_desc.push_str(description);
-                    long_desc.push_str("\r\n\r\n");
-                }
-
-                let extra_desc = decl.extra_description();
-                if !extra_desc.is_empty() {
-                    long_desc.push_str(extra_desc);
-                    long_desc.push_str("\r\n\r\n");
-                }
-
-                let sig = decl.signature();
-                let _ = write!(long_desc, "Usage:\r\n  > {}\r\n", sig.call_signature());
-
-                if !sig.named.is_empty() {
-                    long_desc.push_str(&get_flags_section(&sig, &help_style, |v| match v {
-                        FormatterValue::DefaultValue(value) => {
-                            value.to_parsable_string(", ", &self.config)
-                        }
-                        FormatterValue::CodeString(text) => text.to_string(),
-                    }))
-                }
-
-                if !sig.required_positional.is_empty()
-                    || !sig.optional_positional.is_empty()
-                    || sig.rest_positional.is_some()
-                {
-                    long_desc.push_str("\r\nParameters:\r\n");
-                    for positional in &sig.required_positional {
-                        let _ = write!(long_desc, "  {}: {}\r\n", positional.name, positional.desc);
-                    }
-                    for positional in &sig.optional_positional {
-                        let _ = write!(
-                            long_desc,
-                            "  {}: {} (optional",
-                            positional.name, positional.desc
-                        );
-                        if let Some(value) = &positional.default_value {
-                            let _ = write!(
-                                long_desc,
-                                ", default: {}",
-                                value.to_parsable_string(", ", &self.config),
-                            );
-                        }
-                        let _ = write!(long_desc, ")\r\n");
-                    }
-
-                    if let Some(rest_positional) = &sig.rest_positional {
-                        let _ = write!(
-                            long_desc,
-                            "  ...{}: {}\r\n",
-                            rest_positional.name, rest_positional.desc
-                        );
-                    }
-                }
-
-                let extra: Vec<String> = decl
-                    .examples()
-                    .iter()
-                    .map(|example| example.example.replace('\n', "\r\n"))
-                    .collect();
-
-                Suggestion {
-                    value: decl.name().into(),
-                    description: Some(long_desc),
-                    extra: Some(extra),
-                    span: reedline::Span {
-                        start: pos - line.len(),
-                        end: pos,
-                    },
-                    ..Suggestion::default()
-                }
-            })
-            .collect()
     }
 }
 
 impl Completer for NuHelpCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
-        // Help completions are computed synchronously, so results are always final.
-        CompletionResult::fresh(self.completion_helper(line, pos))
+    fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+        let (line, cursor) = (request.line.to_owned(), request.cursor);
+        if let Some(index) = self.index.get() {
+            reply.send(index.search(&line, cursor));
+            return;
+        }
+        // Reading the tldr pages takes a moment, which the keystroke does not wait for.
+        let (engine_state, slot) = (Arc::clone(&self.engine_state), Arc::clone(&self.index));
+        thread::spawn(move || {
+            let index = slot.get_or_init(|| ExampleIndex::of(&engine_state));
+            if reply.is_current() {
+                reply.send(index.search(&line, cursor));
+            }
+        });
+    }
+
+    fn preview(
+        &mut self,
+        completions: &Completions,
+        index: usize,
+        width: u16,
+        reply: Reply<Preview>,
+    ) {
+        reply.send(example_preview(
+            &self.engine_state,
+            &self.stack,
+            completions,
+            index,
+            width,
+        ));
+    }
+
+    /// The preview of an example is what it gives, so a click on any row of it takes the
+    /// example, as accepting it does.
+    fn preview_clicked(
+        &mut self,
+        completions: &Completions,
+        index: usize,
+        _row: usize,
+    ) -> Option<Suggestion> {
+        completions.items.get(index).cloned()
     }
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
-    use rstest::rstest;
 
-    #[rstest]
-    // `whoam` only matches the name `whoami`, so help text elsewhere can't change the result.
-    #[case("whoam", 3, 8, &["whoami"])]
-    #[case("hash", 1, 5, &["hash", "hash md5", "hash sha256", "hash sha512"])]
-    #[case("into f", 0, 6, &["into float", "into filesize"])]
-    #[case("into nonexistent", 0, 16, &[])]
-    fn test_help_completer(
-        #[case] line: &str,
-        #[case] start: usize,
-        #[case] end: usize,
-        #[case] expected: &[&str],
-    ) {
+    #[test]
+    fn clicking_the_preview_of_an_example_takes_it() {
         let engine_state =
             nu_command::add_shell_command_context(nu_cmd_lang::create_default_context());
         let config = engine_state.get_config().clone();
         let mut completer = NuHelpCompleter::new(engine_state.into(), config);
-        let completion = completer.complete(line, end);
-        let suggestions = completion.suggestions();
-
-        assert_eq!(
-            expected.len(),
-            suggestions.len(),
-            "expected {:?}, got {:?}",
-            expected,
-            suggestions
-                .iter()
-                .map(|s| s.value.clone())
-                .collect::<Vec<_>>()
-        );
-
-        for (exp, actual) in expected.iter().zip(suggestions) {
-            assert_eq!(exp, &actual.value);
-            assert_eq!(reedline::Span::new(start, end), actual.span);
-        }
+        let item = Suggestion {
+            value: "git switch <branch>".into(),
+            cursor: Some(19),
+            ..Suggestion::default()
+        };
+        let completions = Completions::new(vec![item.clone()]);
+        assert_eq!(completer.preview_clicked(&completions, 0, 2), Some(item));
+        assert_eq!(completer.preview_clicked(&completions, 1, 0), None);
     }
 }

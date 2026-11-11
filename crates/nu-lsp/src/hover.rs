@@ -240,7 +240,11 @@ mod hover_tests {
     use rstest::rstest;
 
     #[rstest]
-    #[case::variable("var.nu", (2, 0), "```\ntable\n``` \n---\nimmutable")]
+    #[case::variable(
+        "var.nu",
+        (2, 0),
+        "```\ntable<name: string, type: string, size: filesize, modified: datetime>\n``` \n---\nimmutable"
+    )]
     #[case::custom_command(
         "command.nu", (3, 0),
         "Renders some greeting message\n\n---\n### Usage \n```nu\n  hello {flags}\n```\n\n### Flags\n\n  `-h`, `--help` - Display the help message for this command\n\n"

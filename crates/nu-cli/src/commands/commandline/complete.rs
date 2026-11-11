@@ -4,8 +4,7 @@ use nu_engine::command_prelude::*;
 use nu_protocol::{FromValue, shell_error::generic::GenericError};
 
 use crate::completions::{
-    Buffer, CommandCompletion, CommandScope, Completer, CompletionEngine, DeclaredInputs,
-    DirectoryCompletion, EnvVarCompletion, FileCompletion, SemanticSuggestion, VariableCompletion,
+    CommandScope, CompletionEngine, Context, DeclaredInputs, SemanticSuggestion, Source, ask,
     flush_completion_warnings,
 };
 
@@ -65,10 +64,22 @@ impl Command for CommandlineComplete {
                     Type::record(),
                 ]),
             )
+            .named(
+                "cursor",
+                SyntaxShape::Int,
+                "Complete at this byte offset of the input instead of at its end.",
+                Some('c'),
+            )
             .switch(
                 "detailed",
                 "Output completions as records, in the format expected from custom completers.",
                 Some('d'),
+            )
+            .switch(
+                "explain",
+                "Output records saying why each completion is offered: \
+                 `{value, display, description, kind, score, why, source}`.",
+                Some('e'),
             )
             .switch(
                 "input",
@@ -97,6 +108,16 @@ Completions will be provided as if the cursor is placed at the end of the given 
 
 If no input is provided, the current commandline contents will be used instead.
 
+With --explain, each completion is a record that says where it came from and how it ranked:
+`source` names the completer (`command`, `flag`, `file`, `custom: <name>`, `external completer`,
+`delegated: ...`), `score` is the total of the fuzzy ranking and `why` its nonzero terms
+(`matched`, `prefix`, `exact`, `basename`, `hidden`, `typo`, `used`, `git`). `used` is
+the frecency of the candidate: how often and how lately the history says a command, argument or
+directory is used (a use in the last hour counts four times, in the last day twice, in the last
+week half and older a quarter). It only counts in the line editor, and in `debug complete`: this
+command does not read the history. Both are `null` for a completion that was not ranked, such as the unfiltered list
+of a custom completer or any completion under the `prefix` algorithm.
+
 With --input, the record a completer would receive at that position is returned instead of
 completions, which is the supported way to develop and test a completer from inside Nushell."
     }
@@ -118,13 +139,36 @@ completions, which is the supported way to develop and test a completer from ins
 
         let (buffer, cursor_position) =
             extract_input_buffer(&input, engine_state, head_span, source_span)?;
+        // A cursor inside the input, as the line editor has one: clamped to the input and to a
+        // character boundary, so that no offset a script passes can split a character.
+        let cursor_position = match call.get_flag::<Spanned<i64>>(engine_state, stack, "cursor")? {
+            Some(cursor) => {
+                let at = usize::try_from(cursor.item).map_err(|_| ShellError::InvalidValue {
+                    valid: "a byte offset of zero or more".into(),
+                    actual: cursor.item.to_string(),
+                    span: cursor.span,
+                })?;
+                buffer.floor_char_boundary(at.min(buffer.len()))
+            }
+            None => cursor_position,
+        };
 
         let is_detailed = call.has_flag(engine_state, stack, "detailed")?;
+        let is_explained = call.has_flag(engine_state, stack, "explain")?;
+        if is_detailed && is_explained {
+            let flag_span = |name| call.get_flag_span(stack, name).unwrap_or(head_span);
+            return Err(ShellError::IncompatibleParameters {
+                left_message: "cannot be used with --explain".into(),
+                left_span: flag_span("detailed"),
+                right_message: "--explain returns its own records".into(),
+                right_span: flag_span("explain"),
+            });
+        }
 
         // --input returns the completer's input record, not completions; reject the flags that
         // shape output.
         if call.has_flag(engine_state, stack, "input")? {
-            for conflicting in ["detailed", "type"] {
+            for conflicting in ["detailed", "explain", "type"] {
                 if let Some(span) = call.get_flag_span(stack, conflicting) {
                     return Err(ShellError::IncompatibleParameters {
                         left_message: "cannot be used with --input".into(),
@@ -193,9 +237,10 @@ completions, which is the supported way to develop and test a completer from ins
 
         let result_values: Vec<Value> = completions
             .into_iter()
-            .map(|suggestion| match is_detailed {
-                true => suggestion.into_value(call_span),
-                false => Value::string(suggestion.suggestion.value, call_span),
+            .map(|suggestion| match (is_explained, is_detailed) {
+                (true, _) => suggestion.explain(call_span),
+                (_, true) => suggestion.into_value(call_span),
+                _ => Value::string(suggestion.suggestion.value, call_span),
             })
             .collect();
 
@@ -225,6 +270,21 @@ completions, which is the supported way to develop and test a completer from ins
                     ],
                     Span::test_data(),
                 )),
+            },
+            Example {
+                description: "Say where each completion came from; `score` is the total of the \
+                              terms in `why`.",
+                example: "def my-bar [] {}; 'my-b' | commandline complete --explain | select value source",
+                result: Some(Value::test_list(vec![Value::test_record(record! {
+                    "value" => Value::test_string("my-bar"),
+                    "source" => Value::test_string("command"),
+                })])),
+            },
+            Example {
+                description: "See why a completion ranks where it does: the nonzero terms of its \
+                              score.",
+                example: "'ls' | commandline complete --explain | first | get why",
+                result: None,
             },
             Example {
                 description: "Complete filepath or glob arguments.",
@@ -259,7 +319,7 @@ completions, which is the supported way to develop and test a completer from ins
 }
 
 /// Read the buffer and cursor position from a string input or, if none, the repl state.
-fn extract_input_buffer<'a>(
+pub(crate) fn extract_input_buffer<'a>(
     input: &'a PipelineData,
     engine_state: &EngineState,
     head_span: Span,
@@ -326,26 +386,26 @@ fn generate_typed_suggestions(
     let file_id = working_set.add_file("completer", buffer_bytes);
     let file_span = working_set.get_span_for_file(file_id);
 
-    let context = completer.context(
-        &working_set,
-        Buffer {
-            text: &buffer[..cursor_position],
-            offset: file_span.start,
-        },
-        file_span,
-        &buffer_bytes[..cursor_position],
-    );
+    let context = Context {
+        span: file_span,
+        prefix: &buffer_bytes[..cursor_position],
+        ..completer.context(&working_set, &buffer[..cursor_position], file_span.start)
+    };
 
-    // Explicit matching avoids boxing the source into a `dyn` trait object.
     match completion_type {
-        CompletionType::Directory => DirectoryCompletion.fetch(&context).into_suggestions(),
+        CompletionType::Directory => ask([Source::Paths { directories: true }], &context),
         CompletionType::Path | CompletionType::Glob => {
-            FileCompletion.fetch(&context).into_suggestions()
+            ask([Source::Paths { directories: false }], &context)
         }
-        CompletionType::Command => CommandCompletion::new(CommandScope::All)
-            .fetch(&context)
-            .into_suggestions(),
-        CompletionType::Variable => VariableCompletion.fetch(&context).into_suggestions(),
-        CompletionType::EnvVar => EnvVarCompletion.fetch(&context).into_suggestions(),
+        CompletionType::Command => ask(
+            [Source::Commands {
+                scope: CommandScope::All,
+                quoted: false,
+                parent: None,
+            }],
+            &context,
+        ),
+        CompletionType::Variable => ask([Source::Variables], &context),
+        CompletionType::EnvVar => ask([Source::EnvVars], &context),
     }
 }

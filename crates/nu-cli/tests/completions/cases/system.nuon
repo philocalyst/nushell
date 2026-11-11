@@ -1,0 +1,14 @@
+# What the system knows: subcommands and processes. The files of the world are never what these
+# offer.
+{
+  world: [notes.txt docs/]
+  programs: [git]
+  cases: [
+    {test: the_subcommands_of_export_complete_like_any_command, line: "export d", has: ["export def"], lacks: [notes.txt docs/]}
+    {test: the_subcommands_of_export_complete_like_any_command, line: "export ", has: ["export def" "export alias" "export const" "export extern" "export module" "export use"], lacks: [notes.txt]}
+    {test: the_subcommands_of_export_complete_like_any_command, line: "export zzz", values: []}
+    # The process running the test is found by the start of its name, and what is inserted is its id.
+    {test: kill_finds_a_process_by_its_name, line_from: "$'kill ($nu.current-exe | path basename | str substring 0..<12)'", has: ["{pid}"], lacks: [notes.txt docs/]}
+    {test: kill_finds_a_process_by_its_name, line_from: "$'kill ($nu.pid)'", has: ["{pid}"]}
+  ]
+}

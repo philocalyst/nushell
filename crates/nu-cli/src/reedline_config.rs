@@ -1,25 +1,18 @@
-use crate::{
-    NuHelpCompleter,
-    menus::{MenuLine, NuMenuCompleter, SourceMode, SourcedMenu},
-};
+use crate::{NuHelpCompleter, menus::NuMenuCompleter};
 use crossterm::event::{KeyCode, KeyModifiers};
-use nu_ansi_term::Style;
-use nu_color_config::{color_record_to_nustyle, lookup_ansi_color_style};
 use nu_protocol::{
-    Config, EditBindings, EditModeName, KeyCodeSpec, KeyModifier, MenuInputMode, MenuLayout,
-    MenuOutputMode, ParsedKeybinding, ParsedMenu, Record, ShellError, Span, Type,
-    VALID_KEYBINDING_MODES, Value,
-    engine::{Closure, EngineState, Stack},
+    Config, EditBindings, EditModeName, KeyCodeSpec, KeyModifier, MenuLayout, ParsedKeybinding,
+    ParsedMenu, Record, ShellError, Span, Type, VALID_KEYBINDING_MODES, Value,
+    engine::{EngineState, Stack},
     extract_value,
 };
 use reedline::{
-    ColumnarMenu, DescriptionMenu, DescriptionMode, DescriptionPosition, Direction, EditCommand,
-    EditCommandDiscriminants, FindStop, Granularity, IdeMenu, InputMode, Keybindings, ListMenu,
-    Menu, MenuBuilder, MotionTarget, OutputMode, PromptEditMode, PromptEditModeDiscriminants,
-    PromptHelixMode, PromptViMode, Reedline, ReedlineEvent, ReedlineEventDiscriminants,
-    ReedlineMenu, TextObject, TextObjectBracket, TextObjectQuote, TextObjectScope, TextObjectType,
-    TraversalDirection, WordEdge, WordKind, default_emacs_keybindings,
-    default_vi_insert_keybindings, default_vi_normal_keybindings, default_vi_visual_keybindings,
+    Direction, EditCommand, EditCommandDiscriminants, FindStop, Granularity, HistoryCompleter,
+    Keybindings, MotionTarget, PromptEditMode, PromptEditModeDiscriminants, PromptHelixMode,
+    PromptViMode, Reedline, ReedlineEvent, ReedlineEventDiscriminants, ReedlineMenu, TextObject,
+    TextObjectBracket, TextObjectQuote, TextObjectScope, TextObjectType, WordEdge, WordKind,
+    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
+    default_vi_visual_keybindings,
 };
 use reedline::{
     default_helix_insert_keybindings, default_helix_normal_keybindings,
@@ -49,6 +42,9 @@ pub(crate) fn add_menus(
     Ok(line_editor)
 }
 
+/// Adds one menu of `$env.config.menus`. Every menu draws in the completion
+/// panel, so a menu's `type` and `style` no longer change how it looks; only
+/// what answers it is read from them.
 fn add_menu(
     line_editor: Reedline,
     menu: &ParsedMenu,
@@ -56,496 +52,28 @@ fn add_menu(
     stack: &Stack,
     config: Arc<Config>,
 ) -> Result<Reedline, ShellError> {
+    let name = menu.name.to_expanded_string("", &config);
+    let marker = menu.marker.to_expanded_string("", &config);
     // `nu-protocol` reads the layout, and checks it when the list is assigned.
-    match menu.layout(&config)? {
-        MenuLayout::Columnar => add_columnar_menu(line_editor, menu, engine_state, stack, &config),
-        MenuLayout::List => add_list_menu(line_editor, menu, engine_state, stack, config),
-        MenuLayout::Ide => add_ide_menu(line_editor, menu, engine_state, stack, config),
-        MenuLayout::Description => {
-            add_description_menu(line_editor, menu, engine_state, stack, config)
-        }
-    }
-}
+    let layout = menu.layout(&config)?;
 
-fn get_style(record: &Record, name: &'static str, span: Span) -> Option<Style> {
-    extract_value(name, record, span)
-        .ok()
-        .map(|text| match text {
-            Value::String { val, .. } => lookup_ansi_color_style(val),
-            Value::Record { .. } => color_record_to_nustyle(text),
-            _ => lookup_ansi_color_style("green"),
-        })
-}
-
-fn set_menu_style<M: MenuBuilder>(mut menu: M, style: &Value) -> M {
-    let span = style.span();
-    let Value::Record { val, .. } = &style else {
-        return menu;
-    };
-    if let Some(style) = get_style(val, "text", span) {
-        menu = menu.with_text_style(style);
-    }
-    if let Some(style) = get_style(val, "selected_text", span) {
-        menu = menu.with_selected_text_style(style);
-    }
-    if let Some(style) = get_style(val, "description_text", span) {
-        menu = menu.with_description_text_style(style);
-    }
-    if let Some(style) = get_style(val, "match_text", span) {
-        menu = menu.with_match_text_style(style);
-    }
-    if let Some(style) = get_style(val, "selected_match_text", span) {
-        menu = menu.with_selected_match_text_style(style);
-    }
-    menu
-}
-
-fn parse_description_position(
-    value: &Value,
-    config: &Config,
-) -> Result<DescriptionPosition, ShellError> {
-    match value
-        .to_expanded_string("", config)
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "before" => Ok(DescriptionPosition::Before),
-        "after" => Ok(DescriptionPosition::After),
-        other => Err(ShellError::InvalidValue {
-            valid: "'before' or 'after'".into(),
-            actual: format!("'{other}'"),
-            span: value.span(),
-        }),
-    }
-}
-
-/// Menu with nushell source carrying editor line.
-fn menu_with_source<M: Menu + 'static>(
-    menu: M,
-    source: &Closure,
-    span: Span,
-    stack: &Stack,
-    engine_state: Arc<EngineState>,
-    input_mode: InputMode,
-) -> ReedlineMenu {
-    let mode = SourceMode::of(&input_mode);
-    let line = MenuLine::default();
-    let completer = NuMenuCompleter::new(
-        source.block_id,
-        span,
-        stack.captures_to_stack(source.captures.clone()),
-        engine_state,
-        mode,
-        line.clone(),
-    );
-
-    ReedlineMenu::WithCompleter {
-        menu: Box::new(SourcedMenu::new(menu, line, mode)),
-        completer: Box::new(completer),
-    }
-}
-
-/// Resolve the menu's effective reedline `InputMode` from the optional
-/// `input_mode` and legacy `only_buffer_difference` fields. The result drives
-/// both the reedline menu and `NuMenuCompleter`'s span math, so it must be
-/// resolved exactly once, here. `nu-protocol` reads the fields, and checks them
-/// when the list is assigned.
-fn resolve_input_mode(menu: &ParsedMenu, config: &Config) -> Result<InputMode, ShellError> {
-    Ok(match menu.input_mode(config)? {
-        MenuInputMode::Diff => InputMode::Diff,
-        MenuInputMode::CursorPrefix => InputMode::CursorPrefix,
-        MenuInputMode::FullBuffer => InputMode::FullBuffer,
-    })
-}
-
-/// Apply the optional reedline #1071 `output_mode`. Unset preserves
-/// reedline's default (`suggested_span`).
-fn apply_output_mode<M: MenuBuilder>(
-    menu: M,
-    parsed: &ParsedMenu,
-    config: &Config,
-) -> Result<M, ShellError> {
-    Ok(match parsed.output_mode(config)? {
-        Some(MenuOutputMode::SuggestedSpan) => menu.with_output_mode(OutputMode::SuggestedSpan),
-        Some(MenuOutputMode::FullBuffer) => menu.with_output_mode(OutputMode::FullBuffer),
-        Some(MenuOutputMode::ExtendToEnd) => menu.with_output_mode(OutputMode::ExtendToEnd),
-        None => menu,
-    })
-}
-
-// Adds a columnar menu to the editor engine
-pub(crate) fn add_columnar_menu(
-    line_editor: Reedline,
-    menu: &ParsedMenu,
-    engine_state: Arc<EngineState>,
-    stack: &Stack,
-    config: &Config,
-) -> Result<Reedline, ShellError> {
-    let span = menu.r#type.span();
-    let name = menu.name.to_expanded_string("", config);
-    let mut columnar_menu = ColumnarMenu::default().with_name(&name);
-
-    if let Value::Record { val, .. } = &menu.r#type {
-        columnar_menu = match extract_value("columns", val, span) {
-            Ok(columns) => {
-                let columns = columns.as_int()?;
-                columnar_menu.with_columns(columns as u16)
-            }
-            Err(_) => columnar_menu,
-        };
-
-        columnar_menu = match extract_value("col_width", val, span) {
-            Ok(col_width) => {
-                let col_width = col_width.as_int()?;
-                columnar_menu.with_column_width(Some(col_width as usize))
-            }
-            Err(_) => columnar_menu.with_column_width(None),
-        };
-
-        columnar_menu = match extract_value("col_padding", val, span) {
-            Ok(col_padding) => {
-                let col_padding = col_padding.as_int()?;
-                columnar_menu.with_column_padding(col_padding as usize)
-            }
-            Err(_) => columnar_menu,
-        };
-
-        columnar_menu = match extract_value("tab_traversal", val, span) {
-            Ok(tab_traversal) => match tab_traversal.coerce_str()?.as_ref() {
-                "vertical" => columnar_menu.with_traversal_direction(TraversalDirection::Vertical),
-                "horizontal" => {
-                    columnar_menu.with_traversal_direction(TraversalDirection::Horizontal)
-                }
-                str => {
-                    return Err(ShellError::InvalidValue {
-                        valid: "'horizontal' or 'vertical'".into(),
-                        actual: format!("'{str}'"),
-                        span: tab_traversal.span(),
-                    });
-                }
-            },
-            Err(_) => columnar_menu,
-        };
-    }
-
-    columnar_menu = set_menu_style(columnar_menu, &menu.style);
-
-    let marker = menu.marker.to_expanded_string("", config);
-    columnar_menu = columnar_menu.with_marker(&marker);
-
-    let input_mode = resolve_input_mode(menu, config)?;
-    columnar_menu = columnar_menu.with_input_mode(input_mode);
-    columnar_menu = apply_output_mode(columnar_menu, menu, config)?;
-
-    let completer = if let Some(closure) = &menu.source {
-        menu_with_source(
-            columnar_menu,
-            closure,
-            span,
-            stack,
+    let entry = ReedlineMenu::new(name).with_marker(marker);
+    let entry = match (&menu.source, layout) {
+        (Some(closure), _) => entry.with_completer(Box::new(NuMenuCompleter::new(
+            closure.block_id,
+            menu.name.span(),
+            stack.captures_to_stack(closure.captures.clone()),
             engine_state,
-            input_mode,
-        )
-    } else {
-        ReedlineMenu::EngineCompleter(Box::new(SourcedMenu::abandoning(columnar_menu)))
-    };
-
-    Ok(line_editor.with_menu(completer))
-}
-
-// Adds a search menu to the line editor
-pub(crate) fn add_list_menu(
-    line_editor: Reedline,
-    menu: &ParsedMenu,
-    engine_state: Arc<EngineState>,
-    stack: &Stack,
-    config: Arc<Config>,
-) -> Result<Reedline, ShellError> {
-    let name = menu.name.to_expanded_string("", &config);
-    let mut list_menu = ListMenu::default().with_name(&name);
-
-    let span = menu.r#type.span();
-    if let Value::Record { val, .. } = &menu.r#type {
-        list_menu = match extract_value("page_size", val, span) {
-            Ok(page_size) => {
-                let page_size = page_size.as_int()?;
-                list_menu.with_page_size(page_size as usize)
-            }
-            Err(_) => list_menu,
-        };
-
-        list_menu = match extract_value("description_position", val, span) {
-            Ok(position) => {
-                list_menu.with_description_position(parse_description_position(position, &config)?)
-            }
-            Err(_) => list_menu,
-        };
-    }
-
-    list_menu = set_menu_style(list_menu, &menu.style);
-
-    let marker = menu.marker.to_expanded_string("", &config);
-    list_menu = list_menu.with_marker(&marker);
-
-    let input_mode = resolve_input_mode(menu, &config)?;
-    list_menu = list_menu.with_input_mode(input_mode);
-    list_menu = apply_output_mode(list_menu, menu, &config)?;
-
-    let completer = if let Some(closure) = &menu.source {
-        menu_with_source(list_menu, closure, span, stack, engine_state, input_mode)
-    } else {
-        ReedlineMenu::HistoryMenu(Box::new(list_menu))
-    };
-
-    Ok(line_editor.with_menu(completer))
-}
-
-// Adds an IDE menu to the line editor
-pub(crate) fn add_ide_menu(
-    line_editor: Reedline,
-    menu: &ParsedMenu,
-    engine_state: Arc<EngineState>,
-    stack: &Stack,
-    config: Arc<Config>,
-) -> Result<Reedline, ShellError> {
-    let span = menu.r#type.span();
-    let name = menu.name.to_expanded_string("", &config);
-    let mut ide_menu = IdeMenu::default().with_name(&name);
-
-    if let Value::Record { val, .. } = &menu.r#type {
-        ide_menu = match extract_value("min_completion_width", val, span) {
-            Ok(min_completion_width) => {
-                let min_completion_width = min_completion_width.as_int()?;
-                ide_menu.with_min_completion_width(min_completion_width as u16)
-            }
-            Err(_) => ide_menu,
-        };
-
-        ide_menu = match extract_value("max_completion_width", val, span) {
-            Ok(max_completion_width) => {
-                let max_completion_width = max_completion_width.as_int()?;
-                ide_menu.with_max_completion_width(max_completion_width as u16)
-            }
-            Err(_) => ide_menu,
-        };
-
-        ide_menu = match extract_value("max_completion_height", val, span) {
-            Ok(max_completion_height) => {
-                let max_completion_height = max_completion_height.as_int()?;
-                ide_menu.with_max_completion_height(max_completion_height as u16)
-            }
-            Err(_) => ide_menu.with_max_completion_height(10u16),
-        };
-
-        ide_menu = match extract_value("padding", val, span) {
-            Ok(padding) => {
-                let padding = padding.as_int()?;
-                ide_menu.with_padding(padding as u16)
-            }
-            Err(_) => ide_menu,
-        };
-
-        ide_menu = match extract_value("border", val, span) {
-            Ok(border) => {
-                if let Ok(border) = border.as_bool() {
-                    if border {
-                        ide_menu.with_default_border()
-                    } else {
-                        ide_menu
-                    }
-                } else if let Ok(border_chars) = border.as_record() {
-                    let top_right = extract_value("top_right", border_chars, span)?.as_char()?;
-                    let top_left = extract_value("top_left", border_chars, span)?.as_char()?;
-                    let bottom_right =
-                        extract_value("bottom_right", border_chars, span)?.as_char()?;
-                    let bottom_left =
-                        extract_value("bottom_left", border_chars, span)?.as_char()?;
-                    let horizontal = extract_value("horizontal", border_chars, span)?.as_char()?;
-                    let vertical = extract_value("vertical", border_chars, span)?.as_char()?;
-
-                    ide_menu.with_border(
-                        top_right,
-                        top_left,
-                        bottom_right,
-                        bottom_left,
-                        horizontal,
-                        vertical,
-                    )
-                } else {
-                    return Err(ShellError::RuntimeTypeMismatch {
-                        expected: Type::custom("bool or record"),
-                        actual: border.get_type(),
-                        span: border.span(),
-                    });
-                }
-            }
-            Err(_) => ide_menu.with_default_border(),
-        };
-
-        ide_menu = match extract_value("cursor_offset", val, span) {
-            Ok(cursor_offset) => {
-                let cursor_offset = cursor_offset.as_int()?;
-                ide_menu.with_cursor_offset(cursor_offset as i16)
-            }
-            Err(_) => ide_menu,
-        };
-
-        ide_menu = match extract_value("description_mode", val, span) {
-            Ok(description_mode) => match description_mode.coerce_str()?.as_ref() {
-                "left" => ide_menu.with_description_mode(DescriptionMode::Left),
-                "right" => ide_menu.with_description_mode(DescriptionMode::Right),
-                "prefer_right" => ide_menu.with_description_mode(DescriptionMode::PreferRight),
-                str => {
-                    return Err(ShellError::InvalidValue {
-                        valid: "'left', 'right', or 'prefer_right'".into(),
-                        actual: format!("'{str}'"),
-                        span: description_mode.span(),
-                    });
-                }
-            },
-            Err(_) => ide_menu,
-        };
-
-        ide_menu = match extract_value("min_description_width", val, span) {
-            Ok(min_description_width) => {
-                let min_description_width = min_description_width.as_int()?;
-                ide_menu.with_min_description_width(min_description_width as u16)
-            }
-            Err(_) => ide_menu,
-        };
-
-        ide_menu = match extract_value("max_description_width", val, span) {
-            Ok(max_description_width) => {
-                let max_description_width = max_description_width.as_int()?;
-                ide_menu.with_max_description_width(max_description_width as u16)
-            }
-            Err(_) => ide_menu,
-        };
-
-        ide_menu = match extract_value("max_description_height", val, span) {
-            Ok(max_description_height) => {
-                let max_description_height = max_description_height.as_int()?;
-                ide_menu.with_max_description_height(max_description_height as u16)
-            }
-            Err(_) => ide_menu,
-        };
-
-        ide_menu = match extract_value("description_offset", val, span) {
-            Ok(description_padding) => {
-                let description_padding = description_padding.as_int()?;
-                ide_menu.with_description_offset(description_padding as u16)
-            }
-            Err(_) => ide_menu,
-        };
-
-        ide_menu = match extract_value("correct_cursor_pos", val, span) {
-            Ok(correct_cursor_pos) => {
-                let correct_cursor_pos = correct_cursor_pos.as_bool()?;
-                ide_menu.with_correct_cursor_pos(correct_cursor_pos)
-            }
-            Err(_) => ide_menu,
-        };
-    }
-
-    ide_menu = set_menu_style(ide_menu, &menu.style);
-
-    let marker = menu.marker.to_expanded_string("", &config);
-    ide_menu = ide_menu.with_marker(&marker);
-
-    let input_mode = resolve_input_mode(menu, &config)?;
-    ide_menu = ide_menu.with_input_mode(input_mode);
-    ide_menu = apply_output_mode(ide_menu, menu, &config)?;
-
-    let completer = if let Some(closure) = &menu.source {
-        menu_with_source(ide_menu, closure, span, stack, engine_state, input_mode)
-    } else {
-        ReedlineMenu::EngineCompleter(Box::new(SourcedMenu::abandoning(ide_menu)))
-    };
-
-    Ok(line_editor.with_menu(completer))
-}
-
-// Adds a description menu to the line editor
-pub(crate) fn add_description_menu(
-    line_editor: Reedline,
-    menu: &ParsedMenu,
-    engine_state: Arc<EngineState>,
-    stack: &Stack,
-    config: Arc<Config>,
-) -> Result<Reedline, ShellError> {
-    let name = menu.name.to_expanded_string("", &config);
-    let mut description_menu = DescriptionMenu::default().with_name(&name);
-
-    let span = menu.r#type.span();
-    if let Value::Record { val, .. } = &menu.r#type {
-        description_menu = match extract_value("columns", val, span) {
-            Ok(columns) => {
-                let columns = columns.as_int()?;
-                description_menu.with_columns(columns as u16)
-            }
-            Err(_) => description_menu,
-        };
-
-        description_menu = match extract_value("col_width", val, span) {
-            Ok(col_width) => {
-                let col_width = col_width.as_int()?;
-                description_menu.with_column_width(Some(col_width as usize))
-            }
-            Err(_) => description_menu.with_column_width(None),
-        };
-
-        description_menu = match extract_value("col_padding", val, span) {
-            Ok(col_padding) => {
-                let col_padding = col_padding.as_int()?;
-                description_menu.with_column_padding(col_padding as usize)
-            }
-            Err(_) => description_menu,
-        };
-
-        description_menu = match extract_value("selection_rows", val, span) {
-            Ok(selection_rows) => {
-                let selection_rows = selection_rows.as_int()?;
-                description_menu.with_selection_rows(selection_rows as u16)
-            }
-            Err(_) => description_menu,
-        };
-
-        description_menu = match extract_value("description_rows", val, span) {
-            Ok(description_rows) => {
-                let description_rows = description_rows.as_int()?;
-                description_menu.with_description_rows(description_rows as usize)
-            }
-            Err(_) => description_menu,
-        };
-    }
-
-    description_menu = set_menu_style(description_menu, &menu.style);
-
-    let marker = menu.marker.to_expanded_string("", &config);
-    description_menu = description_menu.with_marker(&marker);
-
-    let input_mode = resolve_input_mode(menu, &config)?;
-    description_menu = description_menu.with_input_mode(input_mode);
-    description_menu = apply_output_mode(description_menu, menu, &config)?;
-
-    let completer = if let Some(closure) = &menu.source {
-        menu_with_source(
-            description_menu,
-            closure,
-            span,
-            stack,
-            engine_state,
-            input_mode,
-        )
-    } else {
-        let menu_completer = NuHelpCompleter::new(engine_state, config);
-        ReedlineMenu::WithCompleter {
-            menu: Box::new(description_menu),
-            completer: Box::new(menu_completer),
+        ))),
+        // Without a source a list menu has always listed the history, and a
+        // description menu the help of commands.
+        (None, MenuLayout::List) => entry.with_completer(Box::new(HistoryCompleter)),
+        (None, MenuLayout::Description) => {
+            entry.with_completer(Box::new(NuHelpCompleter::new(engine_state, config)))
         }
+        (None, _) => entry,
     };
-
-    Ok(line_editor.with_menu(completer))
+    Ok(line_editor.with_menu(entry))
 }
 
 pub enum KeybindingsMode {
@@ -848,6 +376,9 @@ fn event_from_record(
         Ok(RED::MenuRight) => ReedlineEvent::MenuRight,
         Ok(RED::MenuPageNext) => ReedlineEvent::MenuPageNext,
         Ok(RED::MenuPagePrevious) => ReedlineEvent::MenuPagePrevious,
+        Ok(RED::MenuPreview) => ReedlineEvent::MenuPreview,
+        Ok(RED::PreviewUp) => ReedlineEvent::PreviewUp,
+        Ok(RED::PreviewDown) => ReedlineEvent::PreviewDown,
         Ok(RED::ExecuteHostCommand) => {
             let cmd = extract_value("cmd", record, span)?;
             ReedlineEvent::ExecuteHostCommand(cmd.to_expanded_string("", config))
@@ -985,6 +516,9 @@ pub(crate) fn display_reedline_event(event: ReedlineEventDiscriminants) -> Optio
         RED::MenuRight => "MenuRight",
         RED::MenuPageNext => "MenuPageNext",
         RED::MenuPagePrevious => "MenuPagePrevious",
+        RED::MenuPreview => "MenuPreview",
+        RED::PreviewUp => "PreviewUp",
+        RED::PreviewDown => "PreviewDown",
         RED::ExecuteHostCommand => "ExecuteHostCommand cmd: <string>",
         RED::OpenEditor => "OpenEditor",
         RED::SwitchMode => "SwitchMode mode: <string>",
@@ -2020,76 +1554,40 @@ mod test {
                 "object_type" => Value::test_string("brackets"),
             })
             .is_err()
-        );
+        )
     }
 
-    fn test_menu(input_mode: Option<Value>, only_buffer_difference: Option<Value>) -> ParsedMenu {
-        ParsedMenu {
-            name: Value::test_string("test_menu"),
-            marker: Value::test_string("| "),
-            only_buffer_difference,
-            input_mode,
-            output_mode: None,
-            style: Value::test_nothing(),
-            r#type: Value::test_nothing(),
-            source: None,
-        }
-    }
-
+    /// Menus of every layout are accepted: the layout no longer decides how a menu looks.
     #[test]
-    fn test_resolve_input_mode() {
-        let config = Config::default();
+    fn add_menus_accepts_any_layout() {
+        let layouts = [
+            Value::test_record(record! { "layout" => Value::test_string("columnar") }),
+            Value::test_record(record! { "layout" => Value::test_string("list") }),
+            Value::test_record(record! { "layout" => Value::test_string("description") }),
+            Value::test_record(record! { "layout" => Value::test_string("ide") }),
+        ];
+        let menus = layouts
+            .into_iter()
+            .enumerate()
+            .map(|(index, r#type)| ParsedMenu {
+                name: Value::test_string(format!("menu_{index}")),
+                marker: Value::test_string("| "),
+                only_buffer_difference: None,
+                input_mode: None,
+                output_mode: None,
+                style: Value::test_nothing(),
+                r#type,
+                source: None,
+            })
+            .collect();
+        let config = Arc::new(Config {
+            menus,
+            ..Default::default()
+        });
+        let engine_state = Arc::new(nu_cmd_lang::create_default_context());
 
-        // input_mode alone
-        assert!(matches!(
-            resolve_input_mode(
-                &test_menu(Some(Value::test_string("full_buffer")), None),
-                &config
-            ),
-            Ok(InputMode::FullBuffer)
-        ));
-
-        // input_mode supersedes a conflicting legacy flag
-        assert!(matches!(
-            resolve_input_mode(
-                &test_menu(
-                    Some(Value::test_string("diff")),
-                    Some(Value::test_bool(false))
-                ),
-                &config
-            ),
-            Ok(InputMode::Diff)
-        ));
-
-        // legacy flag alone maps to the equivalent mode
-        assert!(matches!(
-            resolve_input_mode(&test_menu(None, Some(Value::test_bool(true))), &config),
-            Ok(InputMode::Diff)
-        ));
-        assert!(matches!(
-            resolve_input_mode(&test_menu(None, Some(Value::test_bool(false))), &config),
-            Ok(InputMode::CursorPrefix)
-        ));
-
-        // neither field set is a config error
-        assert!(matches!(
-            resolve_input_mode(&test_menu(None, None), &config),
-            Err(ShellError::MissingRequiredColumn { .. })
-        ));
-    }
-
-    #[test]
-    fn test_parse_description_position() {
-        let config = Config::default();
-        assert!(matches!(
-            parse_description_position(&Value::test_string("after"), &config),
-            Ok(DescriptionPosition::After)
-        ));
-        assert!(matches!(
-            parse_description_position(&Value::test_string("before"), &config),
-            Ok(DescriptionPosition::Before)
-        ));
-        assert!(parse_description_position(&Value::test_string("nope"), &config).is_err());
+        add_menus(Reedline::create(), engine_state, &Stack::new(), config)
+            .expect("every layout is accepted");
     }
 
     #[test]

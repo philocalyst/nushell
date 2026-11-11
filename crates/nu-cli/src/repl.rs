@@ -7,8 +7,9 @@ use crate::prompt_update::{
 };
 use crate::{
     NuHighlighter, NuValidator, NushellPrompt,
-    completions::{NarrowingCache, NuCompleter, flush_completion_warnings},
-    hints::ExternalHinter,
+    completion_panel::nu_panel,
+    completions::{CompletionCache, NuCompleter, flush_completion_warnings, history_reader},
+    hints::{ExternalHinter, NuHinter},
     prompt_update,
     reedline_config::{KeybindingsMode, add_menus, create_keybindings},
     status_line::{NuStatusLine, StatusStyles},
@@ -41,9 +42,8 @@ use reedline::Helix;
 #[cfg(feature = "sqlite")]
 use reedline::SqliteBackedHistory;
 use reedline::{
-    CursorConfig, CwdAwareHinter, DefaultCompleter, EditCommand, Emacs, FileBackedHistory,
-    HistorySessionId, MouseClickMode, Osc133ClickEventsMarkers, Osc633Markers, Reedline,
-    SemanticPromptMarkers, Vi,
+    CursorConfig, DefaultCompleter, EditCommand, Emacs, FileBackedHistory, HistorySessionId,
+    MouseClickMode, Osc133ClickEventsMarkers, Osc633Markers, Reedline, SemanticPromptMarkers, Vi,
 };
 use std::ffi::OsStr;
 use std::sync::atomic::Ordering;
@@ -219,7 +219,7 @@ pub fn evaluate_repl(
     let mut previous_engine_state = engine_state.clone();
     let mut previous_stack_arc = Arc::new(unique_stack);
     // Cache survives the completer being rebuilt each prompt.
-    let completion_cache = NarrowingCache::default();
+    let completion_cache = CompletionCache::default();
     loop {
         // clone these values so that they can be moved by AssertUnwindSafe
         // If there is a panic within this iteration the last engine_state and stack
@@ -358,7 +358,7 @@ struct LoopContext<'a> {
     hostname: Option<&'a str>,
     is_hostcommand: &'a mut bool,
     /// Completion cache carried across prompts (survives the per-prompt completer rebuild).
-    completion_cache: NarrowingCache,
+    completion_cache: CompletionCache,
     /// Set for the iteration that draws the first prompt; `None` afterwards.
     first_prompt: Option<FirstPrompt>,
 }
@@ -594,6 +594,159 @@ fn run_command(ctx: RunContext) -> Reedline {
 }
 
 /// Check whether `cmd` exists in the current directory or in `$env.PATH`
+/// The line editor set up for one prompt as the config says: highlighting, validation, completion
+/// over `completion_cache`, the panel, the status line, hints and menus. The REPL and the
+/// keystroke tests set it up alike.
+pub(crate) fn editor_for_prompt(
+    line_editor: Reedline,
+    engine_state: &EngineState,
+    stack: Stack,
+    completion_cache: CompletionCache,
+    use_color: bool,
+) -> (Reedline, Arc<Stack>) {
+    let mut start_time;
+    let engine_reference = Arc::new(engine_state.clone());
+    let config = stack.get_config(engine_state);
+
+    start_time = Instant::now();
+    // Find the configured cursor shapes for each mode
+    let cursor_config = CursorConfig {
+        vi_insert: map_nucursorshape_to_cursorshape(config.cursor_shape.vi_insert),
+        vi_normal: map_nucursorshape_to_cursorshape(config.cursor_shape.vi_normal),
+        vi_visual: map_nucursorshape_to_cursorshape(config.cursor_shape.vi_visual),
+        emacs: map_nucursorshape_to_cursorshape(config.cursor_shape.emacs),
+        hx_insert: map_nucursorshape_to_cursorshape(config.cursor_shape.helix_insert),
+        hx_normal: map_nucursorshape_to_cursorshape(config.cursor_shape.helix_normal),
+        hx_select: map_nucursorshape_to_cursorshape(config.cursor_shape.helix_select),
+    };
+    perf!("get config/cursor config", start_time, use_color);
+
+    start_time = Instant::now();
+    // at this line we have cloned the state for the completer and the transient prompt
+    // until we drop those, we cannot use the stack in the REPL loop itself
+    // See STACK-REFERENCE to see where we have taken a reference
+    let stack_arc = Arc::new(stack);
+    let term_program_is_vscode = engine_state
+        .get_env_var("TERM_PROGRAM")
+        .and_then(|v| v.as_str().ok())
+        == Some("vscode");
+    let highlighter = NuHighlighter::new(
+        engine_reference.clone(),
+        // STACK-REFERENCE 1
+        stack_arc.clone(),
+    );
+    let parse_cache = highlighter.parse_cache();
+    // The completer's latest answer, which the history hint checks its next word against.
+    let latest_answer = crate::completions::LatestAnswer::default();
+    let mut line_editor = line_editor
+        .use_kitty_keyboard_enhancement(config.use_kitty_protocol)
+        // try to enable bracketed paste
+        // It doesn't work on windows system: https://github.com/crossterm-rs/crossterm/issues/737
+        .use_bracketed_paste(cfg!(not(target_os = "windows")) && config.bracketed_paste)
+        .with_highlighter(Box::new(highlighter))
+        .with_validator(Box::new(NuValidator {
+            engine_state: engine_reference.clone(),
+        }))
+        .with_completer(Box::new(
+            NuCompleter::with_cache(
+                engine_reference.clone(),
+                // STACK-REFERENCE 2
+                stack_arc.clone(),
+                completion_cache,
+            )
+            .with_parse_cache(parse_cache.clone())
+            .with_latest(latest_answer.clone())
+            .with_history_reader(history_reader(engine_state)),
+        ))
+        .with_quick_completions(config.completions.quick)
+        .with_partial_completions(config.completions.partial)
+        .with_passive_completions(config.completions.passive)
+        .with_ansi_colors(config.use_ansi_coloring.get(engine_state))
+        .with_cwd(Some(
+            engine_state
+                .cwd(None)
+                .map(|cwd| cwd.into_std_path_buf())
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+        ))
+        .with_cursor_config(cursor_config)
+        .with_abbreviations(config.abbreviations.clone())
+        .with_semantic_markers(semantic_markers_from_config(
+            &config,
+            term_program_is_vscode,
+        ))
+        .with_mouse_click(if config.shell_integration.osc133 {
+            MouseClickMode::Enabled
+        } else {
+            MouseClickMode::Disabled
+        });
+
+    perf!("reedline builder", start_time, use_color);
+
+    let style_computer = StyleComputer::from_config(engine_state, &stack_arc);
+
+    start_time = Instant::now();
+    // `color_config.selection` defaults to `{ attr: r }`, the reverse video
+    // this used to hardcode.
+    line_editor = line_editor.with_visual_selection_style(
+        style_computer.compute("selection", &Value::nothing(Span::unknown())),
+    );
+    line_editor = line_editor.with_visual_selection_cursor_style(
+        style_computer.compute("selection_cursor", &Value::nothing(Span::unknown())),
+    );
+    // As of Nov 2022, "hints" color_config closures only get `null` passed in.
+    // No meaningful span — this is a synthetic null value for style computation.
+    let hint_style = style_computer.compute("hints", &Value::nothing(Span::unknown()));
+    // The panel is framed in the style of the status line its description is drawn on.
+    let status_styles = StatusStyles::from_config(&config, &style_computer);
+    line_editor = line_editor.with_panel(Box::new(nu_panel(&config, status_styles.text)));
+    line_editor = if config.status_line.enable {
+        let repaint = line_editor.repaint_signal();
+        line_editor.with_status_line(Box::new(
+            NuStatusLine::new(
+                engine_reference.clone(),
+                parse_cache,
+                config.status_line,
+                status_styles,
+            )
+            .with_repaint(repaint),
+        ))
+    } else {
+        line_editor.disable_status_line()
+    };
+    line_editor = if config.use_ansi_coloring.get(engine_state) && config.show_hints {
+        let style = hint_style;
+        if let Some(closure) = config.hinter.closure.as_ref() {
+            line_editor.with_hinter(Box::new(ExternalHinter::new(
+                engine_reference.clone(),
+                stack_arc.clone(),
+                closure.clone(),
+                style,
+            )))
+        } else {
+            line_editor.with_hinter(Box::new(
+                NuHinter::new(engine_reference.clone(), style).with_answers(latest_answer),
+            ))
+        }
+    } else {
+        line_editor.disable_hints()
+    };
+
+    perf!("reedline coloring/style_computer", start_time, use_color);
+
+    start_time = Instant::now();
+    trace!("adding menus");
+    line_editor =
+        add_menus(line_editor, engine_reference, &stack_arc, config).unwrap_or_else(|e| {
+            report_shell_error(None, engine_state, &e);
+            Reedline::create()
+        });
+
+    perf!("reedline adding menus", start_time, use_color);
+    (line_editor, stack_arc)
+}
+
 fn editor_is_resolved(engine_state: &EngineState, stack: &Stack, cmd: &str) -> bool {
     let paths = nu_engine::env::path_str(engine_state, stack, Span::unknown()).ok();
     let cmd_os = OsStr::new(cmd);
@@ -697,129 +850,13 @@ fn loop_iteration(ctx: LoopContext) -> (bool, Stack, Reedline) {
     }
     perf!("pre-prompt hook", start_time, use_color);
 
-    let engine_reference = Arc::new(engine_state.clone());
-    let config = stack.get_config(engine_state);
-
-    start_time = Instant::now();
-    // Find the configured cursor shapes for each mode
-    let cursor_config = CursorConfig {
-        vi_insert: map_nucursorshape_to_cursorshape(config.cursor_shape.vi_insert),
-        vi_normal: map_nucursorshape_to_cursorshape(config.cursor_shape.vi_normal),
-        vi_visual: map_nucursorshape_to_cursorshape(config.cursor_shape.vi_visual),
-        emacs: map_nucursorshape_to_cursorshape(config.cursor_shape.emacs),
-        hx_insert: map_nucursorshape_to_cursorshape(config.cursor_shape.helix_insert),
-        hx_normal: map_nucursorshape_to_cursorshape(config.cursor_shape.helix_normal),
-        hx_select: map_nucursorshape_to_cursorshape(config.cursor_shape.helix_select),
-    };
-    perf!("get config/cursor config", start_time, use_color);
-
-    start_time = Instant::now();
-    // at this line we have cloned the state for the completer and the transient prompt
-    // until we drop those, we cannot use the stack in the REPL loop itself
-    // See STACK-REFERENCE to see where we have taken a reference
-    let stack_arc = Arc::new(stack);
-    let term_program_is_vscode = engine_state
-        .get_env_var("TERM_PROGRAM")
-        .and_then(|v| v.as_str().ok())
-        == Some("vscode");
-    let highlighter = NuHighlighter::new(
-        engine_reference.clone(),
-        // STACK-REFERENCE 1
-        stack_arc.clone(),
+    let (mut line_editor, stack_arc) = editor_for_prompt(
+        line_editor,
+        engine_state,
+        stack,
+        completion_cache,
+        use_color,
     );
-    let parse_cache = highlighter.parse_cache();
-    let mut line_editor = line_editor
-        .use_kitty_keyboard_enhancement(config.use_kitty_protocol)
-        // try to enable bracketed paste
-        // It doesn't work on windows system: https://github.com/crossterm-rs/crossterm/issues/737
-        .use_bracketed_paste(cfg!(not(target_os = "windows")) && config.bracketed_paste)
-        .with_highlighter(Box::new(highlighter))
-        .with_validator(Box::new(NuValidator {
-            engine_state: engine_reference.clone(),
-        }))
-        .with_completer(Box::new(NuCompleter::with_cache(
-            engine_reference.clone(),
-            // STACK-REFERENCE 2
-            stack_arc.clone(),
-            completion_cache,
-        )))
-        .with_quick_completions(config.completions.quick)
-        .with_partial_completions(config.completions.partial)
-        .with_persistent_menus(config.completions.persistent_menus)
-        .with_ansi_colors(config.use_ansi_coloring.get(engine_state))
-        .with_cwd(Some(
-            engine_state
-                .cwd(None)
-                .map(|cwd| cwd.into_std_path_buf())
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
-        ))
-        .with_cursor_config(cursor_config)
-        .with_abbreviations(config.abbreviations.clone())
-        .with_semantic_markers(semantic_markers_from_config(
-            &config,
-            term_program_is_vscode,
-        ))
-        .with_mouse_click(if config.shell_integration.osc133 {
-            MouseClickMode::Enabled
-        } else {
-            MouseClickMode::Disabled
-        });
-
-    perf!("reedline builder", start_time, use_color);
-
-    let style_computer = StyleComputer::from_config(engine_state, &stack_arc);
-
-    start_time = Instant::now();
-    // `color_config.selection` defaults to `{ attr: r }`, the reverse video
-    // this used to hardcode.
-    line_editor = line_editor.with_visual_selection_style(
-        style_computer.compute("selection", &Value::nothing(Span::unknown())),
-    );
-    line_editor = line_editor.with_visual_selection_cursor_style(
-        style_computer.compute("selection_cursor", &Value::nothing(Span::unknown())),
-    );
-    // As of Nov 2022, "hints" color_config closures only get `null` passed in.
-    // No meaningful span — this is a synthetic null value for style computation.
-    let hint_style = style_computer.compute("hints", &Value::nothing(Span::unknown()));
-    line_editor = if config.status_line.enable {
-        line_editor.with_status_line(Box::new(NuStatusLine::new(
-            engine_reference.clone(),
-            parse_cache,
-            config.status_line,
-            StatusStyles::from_config(&config, &style_computer, hint_style),
-        )))
-    } else {
-        line_editor.disable_status_line()
-    };
-    line_editor = if config.use_ansi_coloring.get(engine_state) && config.show_hints {
-        let style = hint_style;
-        if let Some(closure) = config.hinter.closure.as_ref() {
-            line_editor.with_hinter(Box::new(ExternalHinter::new(
-                engine_reference.clone(),
-                stack_arc.clone(),
-                closure.clone(),
-                style,
-            )))
-        } else {
-            line_editor.with_hinter(Box::new(CwdAwareHinter::default().with_style(style)))
-        }
-    } else {
-        line_editor.disable_hints()
-    };
-
-    perf!("reedline coloring/style_computer", start_time, use_color);
-
-    start_time = Instant::now();
-    trace!("adding menus");
-    line_editor =
-        add_menus(line_editor, engine_reference, &stack_arc, config).unwrap_or_else(|e| {
-            report_shell_error(None, engine_state, &e);
-            Reedline::create()
-        });
-
-    perf!("reedline adding menus", start_time, use_color);
 
     start_time = Instant::now();
     // No call span available in the REPL loop for editor lookup
@@ -1453,7 +1490,7 @@ fn setup_history(
 ///
 /// Setup Reedline keybindingds based on the provided config
 ///
-fn setup_keybindings(engine_state: &EngineState, line_editor: Reedline) -> Reedline {
+pub(crate) fn setup_keybindings(engine_state: &EngineState, line_editor: Reedline) -> Reedline {
     match create_keybindings(engine_state.get_config()) {
         Ok(keybindings) => match keybindings {
             KeybindingsMode::Emacs(keybindings) => {

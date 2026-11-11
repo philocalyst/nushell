@@ -1,0 +1,97 @@
+# Completion delegation: what `sudo` and `doas` run, and a completer's
+# `{delegate: {from}}` both complete part of the line as a command line of its own, and their
+# answers replace the right bytes of the line that was typed. `git`, `gitk`, `grep` and `sleep`
+# are the only programs; `{exe}` is their suffix on this platform.
+{
+  world: [notes.txt docs/]
+  programs: [git gitk grep sleep]
+  cases: [
+    # The head of a wrapped line names programs, in place of the word typed.
+    {test: a_wrapped_command_head_completes_programs_in_place, values: [git{exe} gitk{exe}], replaces: gi, lines: ["sudo gi" "doas gi" "ls | sudo gi"]}
+    # `sudo l` is not `let`, and `sudo gr` is not `grid` or `group-by`.
+    {test: a_wrapped_command_head_offers_no_nushell_commands, line: "sudo gr", values: [grep{exe}]}
+    {test: a_wrapped_command_head_offers_no_nushell_commands, line: "sudo l", lacks: [let ls]}
+    # A wrapped command's arguments go to the external completer as a line of its own (here
+    # answered in brackets, so that a space it ends with stays in the value), and the answer
+    # replaces the word typed; on the wrapper's own words, the line is the wrapper's.
+    {test: wrapped_arguments_complete_as_a_line_of_their_own, setup: "$env.config.completions.external.completer = {|buffer| [$'buf:[($buffer)]']}", line: "sudo git ch", values: ["buf:[git ch]"], replaces: "ch"}
+    {test: wrapped_arguments_complete_as_a_line_of_their_own, setup: "$env.config.completions.external.completer = {|buffer| [$'buf:[($buffer)]']}", line: "sudo --back", values: ["buf:[sudo --back]"], replaces: "--back"}
+    {test: wrapped_arguments_complete_as_a_line_of_their_own, setup: "$env.config.completions.external.completer = {|buffer| [$'buf:[($buffer)]']}", line: "sudo -p ro", values: ["buf:[sudo -p ro]"], replaces: "ro"}
+    {test: wrapped_arguments_complete_as_a_line_of_their_own, setup: "$env.config.completions.external.completer = {|buffer| [$'buf:[($buffer)]']}", line: "env A=", values: ["buf:[env A=]"], replaces: "A="}
+    {test: wrapped_arguments_complete_as_a_line_of_their_own, setup: "$env.config.completions.external.completer = {|buffer| [$'buf:[($buffer)]']}", line: "timeout 5", values: ["buf:[timeout 5]"], replaces: "5"}
+    # Without an external completer a wrapped command's arguments are files.
+    {test: wrapped_arguments_fall_back_to_files, lines: ["sudo cat no" "env A=1 cat no" "timeout 5 cat no" "exec cat no"], values: [notes.txt], replaces: no}
+    {test: wrapped_arguments_fall_back_to_files, line: "sudo -u root cat do", values: [docs/], paths: true}
+    # A wrapped `extern` or custom command completes from its signature; Nushell's own command of
+    # the same name as a program does not take the line over.
+    {test: a_wrapped_signature_is_used_and_a_builtin_is_not, setup: "extern git [--paginate(-p)]\ndef mytool [--verbose] {}", line: "sudo git --pag", values: [--paginate], replaces: --pag}
+    {test: a_wrapped_signature_is_used_and_a_builtin_is_not, setup: "def mytool [--verbose] {}", line: "sudo mytool --ver", values: [--verbose]}
+    {test: a_wrapped_signature_is_used_and_a_builtin_is_not, lines: ["sudo ls --a" "exec ls --a"], lacks: [--all]}
+    # A completer asking to complete from a byte offset gets the rest of the line completed as a
+    # command line of its own, with the answer on the line it was given.
+    {test: a_completer_can_delegate_the_rest_of_the_line, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: 5}}}", line: "xcmd gi", values: [git{exe} gitk{exe}], replaces: "gi"}
+    {test: a_completer_can_delegate_the_rest_of_the_line, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: 8}}}", line: "xcmd -x gi", values: [git{exe} gitk{exe}], replaces: "gi"}
+    {test: a_completer_can_delegate_the_rest_of_the_line, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: 8}}}", line: "xcmd é gi", values: [git{exe} gitk{exe}], replaces: "gi"}
+    {test: a_completer_can_delegate_the_rest_of_the_line, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: 11}}}", line: "pre | xcmd gi", values: [git{exe} gitk{exe}], replaces: "gi"}
+    # A delegation from the end of the line completes an empty line: every program.
+    {test: delegating_from_the_end_completes_an_empty_command, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: 5}}}", line: "xcmd ", count: 4, replaces: ""}
+    # A delegation the line cannot honour, or a malformed one, declines: the files answer.
+    {test: a_delegation_the_line_cannot_honour_declines, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: -1}}}", line: "xcmd no", values: [notes.txt]}
+    {test: a_delegation_the_line_cannot_honour_declines, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: 99999}}}", line: "xcmd no", values: [notes.txt]}
+    {test: a_delegation_the_line_cannot_honour_declines, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: 8}}}", line: "xcmd no", values: [notes.txt]}
+    {test: a_delegation_the_line_cannot_honour_declines, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: 9223372036854775807}}}", line: "xcmd no", values: [notes.txt]}
+    {test: a_delegation_the_line_cannot_honour_declines, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: 6}}}", line: "xcmd é no", values: [notes.txt]}
+    {test: a_delegation_the_line_cannot_honour_declines, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: 'a'}}}", line: "xcmd no", values: [notes.txt]}
+    {test: a_delegation_the_line_cannot_honour_declines, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: 1.5}}}", line: "xcmd no", values: [notes.txt]}
+    {test: a_delegation_the_line_cannot_honour_declines, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: null}}}", line: "xcmd no", values: [notes.txt]}
+    {test: a_malformed_delegate_declines, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {}}}", line: "xcmd no", values: [notes.txt]}
+    {test: a_malformed_delegate_declines, setup: "$env.config.completions.external.completer = {|buffer| {delegate: 5}}", line: "xcmd no", values: [notes.txt]}
+    {test: a_malformed_delegate_declines, setup: "$env.config.completions.external.completer = {|buffer| {delegate: null}}", line: "xcmd no", values: [notes.txt]}
+    {test: a_malformed_delegate_declines, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: 5, paths: 'x'}}}", line: "xcmd no", values: [notes.txt]}
+    # A completer that delegates the line it was given stops at the depth limit, as does a long
+    # chain of wrappers.
+    {test: a_delegation_to_itself_stops, setup: "$env.config.completions.external.completer = {|buffer| {delegate: {from: 0}}}", line: "xcmd no"}
+    {test: a_delegation_to_itself_stops, line_from: "$'(1..40 | each { \'sudo \' } | str join)gi'"}
+    # A `paths` closure stands in for the filesystem in the delegated line, and `commands` for
+    # `PATH`; neither shows the machine the shell runs on. A name the remote shell would split is
+    # quoted for it, then for Nushell; the prefix match first; a failing closure offers nothing.
+    {test: a_delegate_can_bring_its_own_paths_and_commands, setup: r#'
+      $env.config.completions.external.completer = {|buffer| if ($buffer | str starts-with 'xcmd ') {
+        {delegate: {from: 5,
+          paths: {|dir| match $dir { '.' => ['etc/', 'motd', 'my notes'], 'etc/' => ['hosts', 'ssh/'], _ => (error make {msg: 'no such directory'}) }},
+          commands: {|| ['foo', 'fob', 'bar']}}}
+      }}
+    '#, cases: [
+      {line: "xcmd fo", values: [fob foo], replaces: fo}
+      {line: "xcmd cat e", values: [etc/ "`'my notes'`"], replaces: e}
+      {line: "xcmd cat etc/", values: [etc/hosts etc/ssh/], replaces: etc/}
+      {line: "xcmd cat etc/h", values: [etc/hosts etc/ssh/]}
+      {lines: ["xcmd cat no" "xcmd cat do"], lacks: [notes.txt docs/]}
+      {line: "xcmd cat my", values: ["`'my notes'`"]}
+      {line: "xcmd cat nodir/n", values: []}
+      {line: "xcmd sudo cat etc/s", values: [etc/ssh/ etc/hosts]}
+    ]}
+    # Inside a quoted string the words inserted are valid for the remote shell and the string; a
+    # single quote cannot be inside a single-quoted string, so it is not offered there.
+    {test: a_delegation_inside_a_string_inserts_words_that_stay_in_it, setup: r#'$env.config.completions.external.completer = {|buffer| {delegate: {from: 6, inside: "'", paths: {|dir| ["it's", 'a"b', 'my notes', 'plain']}}}}'#, line: "xcmd 'cat ", set: ['a\"b' 'my\ notes' plain], replaces: ""}
+    {test: a_delegation_inside_a_string_inserts_words_that_stay_in_it, setup: r#'$env.config.completions.external.completer = {|buffer| {delegate: {from: 6, inside: "\"", paths: {|dir| ["it's", 'a"b', 'my notes', 'plain']}}}}'#, line: "xcmd \"cat ", set: ['a\\\"b' r#'it\\'s'# 'my\\ notes' plain], replaces: ""}
+    # A delegation that is a path completes one path of the other machine, from the byte it names,
+    # quoted for Nushell only; never the local files.
+    {test: a_delegated_path_completes_the_part_after_the_host, setup: r#'
+      $env.config.completions.external.completer = {|buffer| {delegate: {from: 10, path: true,
+        paths: {|dir| match $dir { '.' => ['etc/', 'motd', 'my notes'], 'etc/' => ['hosts'], _ => (error make {msg: 'no such directory'}) }}}}}
+    '#, cases: [
+      {line: "xcmd host:", values: [etc/ motd "`my notes`"], replaces: ""}
+      {line: "xcmd host:m", values: [motd "`my notes`"], replaces: m}
+      {line: "xcmd host:etc/", values: [etc/hosts], replaces: etc/}
+      {line: "xcmd host:nodir/n", values: []}
+    ]}
+    # The external completer the user configured knows the local machine: a line for another one is
+    # not completed by it, nor by the files of this one.
+    {test: a_remote_line_is_not_completed_by_the_external_completer, setup: "$env.config.completions.external.completer = {|buffer| if ($buffer | str starts-with 'xcmd ') { {delegate: {from: 5}} } else { ['local-answer'] }}", line: "xcmd cat lo", values: [local-answer]}
+    {test: a_remote_line_is_not_completed_by_the_external_completer, setup: "$env.config.completions.external.completer = {|buffer| if ($buffer | str starts-with 'xcmd ') { {delegate: {from: 5, paths: {|dir| ['remote-file']}}} } else { ['local-answer'] }}", cases: [
+      {line: "xcmd cat re", values: [remote-file]}
+      {line: "xcmd cat lo", values: []}
+    ]}
+  ]
+}

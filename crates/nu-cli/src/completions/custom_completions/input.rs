@@ -1,189 +1,33 @@
+//! The record a custom completer is handed, built from only the inputs it declares.
+//!
+//! - `token`: the token being completed, `{text, kind, span}`.
+//! - `place`: where in the line that is.
+//!   - `cursor`: the byte offset of the cursor.
+//!   - `target`: the `{start, end}` range a suggestion replaces.
+//!   - `kind`: what is completed (`command`, `flag-name`, `flag-value`, `positional`, ...).
+//!   - `flag` (long name, or the short name of a short-only flag) or `index` (position), and
+//!     `shape` (the declared type, as a string), where a value is completed.
+//!   - `arguments`: where an argument of a call is completed, the call's other arguments known
+//!     before it runs, keyed by the parameter they bind.
+//!   - `command`: the words of the command the cursor is in.
+//! - `buffer`: the line up to the cursor.
+
 use crate::completions::{
     Context,
-    completer::{CompletionContext, ResolvedCursor, is_flag_text},
-    to_reedline_span,
+    completer::{ResolvedCursor, is_flag_text, touches},
+    span_record, to_reedline_span,
 };
-use nu_parser::{FlatShape, flatten_expression};
-use nu_protocol::{Record, Signature, Span, SyntaxShape, Value, ast::Expr, record};
-
-/// A `{start, end}` record of byte offsets into the commandline.
-fn span_record(start: usize, end: usize, span: Span) -> Value {
-    Value::record(
-        record! {
-            "start" => Value::int(start as i64, span),
-            "end" => Value::int(end as i64, span),
-        },
-        span,
-    )
-}
-
-/// Token kind and span.
-struct Token {
-    /// `head`, `flag`, `block`, or `value`.
-    kind: &'static str,
-    /// Byte range the token occupies on the line; absent for alias-expanded tokens.
-    at: Option<(usize, usize)>,
-}
-
-impl Token {
-    /// A token spanning `start..end` of the line.
-    fn on_line(
-        buffer: &str,
-        (start, end): (usize, usize),
-        is_first: bool,
-        is_flag_shape: bool,
-    ) -> Self {
-        Self {
-            kind: Self::classify(
-                buffer.get(start..end).unwrap_or_default(),
-                is_first,
-                is_flag_shape,
-            ),
-            at: Some((start, end)),
-        }
-    }
-
-    /// A token an alias expansion produced.
-    fn expanded(text: &str, is_first: bool, is_flag_shape: bool) -> Self {
-        Self {
-            kind: Self::classify(text, is_first, is_flag_shape),
-            at: None,
-        }
-    }
-
-    /// The closure or subexpression the cursor descends into.
-    fn nesting(range: (usize, usize)) -> Self {
-        Self {
-            kind: "block",
-            at: Some(range),
-        }
-    }
-
-    /// Classifies the token strictly based on position and shape.
-    fn classify(text: &str, is_first: bool, is_flag_shape: bool) -> &'static str {
-        if is_first {
-            "head"
-        } else if is_flag_shape || is_flag_text(text) {
-            "flag"
-        } else {
-            "value"
-        }
-    }
-}
-
-/// The tokens of one context's command.
-fn context_tokens(context: &Context, level: &CompletionContext) -> Vec<Token> {
-    let cursor = context.buffer.len();
-    let element_span = level.element.map(|element| element.span);
-
-    // Clever: Pre-allocate a reasonable capacity to avoid reallocation overhead.
-    let mut tokens: Vec<Token> = Vec::with_capacity(16);
-
-    let flattened = level
-        .element
-        .map(|element| flatten_expression(context.working_set, element))
-        .unwrap_or_default();
-
-    let mut previous_span = None;
-
-    for (token_span, shape) in &flattened {
-        // Break exactly when we cross into nested territory.
-        if level
-            .descent
-            .is_some_and(|descent| token_span.start >= descent.start)
-        {
-            break;
-        }
-
-        // Bypass zero-width or duplicated implicit variable spans cleanly.
-        if token_span.start >= token_span.end || previous_span == Some(*token_span) {
-            continue;
-        }
-        previous_span = Some(*token_span);
-
-        let contents = context.working_set.get_span_contents(*token_span);
-        if contents.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-
-        let is_on_line = token_span.start >= context.offset
-            && element_span.is_some_and(|element| {
-                token_span.start >= element.start && token_span.end <= element.end
-            });
-
-        let is_first = tokens.is_empty();
-        let is_flag_shape = matches!(shape, FlatShape::Flag);
-
-        if is_on_line {
-            let start = token_span.start.saturating_sub(context.offset);
-            if start >= cursor {
-                continue;
-            }
-            let end = (token_span.end.saturating_sub(context.offset)).min(cursor);
-            tokens.push(Token::on_line(
-                context.buffer,
-                (start, end),
-                is_first,
-                is_flag_shape,
-            ));
-        } else {
-            let text = String::from_utf8_lossy(contents);
-            tokens.push(Token::expanded(&text, is_first, is_flag_shape));
-        }
-    }
-
-    if let Some(descent) = level.descent {
-        let start = descent.start.saturating_sub(context.offset);
-        let end = descent.end.saturating_sub(context.offset).min(cursor);
-        tokens.push(Token::nesting((start, end)));
-        return tokens;
-    }
-
-    if locate(&tokens, cursor).is_none() {
-        // Clever: We can safely grab the last known end point because tokens are appended sequentially.
-        let last_end = tokens
-            .iter()
-            .filter_map(|token| token.at)
-            .next_back()
-            .map(|(_, end)| end)
-            .unwrap_or(0);
-        let replacing = to_reedline_span(context.span, context.offset);
-        let start = replacing.start.max(last_end).min(cursor);
-
-        tokens.push(Token::on_line(
-            context.buffer,
-            (start, cursor),
-            tokens.is_empty(),
-            false,
-        ));
-    }
-
-    tokens
-}
-
-/// The token `offset` falls in, and its byte offset within that token.
-fn locate(tokens: &[Token], offset: usize) -> Option<(usize, usize)> {
-    let (index, token) = tokens.iter().enumerate().find(|(_, token)| {
-        token
-            .at
-            .is_some_and(|(start, end)| start <= offset && offset <= end)
-    })?;
-
-    let start = token
-        .at
-        .expect("Predicate guarantees token position is valid")
-        .0;
-    Some((index, offset - start))
-}
+use nu_parser::{TokenContents, lex};
+use nu_protocol::{
+    Record, Signature, Span, SyntaxShape, Value,
+    ast::{Argument, Call, Expr, Expression, FlagRef},
+    eval_const::eval_constant,
+    record,
+};
 
 /// Return the declared shape for the argument under the cursor.
-fn expected_shape(context: &Context, level: &CompletionContext) -> Option<SyntaxShape> {
-    let Expr::Call(call) = &level.element?.expr else {
-        return None;
-    };
-    let signature = context.working_set.get_decl(call.decl_id).signature();
-
-    match level.cursor {
+fn expected_shape(signature: &Signature, cursor: ResolvedCursor) -> Option<SyntaxShape> {
+    match cursor {
         ResolvedCursor::Positional { index } => signature
             .get_positional(index)
             .map(|positional| positional.shape.clone()),
@@ -200,6 +44,78 @@ fn expected_shape(context: &Context, level: &CompletionContext) -> Option<Syntax
     }
 }
 
+/// The arguments of `call` known before it runs, by the parameter they bind.
+///
+/// - A positional maps to its value, and the rest parameter to a list of its values.
+/// - A flag maps by long name, or by short name when it has only a short one; a switch maps to
+///   `true`, and a flag with a value to that value.
+/// - A value is its constant evaluation where there is one, else its source text.
+/// - The argument under the cursor is left out, as it is what is being completed.
+fn call_arguments(
+    context: &Context,
+    call: &Call,
+    signature: &Signature,
+    cursor: ResolvedCursor,
+) -> Record {
+    let span = context.span;
+    let at = context.offset + context.buffer.len();
+    let fixed = signature.required_positional.len() + signature.optional_positional.len();
+    let value_of = |expression: &Expression| {
+        eval_constant(context.working_set, expression).unwrap_or_else(|_| {
+            let text = context.working_set.get_span_contents(expression.span);
+            Value::string(String::from_utf8_lossy(text), span)
+        })
+    };
+
+    let (mut arguments, mut rest, mut index) = (Record::new(), Vec::new(), 0);
+    for argument in &call.arguments {
+        // A flag still awaiting its value is the one completed, though the cursor is past it.
+        let completed = touches(argument.span(), at)
+            || matches!(
+                (argument, cursor),
+                (Argument::Named((long, short, None)), ResolvedCursor::FlagValue { flag })
+                    if FlagRef::from_named(long, short.as_ref()).name() == flag
+            );
+        match argument {
+            Argument::Positional(expression) | Argument::Unknown(expression) => {
+                index += 1;
+                if completed {
+                    continue;
+                }
+                match signature.get_positional(index - 1) {
+                    Some(positional) if index <= fixed => {
+                        arguments.insert(positional.name.clone(), value_of(expression));
+                    }
+                    _ => rest.push(value_of(expression)),
+                }
+            }
+            Argument::Spread(expression) if !completed => match value_of(expression) {
+                Value::List { vals, .. } => rest.extend(vals),
+                other => rest.push(other),
+            },
+            Argument::Named((long, short, value)) if !completed => {
+                let flag = FlagRef::from_named(long, short.as_ref()).name();
+                arguments.insert(
+                    flag,
+                    value
+                        .as_ref()
+                        .map_or_else(|| Value::bool(true, span), value_of),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(parameter) = signature
+        .rest_positional
+        .as_ref()
+        .filter(|_| !rest.is_empty())
+    {
+        arguments.insert(parameter.name.clone(), Value::list(rest, span));
+    }
+    arguments
+}
+
 fn place_value(context: &Context, cursor: Value, target: Value) -> Value {
     let span = context.span;
     let mut place = record! {
@@ -207,10 +123,24 @@ fn place_value(context: &Context, cursor: Value, target: Value) -> Value {
         "target" => target,
     };
 
-    if let Some(level) = context.contexts.last() {
+    if let Some(level) = &context.level {
         place.extend(level.cursor.into_record(span));
-        if let Some(shape) = expected_shape(context, level) {
-            place.insert("shape", Value::string(shape.to_string(), span));
+        if let Some(Expr::Call(call)) = level.element.map(|element| &element.expr) {
+            let signature = context.working_set.get_decl(call.decl_id).signature();
+            if let Some(shape) = expected_shape(&signature, level.cursor) {
+                place.insert("shape", Value::string(shape.to_string(), span));
+            }
+            // Present, though maybe empty, wherever an argument is completed, so that
+            // `$place.arguments.x?` needs no guard.
+            if matches!(
+                level.cursor,
+                ResolvedCursor::FlagName
+                    | ResolvedCursor::FlagValue { .. }
+                    | ResolvedCursor::Positional { .. }
+            ) {
+                let arguments = call_arguments(context, call, &signature, level.cursor);
+                place.insert("arguments", Value::record(arguments, span));
+            }
         }
     }
 
@@ -218,6 +148,10 @@ fn place_value(context: &Context, cursor: Value, target: Value) -> Value {
     // One syntactic token per argument (no flatten), so `token`'s filtered walk
     // is never paid for when only `place` is asked for.
     place.insert("command", command_tokens(context));
+    place.insert(
+        "input",
+        crate::completions::piped::input_record(context.piped, span),
+    );
 
     Value::record(place, span)
 }
@@ -259,21 +193,17 @@ impl DeclaredInputs {
     }
 }
 
-/// Token text/span/kind for replacement range.
+/// Token text/span/kind for replacement range: the kind is the `head` of a command, a `flag`
+/// or a `value`.
 fn token_value(context: &Context) -> Value {
     let span = context.span;
     let replacing = to_reedline_span(span, context.offset);
-    let tokens = context
-        .contexts
-        .last()
-        .map(|level| context_tokens(context, level))
-        .unwrap_or_default();
-
-    let kind = locate(&tokens, context.buffer.len())
-        .map(|(index, _)| index)
-        .or_else(|| tokens.len().checked_sub(1))
-        .and_then(|index| tokens.get(index))
-        .map_or("value", |token| token.kind);
+    let kind = match context.level.map(|level| level.cursor) {
+        Some(ResolvedCursor::Command) => "head",
+        Some(ResolvedCursor::FlagName) => "flag",
+        _ if is_flag_text(context.prefix) => "flag",
+        _ => "value",
+    };
 
     let (start, end) = (replacing.start, replacing.end.min(context.buffer.len()));
     let text = context.buffer.get(start..end).unwrap_or_default();
@@ -282,7 +212,7 @@ fn token_value(context: &Context) -> Value {
         record! {
             "text" => Value::string(text, span),
             "kind" => Value::string(kind, span),
-            "span" => span_record(start, end, span),
+            "span" => span_record(reedline::Span::new(start, end), span),
         },
         span,
     )
@@ -295,7 +225,7 @@ fn place_of(context: &Context) -> Value {
     place_value(
         context,
         Value::int(context.buffer.len() as i64, span),
-        span_record(replacing.start, replacing.end, span),
+        span_record(reedline::Span::new(replacing.start, replacing.end), span),
     )
 }
 
@@ -320,9 +250,7 @@ pub(crate) fn completer_input(context: &Context, wanted: DeclaredInputs) -> Valu
 /// our legacy compat shim!
 pub(crate) fn legacy_context(context: &Context) -> Value {
     let cursor = context.offset + context.buffer.len();
-    let start = context
-        .contexts
-        .last()
+    let start = (context.level)
         .and_then(|level| level.element)
         .map(|element| element.span.start)
         .unwrap_or(cursor)
@@ -356,8 +284,15 @@ struct PlaceCommand(Vec<String>);
 impl PlaceCommand {
     fn of(context: &Context) -> Self {
         let words = Words::of(context);
-        let mut argv: Vec<String> = match context.contexts.last().and_then(|level| level.element) {
+        let mut argv: Vec<String> = match context.level.and_then(|level| level.element) {
             Some(element) => match &element.expr {
+                // A call's arguments are its words as typed: the parse splits a cluster such as
+                // `-vp` into one flag per letter, and leaves out words that are no flag of its.
+                // An alias that brings arguments of its own is read from the parse, which has
+                // them.
+                Expr::Call(call) if !words.spliced(call, element.span) => {
+                    words.typed(call, element.span)
+                }
                 Expr::Call(call) => words.call(call),
                 Expr::ExternalCall(head, args) => words.external(head, args),
                 // A bare word, variable, or cell path is its own command.
@@ -466,6 +401,30 @@ impl<'a> Words<'a> {
                 ExternalArgument::Regular(e) => self.word(e.span),
                 ExternalArgument::Spread(e) => self.spread(e.span),
             }))
+            .collect()
+    }
+
+    /// Whether `call`, written at `span`, has arguments an alias brought in from elsewhere.
+    fn spliced(&self, call: &nu_protocol::ast::Call, span: Span) -> bool {
+        call.arguments
+            .iter()
+            .any(|arg| !span.contains_span(arg.span()))
+    }
+
+    /// argv of `call` as typed at `span`: its declared name as one word, as [`Self::call`] has
+    /// it, then the shell words after its head, as the lexer splits them.
+    fn typed(&self, call: &nu_protocol::ast::Call, span: Span) -> Vec<String> {
+        let head = self.working_set.get_decl(call.decl_id).name().to_string();
+        let after = Span::new(call.head.end.min(span.end), span.end);
+        let text = self.working_set.get_span_contents(after);
+        let (tokens, _) = lex(text, after.start, &[], &[], true);
+        std::iter::once(head)
+            .chain(
+                tokens
+                    .into_iter()
+                    .filter(|token| token.contents == TokenContents::Item)
+                    .filter_map(|token| self.word(token.span)),
+            )
             .collect()
     }
 

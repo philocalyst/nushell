@@ -1,0 +1,62 @@
+# Paths typed whole or in part: absolute ones, `..` and `...` in them, a component typed exactly,
+# the quoting a name needs, and the commands that take them. On Windows, a line whose separator
+# typed last is `/` is answered with `/` throughout (`{cwd/}`). By prefix, in the `completions`
+# fixture unless a case names another.
+{
+  fixture: completions
+  prelude: "$env.config.completions.algorithm = 'prefix'"
+  cases: [
+    {test: file_completions, setup: "def list [ ...args: any ] {}", paths: true, cases: [
+      {lines: ["cp {cwd}/" "cp somefile.txt {cwd}/" "list {cwd}/" "list somefile.txt {cwd}/"], values: ["{cwd}/another/" "{cwd}/custom_completion.nu" "{cwd}/directory_completion/" "{cwd}/nushell" "{cwd}/test_a/" "{cwd}/test_a_symlink/" "{cwd}/test_b/" "{cwd}/.hidden_file" "{cwd}/.hidden_folder/"]}
+      {lines: ["cp {cwd}/another/" "list {cwd}/another/"], values: ["{cwd}/another/newfile"]}
+      {lines: ["ls {cwd}/.hidden_folder/." "list {cwd}/.hidden_folder/."], values: ["{cwd}/.hidden_folder/.hidden_subfile"]}
+      # No file stands in for a directory that does not match.
+      {line: "cd n", values: []}
+    ]}
+    {test: file_completions, os: windows, cases: [
+      {lines: ["cp {cwd}/" "cp somefile.txt {cwd}/"], values: ["{cwd/}/another/" "{cwd/}/custom_completion.nu" "{cwd/}/directory_completion/" "{cwd/}/nushell" "{cwd/}/test_a/" "{cwd/}/test_a_symlink/" "{cwd/}/test_b/" "{cwd/}/.hidden_file" "{cwd/}/.hidden_folder/"]}
+      {line: 'ls {cwd}\.hidden_folder\/.', values: ["{cwd/}/.hidden_folder/.hidden_subfile"]}
+    ]}
+    {test: file_completions_with_mixed_separators, fixture: dotnu_completions, os: windows, cases: [
+      {lines: ['ls {cwd}/lib-dir1/' 'cp {cwd}\lib-dir1/' 'ls {cwd}/lib-dir1\/' 'ls {cwd}\lib-dir1\/'], values: ["{cwd/}/lib-dir1/bar.nu" "{cwd/}/lib-dir1/baz.nu" "{cwd/}/lib-dir1/xyzzy.nu"]}
+      {lines: ['ls {cwd}\lib-dir1\' 'ls {cwd}/lib-dir1\' 'ls {cwd}/lib-dir1/\' 'ls {cwd}\lib-dir1/\'], values: ['{cwd}\lib-dir1\bar.nu' '{cwd}\lib-dir1\baz.nu' '{cwd}\lib-dir1\xyzzy.nu']}
+    ]}
+    {test: command_with_filecompletion, lines: ["ls " "open " "rm " "cp " "save " "touch " "watch "], values: [another/ custom_completion.nu directory_completion/ nushell test_a/ test_a_symlink/ test_b/ .hidden_file .hidden_folder/], paths: true}
+    {test: command_with_filecompletion, lines: ["ls custom_completion." "open custom_completion." "rm custom_completion." "cp custom_completion." "save custom_completion." "touch custom_completion." "watch custom_completion."], values: [custom_completion.nu]}
+    {test: folder_with_directorycompletions, line: "cd {cwd}/", values: ["{cwd}/another/" "{cwd}/directory_completion/" "{cwd}/test_a/" "{cwd}/test_a_symlink/" "{cwd}/test_b/" "{cwd}/.hidden_folder/"], paths: true}
+    {test: folder_with_directorycompletions, line: "cd {cwd}/", values: ["{cwd/}/another/" "{cwd/}/directory_completion/" "{cwd/}/test_a/" "{cwd/}/test_a_symlink/" "{cwd/}/test_b/" "{cwd/}/.hidden_folder/"], os: windows}
+    # `..` and `...` are kept as typed.
+    {test: folder_with_directorycompletions_with_dots, line: "cd {cwd}/directory_completion/folder_inside_folder/../", values: ["{cwd}/directory_completion/folder_inside_folder/../folder_inside_folder/"], paths: true}
+    {test: folder_with_directorycompletions_with_dots, line: 'cd {cwd}\directory_completion\folder_inside_folder/../', values: ["{cwd/}/directory_completion/folder_inside_folder/../folder_inside_folder/"], os: windows}
+    {test: folder_with_directorycompletions_with_three_trailing_dots, line: "cd {cwd}/directory_completion/folder_inside_folder/.../", values: ["{cwd}/directory_completion/folder_inside_folder/.../another/" "{cwd}/directory_completion/folder_inside_folder/.../directory_completion/" "{cwd}/directory_completion/folder_inside_folder/.../test_a/" "{cwd}/directory_completion/folder_inside_folder/.../test_a_symlink/" "{cwd}/directory_completion/folder_inside_folder/.../test_b/" "{cwd}/directory_completion/folder_inside_folder/.../.hidden_folder/"], paths: true}
+    {test: folder_with_directorycompletions_with_three_trailing_dots, line: 'cd {cwd}\directory_completion\folder_inside_folder/.../', values: ["{cwd/}/directory_completion/folder_inside_folder/.../another/" "{cwd/}/directory_completion/folder_inside_folder/.../directory_completion/" "{cwd/}/directory_completion/folder_inside_folder/.../test_a/" "{cwd/}/directory_completion/folder_inside_folder/.../test_a_symlink/" "{cwd/}/directory_completion/folder_inside_folder/.../test_b/" "{cwd/}/directory_completion/folder_inside_folder/.../.hidden_folder/"], os: windows}
+    {test: folder_with_directorycompletions_do_not_collapse_dots, line: "cd {cwd}/directory_completion/folder_inside_folder/../../", values: ["{cwd}/directory_completion/folder_inside_folder/../../another/" "{cwd}/directory_completion/folder_inside_folder/../../directory_completion/" "{cwd}/directory_completion/folder_inside_folder/../../test_a/" "{cwd}/directory_completion/folder_inside_folder/../../test_a_symlink/" "{cwd}/directory_completion/folder_inside_folder/../../test_b/" "{cwd}/directory_completion/folder_inside_folder/../../.hidden_folder/"], paths: true}
+    {test: folder_with_directorycompletions_do_not_collapse_dots, line: 'cd {cwd}\directory_completion\folder_inside_folder/../../', values: ["{cwd/}/directory_completion/folder_inside_folder/../../another/" "{cwd/}/directory_completion/folder_inside_folder/../../directory_completion/" "{cwd/}/directory_completion/folder_inside_folder/../../test_a/" "{cwd/}/directory_completion/folder_inside_folder/../../test_a_symlink/" "{cwd/}/directory_completion/folder_inside_folder/../../test_b/" "{cwd/}/directory_completion/folder_inside_folder/../../.hidden_folder/"], os: windows}
+    # Each component is a prefix: `pa/h` is every `h…` of every `pa…`.
+    {fixture: partial_completions, paths: true, cases: [
+      {test: partial_completions, line: "cd {cwd}/pa", values: ["{cwd}/partial/" "{cwd}/partial-a/" "{cwd}/partial-b/" "{cwd}/partial-c/" "`{cwd}/partial-d(/`"]}
+      {test: partial_completions, line: "cp {cwd}/pa/h", values: ["{cwd}/partial/hello.txt" "{cwd}/partial/hol/" "{cwd}/partial-a/have_ext.exe" "{cwd}/partial-a/have_ext.txt" "{cwd}/partial-a/hello" "{cwd}/partial-a/hola/" "{cwd}/partial-b/hello_b" "{cwd}/partial-b/hi_b" "{cwd}/partial-c/hello_c"]}
+      {test: partial_completions, line: "ls {cwd}/pa/", values: ["{cwd}/partial/hello.txt" "{cwd}/partial/hol/" "{cwd}/partial-a/anotherfile" "{cwd}/partial-a/have_ext.exe" "{cwd}/partial-a/have_ext.txt" "{cwd}/partial-a/hello" "{cwd}/partial-a/hola/" "{cwd}/partial-b/hello_b" "{cwd}/partial-b/hi_b" "{cwd}/partial-c/hello_c" "`{cwd}/partial-d(/.gitkeep`"]}
+      {test: partial_completions, line: "rm {cwd}/fi/so", values: ["{cwd}/final_partial/somefile"]}
+      {test: partial_completions, line: "rm {cwd}/par/../fi/so", values: ["{cwd}/partial/../final_partial/somefile" "{cwd}/partial-a/../final_partial/somefile" "{cwd}/partial-b/../final_partial/somefile" "{cwd}/partial-c/../final_partial/somefile" "`{cwd}/partial-d(/../final_partial/somefile`"]}
+      {test: partial_completions, lines: ["rm {cwd}/partial-a/have" "rm {cwd}/partial-a/have_ext."], values: ["{cwd}/partial-a/have_ext.exe" "{cwd}/partial-a/have_ext.txt"]}
+      {test: partial_completion_with_dot_expansions, line: "rm {cwd}/par/.../par/fi/so", values: ["{cwd}/partial/.../partial_completions/final_partial/somefile" "{cwd}/partial-a/.../partial_completions/final_partial/somefile" "{cwd}/partial-b/.../partial_completions/final_partial/somefile" "{cwd}/partial-c/.../partial_completions/final_partial/somefile" "`{cwd}/partial-d(/.../partial_completions/final_partial/somefile`"]}
+      # A component typed whole, in any case, is that directory alone; `part` is not, so `hol` is
+      # not either; the last component typed whole narrows nothing.
+      {test: exact_match, lines: ["open {cwd}/pArTiAL/" "open {cwd}/partial/h"], values: ["{cwd}/partial/hello.txt" "{cwd}/partial/hol/"]}
+      {test: exact_match, line: "open {cwd}/part/hol", values: ["{cwd}/partial/hol/" "{cwd}/partial-a/hola/"]}
+      {test: exact_match, line: "open {cwd}/partial", at_least: 2}
+    ]}
+    {setup: "$env.config.completions.algorithm = 'fuzzy'", cases: [
+      {test: exact_match_case_insensitive, world: [AA/foo/ aa/foo/ aaa/foo/], os: linux, line: "open {cwd}/aa/", values: ["{cwd}/AA/foo/" "{cwd}/aa/foo/" "{cwd}/aaa/foo/"]}
+      # A cached answer never answers a token that has since become a flag (`--ra` asks for no space).
+      {test: stale_file_completions_do_not_answer_a_flag_token, world: [--raw-notes.md data.csv], line: "open ", has: ["`--raw-notes.md`"]}
+      {test: stale_file_completions_do_not_answer_a_flag_token, world: [--raw-notes.md data.csv], before: "open ", line: "open --ra", values: [--raw]}
+    ]}
+    # The quotes a name needs, the one the user opened kept, and what matched in what is shown.
+    {test: file_completion_quoted_match_indices, fixture: quoted_completions, paths: true, line: "open ", values: ["`--help`" "`-42`" "`-inf`" "`4.2`" "'[a] bc.txt'" "`curly-bracket_{.txt`" "\"double`trouble'.txt\"" "`semicolon_;.txt`" "'square-bracket_[.txt'" "`te st.txt`" "te#st.txt" "`te'st.txt`" "`te(st).txt`" "`test dir/`"], displays: [--help "-42" "-inf" "4.2" "[a] bc.txt" "curly-bracket_{.txt" "double`trouble'.txt" "semicolon_;.txt" "square-bracket_[.txt" "te st.txt" "te#st.txt" "te'st.txt" "te(st).txt" "test dir/"], indices: [[] [] [] [] [] [] [] [] [] [] [] [] [] []]}
+    {test: file_completion_quoted_match_indices, fixture: quoted_completions, line: "open 'test dir/'", values: ["'test dir/double quote'" "'test dir/single quote'"], displays: ["test dir/double quote" "test dir/single quote"], indices: [[0 1 2 3 4 5 6 7] [0 1 2 3 4 5 6 7]], cases: [{} {paths: true, os: windows}]}
+    {test: file_completion_quoted_match_indices, fixture: quoted_completions, setup: "$env.config.completions.algorithm = 'fuzzy'", line: "open .t", values: ["`te st.txt`" "te#st.txt" "`te'st.txt`" "'[a] bc.txt'" "`te(st).txt`" "`semicolon_;.txt`" "`curly-bracket_{.txt`" "\"double`trouble'.txt\"" "'square-bracket_[.txt'"], displays: ["te st.txt" "te#st.txt" "te'st.txt" "[a] bc.txt" "te(st).txt" "semicolon_;.txt" "curly-bracket_{.txt" "double`trouble'.txt" "square-bracket_[.txt"], indices: [[5 6] [5 6] [5 6] [6 7] [6 7] [11 12] [15 16] [15 16] [16 17]]}
+    {test: file_completion_quoted_match_indices, fixture: quoted_completions, setup: "$env.config.completions.algorithm = 'fuzzy'", line: "open t/q", values: ["`test dir/double quote`" "`test dir/single quote`"], displays: ["test dir/double quote" "test dir/single quote"], indices: [[0 16] [0 16]], cases: [{} {paths: true, os: windows}]}
+  ]
+}

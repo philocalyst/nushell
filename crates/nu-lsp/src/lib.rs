@@ -123,7 +123,11 @@ impl LanguageServer {
             work_done_progress: Some(true),
         };
         let server_capabilities = ServerCapabilities {
-            completion_provider: Some(lsp_types::CompletionOptions::default()),
+            completion_provider: Some(lsp_types::CompletionOptions {
+                // documentation is filled in lazily by `completionItem/resolve`
+                resolve_provider: Some(true),
+                ..Default::default()
+            }),
             definition_provider: Some(OneOf::Left(true)),
             document_highlight_provider: Some(OneOf::Left(true)),
             document_symbol_provider: Some(OneOf::Left(true)),
@@ -216,6 +220,11 @@ impl LanguageServer {
                     let resp = match request.method.as_str() {
                         request::Completion::METHOD => {
                             Self::handle_lsp_request(request, |params| self.complete(params))
+                        }
+                        request::ResolveCompletionItem::METHOD => {
+                            Self::handle_lsp_request(request, |item| {
+                                self.resolve_completion_item(item)
+                            })
                         }
                         request::DocumentHighlightRequest::METHOD => {
                             Self::handle_lsp_request(request, |params| {

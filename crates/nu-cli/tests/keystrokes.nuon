@@ -1,0 +1,38 @@
+# Keys typed into the line editor as the REPL sets it up (src/keystrokes.rs runs them). `line` is
+# the line afterwards with ⌶ at the cursor, `submitted` what Enter ran. Every key is also checked
+# against the invariants the runner documents.
+[
+  {name: "a block already begun is not opened again", keys: "ls | each { |row| $row.name ", line: "ls | each { |row| $row.name ⌶"}
+  {name: "a match arm is not opened as a block", keys: "match 1 { 1 ", line: "match 1 { 1 ⌶"}
+  {name: "typing the brace an opening starts with takes it over", keys: "ls | each {", line: "ls | each {⌶"}
+  {name: "a second space does not open again", keys: "ls | each <bs> ", line: "ls | each  ⌶"}
+  {name: "a space typed inside an opening goes over its space", keys: "ls | each  ", line: "ls | each { ⌶ }"}
+  {name: "a space typed after a taken word goes over its space", keys: "ls | sort-by na<tab> ", line: "ls | sort-by name ⌶"}
+  {name: "a pipe typed after a taken file has one space before it", keys: "open Car<tab> | get ", line: "open Cargo.toml | get ⌶"}
+  {name: "a quoted lone path is taken by Tab", keys: "ls my<tab>", line: "ls `my files/`⌶"}
+  {name: "a Tab before the answer takes a quoted continuation", keys: "ls my<race><tab>", line: "ls `my files/`⌶"}
+  {name: "for opens its block", keys: "for x in [1 2] ", line: "for x in [1 2] { ⌶ }"}
+  {name: "let goes on with =", keys: "let x ", line: "let x = ⌶"}
+  {name: "a lone file is taken with one space", keys: "ls Car<tab>", line: "ls Cargo.toml ⌶"}
+  {name: "a second Tab adds nothing after a taken file", keys: "ls Car<tab><tab><tab>"}
+  {name: "a flag is taken with one space", keys: "ls --al<tab>", line: "ls --all ⌶"}
+  {name: "a typed space after a taken word is not doubled", keys: "ls Car<tab> <bs>", line: "ls Cargo.toml⌶"}
+  {name: "a space before the cursor is not doubled mid-line", keys: "ls Car data.csv<left><left><left><left><left><left><left><left><left><tab>", line: "ls Cargo.toml ⌶data.csv"}
+  {name: "a directory is taken without a space", keys: "cd sr<tab>", line: "cd src/⌶"}
+  {name: "a path with a space is quoted once", keys: "ls my<tab>", line: "ls `my files/`⌶"}
+  {name: "taking a quoted path twice does not grow it", keys: "ls my<tab><tab><tab>"}
+  {name: "each opens a closure on the space", keys: "ls | each ", line: "ls | each { ⌶ }"}
+  {name: "Backspace takes the opening back", keys: "ls | each <bs>", line: "ls | each ⌶"}
+  {name: "Tab in an opened closure does not take another command", keys: "ls | each <tab>"}
+  {name: "a Tab before the answer takes a continuation", keys: "ls Car<race><tab>", line: "ls Cargo.toml ⌶"}
+  {name: "a Tab before the answer does not take a fuzzy match", keys: "ls crgo<race><tab>", line: "ls crgo⌶"}
+  {name: "Enter runs what is typed when nothing is highlighted", keys: "ls Car<enter>", submitted: "ls Car"}
+  {name: "typing to a lone match does not take it", keys: "ls READ", line: "ls READ⌶"}
+  {name: "try is followed by catch", keys: "try { ls } <tab><enter>", line: "try { ls } catch ⌶"}
+  {name: "a word after try's block completes to catch", keys: "try { ls } c<tab>", line: "try { ls } catch ⌶"}
+  {name: "if's block is followed by else", keys: "if true { ls } el<tab>", line: "if true { ls } else ⌶"}
+  {name: "else is not compared", keys: "if true { ls } else <tab>"}
+  {name: "a catch closure's error has its fields", keys: "try { ls } catch {|e| $e.ms<tab>", line: "try { ls } catch {|e| $e.msg ⌶"}
+  {name: "a command in a catch block completes", keys: "try { ls } catch { op<tab>"}
+  {name: "a command in a try block completes", keys: "try { op<tab>"}
+]

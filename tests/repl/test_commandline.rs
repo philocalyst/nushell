@@ -154,7 +154,8 @@ fn commandline_test_accepted_command() -> TestResult {
 #[test]
 fn commandline_test_complete_input() -> TestResult {
     run_test(
-        "def test-bar [] {}\n\
+        "$env.config.completions.algorithm = 'prefix'\n\
+        def test-bar [] {}\n\
         def test-baz [] {}\n\
         'test-' | commandline complete | to nuon",
         "[test-bar, test-baz]",
@@ -164,7 +165,8 @@ fn commandline_test_complete_input() -> TestResult {
 #[test]
 fn commandline_test_complete_no_input() -> TestResult {
     run_test(
-        "def test-bar [] {}\n\
+        "$env.config.completions.algorithm = 'prefix'\n\
+        def test-bar [] {}\n\
         def test-baz [] {}\n\
         commandline edit --replace 'test-'\n\
         commandline complete | to nuon",
@@ -177,7 +179,8 @@ fn commandline_test_complete_flags() -> TestResult {
     run_test(
         "def cmd [ --flag: string, --switch(-s) ] {}\n\
         'cmd -' | commandline complete | to nuon",
-        "[--flag, --help, --switch, -h, -s]",
+        // Each flag once: its short form is drawn beside it.
+        "[--flag, --help, --switch]",
     )
 }
 
@@ -202,11 +205,11 @@ fn commandline_test_complete_reentrant() -> TestResult {
 )]
 #[case::int(
     "test-cmd --int ",
-    r#"{value: "1", span: {start: 15, end: 15}, kind: value, type: int}"#
+    r#"{value: "1", span: {start: 15, end: 15}, append_whitespace: true, kind: value, type: int}"#
 )]
 #[case::string(
     "test-cmd --string ",
-    "{value: a, span: {start: 18, end: 18}, kind: value, type: string}"
+    "{value: a, span: {start: 18, end: 18}, append_whitespace: true, kind: value, type: string}"
 )]
 fn commandline_test_complete_detailed(#[case] cmd: &str, #[case] expected: &str) -> TestResult {
     run_test(
@@ -246,6 +249,74 @@ fn commandline_test_complete_invalid_input(
     fail_test(cmd, expected_err)
 }
 
+/// `--explain` names the source of each completion and the terms of its score.
+#[rstest]
+#[case::command(
+    "'zzq-ba' | commandline complete --explain | first | select value kind source | to nuon",
+    "{value: zzq-bar, kind: command, source: command}"
+)]
+#[case::flag(
+    "'zzq-bar -' | commandline complete --explain | first | select value kind source | to nuon",
+    "{value: --flag, kind: flag, source: flag}"
+)]
+#[case::custom_completer(
+    "'zzq-bar --flag a' | commandline complete --explain | first | select value source | to nuon",
+    "{value: apple, source: \"custom: nu-complete-fruit\"}"
+)]
+#[case::list(
+    "'zzq-bar --list r' | commandline complete --explain | first | select value source | to nuon",
+    "{value: red, source: list}"
+)]
+// The terms of `why` are the nonzero ones, and they add up to `score`.
+#[case::why_adds_up(
+    "'zzq-ba' | commandline complete --explain | all {|r| ($r.why | values | math sum) == $r.score} | to nuon",
+    "true"
+)]
+#[case::why_has_only_nonzero_terms(
+    "'zzq-ba' | commandline complete --explain | first | get why | values | all {|v| $v != 0} | to nuon",
+    "true"
+)]
+// A completion that nothing ranked has no score.
+#[case::unranked(
+    "'zzq-bar --unfiltered ' | commandline complete --explain | first | select score why | to nuon",
+    "{score: null, why: null}"
+)]
+fn commandline_test_complete_explain(#[case] cmd: &str, #[case] expected: &str) -> TestResult {
+    run_test(
+        &format!(
+            "
+            def nu-complete-fruit [] {{ [apple banana] }}
+            def nu-complete-unfiltered [] {{
+                {{completions: [one two], options: {{filter: false}}}}
+            }}
+            def zzq-bar [
+                --flag: string@nu-complete-fruit,
+                --list: string@[red green],
+                --unfiltered: string@nu-complete-unfiltered,
+            ] {{}}\n\
+            \n\
+            {cmd}"
+        ),
+        expected,
+    )
+}
+
+#[rstest]
+#[case::with_detailed(
+    "'ls ' | commandline complete --explain --detailed",
+    "cannot be used with --explain"
+)]
+#[case::with_input(
+    "'ls ' | commandline complete --input --explain",
+    "cannot be used with --input"
+)]
+fn commandline_test_complete_explain_conflicts(
+    #[case] cmd: &str,
+    #[case] expected_err: &str,
+) -> TestResult {
+    fail_test(cmd, expected_err)
+}
+
 /// `--input` reports the resolved cursor and declared shape.
 #[rstest]
 #[case::command("test-", "{kind: command}")]
@@ -270,7 +341,7 @@ fn commandline_test_complete_input_cursor(#[case] cmd: &str, #[case] expected: &
             ] {{}}\n\
             \n\
             '{cmd}' | commandline complete --input \
-            | get place | reject cursor target command | to nuon"
+            | get place | reject --optional cursor target command arguments input | to nuon"
         ),
         expected,
     )
@@ -284,8 +355,8 @@ fn commandline_test_complete_input_record() -> TestResult {
         "def test-cmd [first?: string] {}\n\
         'test-cmd ab' | commandline complete --input | to nuon",
         "{token: {text: ab, kind: value, span: {start: 9, end: 11}}, \
-place: {cursor: 11, target: {start: 9, end: 11}, kind: positional, index: 0, shape: string, \
-command: [test-cmd, ab]}, buffer: \"test-cmd ab\"}",
+place: {cursor: 11, target: {start: 9, end: 11}, kind: positional, index: 0, shape: string, arguments: {}, \
+command: [test-cmd, ab], input: {type: nothing}}, buffer: \"test-cmd ab\"}",
     )
 }
 
@@ -385,8 +456,8 @@ fn commandline_test_complete_input_place_command_self_shadowing_alias() -> TestR
 fn commandline_test_complete_input_buffer() -> TestResult {
     run_test(
         "def test-cmd [first?: string] {}\n\
-        'ignored | each { test-cmd ab' | commandline complete --input | reject token place.command | to nuon",
-        "{place: {cursor: 28, target: {start: 26, end: 28}, kind: positional, index: 0, shape: string}, \
+        'ignored | each { test-cmd ab' | commandline complete --input | reject token place.command place.input | to nuon",
+        "{place: {cursor: 28, target: {start: 26, end: 28}, kind: positional, index: 0, shape: string, arguments: {}}, \
 buffer: \"ignored | each { test-cmd ab\"}",
     )
 }
@@ -410,7 +481,8 @@ fn commandline_test_complete_input_buffer_survives_a_semicolon() -> TestResult {
 fn commandline_test_complete_alias_as_completer(#[case] completer: &str) -> TestResult {
     run_test(
         &format!(
-            "def \"nu-complete a\" [input] {{ [alpha beta] }}\n\
+            "$env.config.completions.algorithm = 'prefix'\n\
+            def \"nu-complete a\" [input] {{ [alpha beta] }}\n\
             alias comp-alias = nu-complete a\n\
             alias comp-nested = comp-alias\n\
             def foo [x: string@\"{completer}\"] {{}}\n\
@@ -472,16 +544,23 @@ fn commandline_test_complete_input_last_token(
 /// trailing gap must not land on whitespace: `each { ls ⌶` is completing `ls`'s first
 /// argument, an empty slot, and never the space before it.
 #[rstest]
-#[case::closure("each { ls ")]
-#[case::nested_closure("do { each { ls ")]
-#[case::past_a_pipe("ls | each { ls ")]
-fn commandline_test_complete_input_skips_whitespace_tokens(#[case] line: &str) -> TestResult {
+#[case::closure("each { ls ", "{type: nothing}")]
+#[case::nested_closure("do { each { ls ", "{type: nothing}")]
+#[case::past_a_pipe(
+    "ls | each { ls ",
+    "{type: \"record<name: string, type: string, size: filesize, modified: datetime>\", \
+columns: [[name, type]; [name, string], [type, string], [size, filesize], [modified, datetime]]}"
+)]
+fn commandline_test_complete_input_skips_whitespace_tokens(
+    #[case] line: &str,
+    #[case] input: &str,
+) -> TestResult {
     run_test(
         &format!("'{line}' | commandline complete --input | to nuon"),
         &format!(
             "{{token: {{text: \"\", kind: value, span: {{start: {cursor}, end: {cursor}}}}}, \
 place: {{cursor: {cursor}, target: {{start: {cursor}, end: {cursor}}}, \
-kind: positional, index: 0, shape: \"oneof<glob, string>\", command: [ls, \"\"]}}, \
+kind: positional, index: 0, shape: \"oneof<glob, string>\", arguments: {{}}, command: [ls, \"\"], input: {input}}}, \
 buffer: \"{line}\"}}",
             cursor = line.len()
         ),
@@ -507,7 +586,7 @@ fn commandline_test_complete_input_gap_resolves_inside_the_closure() -> TestResu
 fn commandline_test_complete_input_resolves_deep_in_subexpressions() -> TestResult {
     run_test(
         "'ls | where a == (^ext ' | commandline complete --input\n\
-        | {buffer: $in.buffer, place: ($in.place | reject cursor target command)} | to nuon",
+        | {buffer: $in.buffer, place: ($in.place | reject cursor target command input)} | to nuon",
         "{buffer: \"ls | where a == (^ext \", place: {kind: external-arg, index: 0}}",
     )
 }
@@ -530,7 +609,7 @@ fn commandline_test_complete_input_empty_line() -> TestResult {
     run_test(
         "'' | commandline complete --input | to nuon",
         "{token: {text: \"\", kind: head, span: {start: 0, end: 0}}, \
-place: {cursor: 0, target: {start: 0, end: 0}, kind: command, command: [\"\"]}, buffer: \"\"}",
+place: {cursor: 0, target: {start: 0, end: 0}, kind: command, command: [\"\"], input: {type: nothing}}, buffer: \"\"}",
     )
 }
 

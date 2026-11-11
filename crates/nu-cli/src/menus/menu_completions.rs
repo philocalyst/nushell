@@ -1,9 +1,6 @@
-use crate::{
-    completions::{
-        CompletionEngine, DeclaredInputs, LegacyInputs, Returned, SpanClamp, bind_declared_inputs,
-        catch_completion_panic, map_value_completions, panic_to_shell_error, report,
-    },
-    menus::{MenuLine, sourced_menu::SourceMode},
+use crate::completions::{
+    CompletionEngine, DeclaredInputs, LegacyInputs, Returned, SpanClamp, bind_declared_inputs,
+    catch_completion_panic, map_value_completions, panic_to_shell_error, report,
 };
 use nu_engine::eval_block;
 use nu_protocol::{
@@ -11,18 +8,15 @@ use nu_protocol::{
     debugger::WithoutDebug,
     engine::{EngineState, Stack},
 };
-use reedline::{Completer, CompletionResult, Suggestion, menu_functions::parse_selection_char};
+use reedline::{Completer, Completions, Reply, Request, Suggestion};
 use std::sync::Arc;
 
-const SELECTION_CHAR: char = '!';
-
+/// Answers a menu from the `source` closure configured for it.
 pub struct NuMenuCompleter {
     block_id: BlockId,
     span: Span,
     stack: Stack,
     engine_state: Arc<EngineState>,
-    mode: SourceMode,
-    line: MenuLine,
 }
 
 impl NuMenuCompleter {
@@ -31,29 +25,22 @@ impl NuMenuCompleter {
         span: Span,
         stack: Stack,
         engine_state: Arc<EngineState>,
-        mode: SourceMode,
-        line: MenuLine,
     ) -> Self {
         Self {
             block_id,
             span,
             stack: stack.reset_out_dest().collect_value(),
             engine_state,
-            mode,
-            line,
         }
     }
-}
 
-impl Completer for NuMenuCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
-        let parsed = parse_selection_char(line, SELECTION_CHAR);
-        let handed = parsed.remainder;
-
+    /// What the source offers for `line` with the cursor at `cursor`.
+    pub(crate) fn suggestions(&mut self, line: &str, cursor: usize) -> Vec<Suggestion> {
+        let cursor = line.floor_char_boundary(cursor.min(line.len()));
         let block = self.engine_state.get_block(self.block_id).clone();
-        // Reedline replacement range — never fed into `$token`/`$place`.
-        let replacing = default_span(handed, pos, self.mode);
-        let (buffer, cursor) = self.mode.buffer(&self.line, handed, pos, replacing.start);
+        // What a suggestion replaces when the source names no span: the word
+        // the cursor ends.
+        let replacing = reedline::Span::new(word_start(line, cursor), cursor);
 
         // Menu sources opt into inputs; parsed per keystroke only if declared.
         let declares_positional = !block.signature.required_positional.is_empty()
@@ -61,17 +48,16 @@ impl Completer for NuMenuCompleter {
         if declares_positional {
             let wanted = DeclaredInputs::from_signature(&block.signature);
             let record = CompletionEngine::new(&self.engine_state, &self.stack)
-                .completer_input_at(&buffer, cursor, wanted);
+                .completer_input_at(line, cursor, wanted);
             bind_declared_inputs(
                 &mut self.stack,
                 &block.signature,
                 record,
-                LegacyInputs::menu(&block, &buffer, cursor, self.span),
+                LegacyInputs::menu(&block, line, cursor, self.span),
             );
         }
 
         let input = Value::nothing(self.span).into_pipeline_data();
-
         let res = catch_completion_panic(|| {
             eval_block::<WithoutDebug>(&self.engine_state, &mut self.stack, &block, input)
                 .map(|p| p.body)
@@ -79,36 +65,33 @@ impl Completer for NuMenuCompleter {
         .map_err(|payload| panic_to_shell_error(&payload, self.span))
         .and_then(|result| result);
 
-        let suggestions = match res.and_then(|data| data.into_value(self.span)) {
-            Ok(value) => convert_to_suggestions(value, replacing, &buffer[..cursor]),
+        match res.and_then(|data| data.into_value(self.span)) {
+            Ok(value) => convert_to_suggestions(value, replacing, &line[..cursor]),
             Err(err) => {
                 report(format!("failed to eval menu source: {err}"));
                 Vec::new()
             }
-        };
-
-        // Menu sources run synchronously, so results are always final.
-        CompletionResult::fresh(suggestions)
+        }
     }
 }
 
-/// Replacement span when the source names none: what reedline feeds the completer.
-fn default_span(line: &str, pos: usize, mode: SourceMode) -> reedline::Span {
-    match mode {
-        SourceMode::Diff => reedline::Span {
-            start: pos.saturating_sub(line.len()),
-            end: pos,
-        },
-        SourceMode::Live => reedline::Span {
-            start: 0,
-            end: line.len(),
-        },
+impl Completer for NuMenuCompleter {
+    fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+        reply.send(self.suggestions(request.line, request.cursor).into());
     }
+}
+
+/// Where the word ending at `cursor` starts: after the last whitespace before it.
+fn word_start(line: &str, cursor: usize) -> usize {
+    line[..cursor]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(index, c)| index + c.len_utf8())
 }
 
 /// Read a menu source's output the way a completer's is read: same accepted shapes and span
-/// handling, clamped against `seen`. The `options` of the record form are dropped — reedline
-/// filters and sorts its own list.
+/// handling, clamped against `seen`. The `options` of the record form are dropped.
 fn convert_to_suggestions(value: Value, default: reedline::Span, seen: &str) -> Vec<Suggestion> {
     // `null` declines. A menu has no next source to fall through to, so it shows nothing.
     let Some(returned) = Returned::read(value) else {
@@ -128,7 +111,6 @@ fn convert_to_suggestions(value: Value, default: reedline::Span, seen: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::menus::MenuLine;
     use nu_parser::parse;
     use nu_protocol::engine::StateWorkingSet;
     use rstest::rstest;
@@ -136,10 +118,6 @@ mod tests {
     /// A menu whose source is `source`, over an engine that knows `nu-command`'s builtins so
     /// a line like `str tri` resolves the way it would at the prompt.
     fn menu(source: &str) -> NuMenuCompleter {
-        menu_in(SourceMode::Live, source)
-    }
-
-    fn menu_in(mode: SourceMode, source: &str) -> NuMenuCompleter {
         let mut engine_state =
             nu_command::add_shell_command_context(nu_cmd_lang::create_default_context());
 
@@ -168,26 +146,11 @@ mod tests {
             Span::unknown(),
             Stack::new(),
             Arc::new(engine_state),
-            mode,
-            MenuLine::default(),
         )
     }
 
-    /// The same, on a menu that recorded the line the editor is on -- what a real menu does
-    /// on its way to the source. Without it a source sees only the text it was handed.
-    fn menu_on(source: &str, line: &str) -> NuMenuCompleter {
-        menu_on_in(SourceMode::Live, source, line)
-    }
-
-    fn menu_on_in(mode: SourceMode, source: &str, line: &str) -> NuMenuCompleter {
-        let completer = menu_in(mode, source);
-        completer.line.record(line);
-        completer
-    }
-
-    fn values(result: CompletionResult) -> Vec<String> {
-        result
-            .suggestions()
+    fn values(suggestions: Vec<Suggestion>) -> Vec<String> {
+        suggestions
             .iter()
             .map(|suggestion| suggestion.value.clone())
             .collect()
@@ -205,33 +168,8 @@ mod tests {
         ]}"#;
 
         assert_eq!(
-            values(menu(source).complete("str tri", 7)),
+            values(menu(source).suggestions("str tri", 7)),
             ["token=tri", "kind=positional", "target=4..7"],
-        );
-    }
-
-    /// The line a `Diff` menu is on reaches its source, though reedline hands the source
-    /// only what was typed since the menu opened: opening one on `ls ` completes `ls`'s
-    /// first argument, not a command on a blank line.
-    #[test]
-    fn menu_source_sees_the_line_the_menu_is_on() {
-        let source = r#"{|token, place, buffer| [
-            $"buffer=($buffer)"
-            $"kind=($place.kind)"
-            $"token=($token.kind)"
-            $"target=($place.target.start)..($place.target.end)"
-        ]}"#;
-
-        let mut completer = menu_on_in(SourceMode::Diff, source, "ls ");
-
-        assert_eq!(
-            values(completer.complete("", 3)),
-            [
-                "buffer=ls ",
-                "kind=positional",
-                "token=value",
-                "target=3..3"
-            ],
         );
     }
 
@@ -242,7 +180,7 @@ mod tests {
         let source = "{|buffer| [$buffer]}";
 
         assert_eq!(
-            values(menu(source).complete("each { str tri", 14)),
+            values(menu(source).suggestions("each { str tri", 14)),
             ["each { str tri"],
         );
     }
@@ -255,19 +193,19 @@ mod tests {
     #[case::lone_suggestion("{|input| {value: alpha}}")]
     #[case::bare_value("{|input| 'alpha'}")]
     fn menu_source_accepts_every_completer_shape(#[case] source: &str) {
-        assert_eq!(values(menu(source).complete("a", 1)), ["alpha"]);
+        assert_eq!(values(menu(source).suggestions("a", 1)), ["alpha"]);
     }
 
     /// `null` declines. A menu has no next source to fall through to, so it shows nothing.
     #[test]
     fn menu_source_returning_null_offers_nothing() {
-        assert!(values(menu("{|input| null}").complete("a", 1)).is_empty());
+        assert!(values(menu("{|input| null}").suggestions("a", 1)).is_empty());
     }
 
     #[test]
     fn panicking_menu_source_returns_no_values() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            values(menu("{|input| panic 'boom'}").complete("a", 1))
+            values(menu("{|input| panic 'boom'}").suggestions("a", 1))
         }));
 
         assert_eq!(
@@ -276,33 +214,28 @@ mod tests {
         );
     }
 
-    /// In `Diff` mode reedline hands the source only the text typed since the menu opened,
-    /// while still replacing spans in the whole line. The record's offsets must be in that
-    /// same coordinate system, or a source reading `place.target` to build its own `span`
-    /// would replace the wrong bytes.
+    /// The record describes the site at the cursor, not the buffer tail after it.
     #[test]
-    fn menu_input_offsets_match_the_span_reedline_replaces() {
-        let mut completer = menu_in(SourceMode::Diff, r#"{|place| [$"($place.target.start)"]}"#);
-
-        // `tri` typed since the menu opened, at column 4 of `str tri`.
-        assert_eq!(values(completer.complete("tri", 7)), ["4"]);
-    }
-
-    /// In `FullBuffer` mode the record still describes the site at the cursor, not the
-    /// buffer tail, even though the menu replaces the whole buffer.
-    #[test]
-    fn full_buffer_input_describes_the_cursor_not_the_tail() {
-        let mut completer = menu_on_in(
-            SourceMode::Live,
-            r#"{|place| [$"($place.kind) ($place.index)"]}"#,
-            "str tri foo",
-        );
+    fn input_describes_the_cursor_not_the_tail() {
+        let mut completer = menu(r#"{|place| [$"($place.kind) ($place.index)"]}"#);
 
         // Cursor after `tri` in `str tri foo`: `str`'s first argument, not the trailing `foo`.
         assert_eq!(
-            values(completer.complete("str tri foo", 7)),
+            values(completer.suggestions("str tri foo", 7)),
             ["positional 0"]
         );
+    }
+
+    /// A suggestion whose source names no span replaces the word the cursor ends.
+    #[test]
+    fn menu_suggestion_defaults_to_the_word_before_the_cursor() {
+        let mut completer = menu("{|input| [alpha]}");
+
+        let suggestions = completer.suggestions("str tri foo", 7);
+        assert_eq!(suggestions[0].span, reedline::Span::new(4, 7));
+
+        let suggestions = completer.suggestions("str ", 4);
+        assert_eq!(suggestions[0].span, reedline::Span::new(4, 4));
     }
 
     /// Suggestion spans are clamped against the seen text and floored to a char boundary (#5127).
@@ -310,8 +243,7 @@ mod tests {
     fn menu_suggestion_span_is_clamped_to_a_char_boundary() {
         // `é` occupies bytes 4..6 of `str é`, so 5 is mid-character and 99 is past the end.
         let mut completer = menu("{|place| [{value: v, span: {start: 5, end: 99}}]}");
-        let result = completer.complete("str é", "str é".len());
-        let suggestions = result.suggestions();
+        let suggestions = completer.suggestions("str é", "str é".len());
 
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].span, reedline::Span::new(4, 6));
@@ -323,7 +255,7 @@ mod tests {
     fn menu_source_receives_legacy_buffer_and_position() {
         let source = "{|buffer, position| [$buffer, $\"pos=($position)\"]}";
         assert_eq!(
-            values(menu(source).complete("str tri", 7)),
+            values(menu(source).suggestions("str tri", 7)),
             ["str tri", "pos=7"],
         );
     }
@@ -336,7 +268,7 @@ mod tests {
             $"kind=($token.kind)"
         ]}"#;
         assert_eq!(
-            values(menu_on(source, "ls -al").complete("ls -al", 6)),
+            values(menu(source).suggestions("ls -al", 6)),
             ["text=-al", "start=3", "kind=flag"],
         );
     }
@@ -351,7 +283,7 @@ mod tests {
             $"buffer=($buffer)"
         ]}"#;
         assert_eq!(
-            values(menu_on(source, line).complete(line, line.len())),
+            values(menu(source).suggestions(line, line.len())),
             vec![
                 "text={|r|".into(),
                 "start=10".into(),
@@ -372,7 +304,7 @@ mod tests {
             $"buffer=($buffer)"
         ]}"#;
         assert_eq!(
-            values(menu_on(source, line).complete(line, line.len())),
+            values(menu(source).suggestions(line, line.len())),
             vec![
                 "text=str uppercase".into(),
                 "start=25".into(),
@@ -427,17 +359,17 @@ mod tests {
 
         for (line, expected) in cases {
             assert_eq!(
-                values(menu_on(source, line).complete(line, line.len())),
+                values(menu(source).suggestions(line, line.len())),
                 expected,
                 "menu token/place for {line:?}"
             );
         }
     }
 
-    /// `only_buffer_difference: false` (CursorPrefix) still resolves the site token.
+    /// The token is the site at the cursor, not the whole line.
     #[test]
-    fn cursor_prefix_menu_token_is_the_site_not_the_line() {
-        let mut completer = menu_on_in(SourceMode::Live, "{|token| [$token.text]}", "ls -al");
-        assert_eq!(values(completer.complete("ls -al", 6)), ["-al"]);
+    fn menu_token_is_the_site_not_the_line() {
+        let mut completer = menu("{|token| [$token.text]}");
+        assert_eq!(values(completer.suggestions("ls -al", 6)), ["-al"]);
     }
 }

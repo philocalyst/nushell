@@ -1,0 +1,54 @@
+# What is made of the answer of an external completer or a custom one, and what is said when there
+# is no answer. Externals answer as carapace answers `hx`: each value with a trailing space.
+{
+  world: [Cargo.toml crates/ notes.md]
+  cases: [
+    {test: an_external_that_only_lists_files_is_answered_by_the_files, setup: "$env.config.completions.external = { enable: true, completer: {|spans| [\"Cargo.toml \" \"crates/ \" \"notes.md \"]} }", line: "hx ", set: [Cargo.toml crates/ notes.md]}
+    # The files are matched as Nushell matches them.
+    {test: an_external_that_only_lists_files_is_answered_by_the_files, setup: "$env.config.completions.external = { enable: true, completer: {|spans| [\"Cargo.toml \" \"crates/ \"]} }", line: "hx ntes", values: [notes.md]}
+    # The space each ends with is the one that follows it once taken; nothing is a path that is not there.
+    {test: an_external_that_lists_more_than_files_is_kept, setup: "$env.config.completions.external = { enable: true, completer: {|spans| [\"Cargo.toml \" \"--version \"]} }", line: "hx ", values: [Cargo.toml --version], taken: {Cargo.toml: "hx Cargo.toml ", --version: "hx --version "}}
+    {test: an_external_that_lists_more_than_files_is_kept, setup: "$env.config.completions.external = { enable: true, completer: {|spans| [\"nowhere \" \"nothing \"]} }", line: "hx ", values: [nowhere nothing]}
+    {test: an_empty_answer_says_why_when_the_completer_does, setup: "def reasons [] { { completions: [], message: \"nothing is left to offer\" } }\ndef tool [x: string@reasons] {}", line: "tool ", values: [], message: "nothing is left to offer"}
+    {test: an_empty_answer_says_why_when_the_completer_does, setup: "def plain [] { [] }\ndef other [x: string@plain] {}", line: "other ", values: [], message: null}
+    {test: a_completer_that_fails_says_so, setup: "def broken [] { error make { msg: \"no luck\" } }\ndef tool [x: string@broken] {}", line: "tool ", values: [], message_has: "no luck"}
+    # A `<placeholder>` in a line, as an example leaves it, is completed as the argument it stands
+    # for, and replaced whole, anywhere in it; the value of a flag is one as well.
+    {test: a_placeholder_is_an_empty_token_of_its_argument_and_is_replaced_whole, setup: "def branches [] { [main topic] }\ndef refs [] { [v1 v2] }\nextern \"tool\" [first: string@branches, second?: string@refs, --onto(-o): string@refs]", line: "tool <branch> <from> --onto <ref>", at: [5 6 7 8 9 10 11 12 13], values: [main topic], spans: [[5 13] [5 13]]}
+    {test: a_placeholder_is_an_empty_token_of_its_argument_and_is_replaced_whole, setup: "def branches [] { [main topic] }\ndef refs [] { [v1 v2] }\nextern \"tool\" [first: string@branches, second?: string@refs, --onto(-o): string@refs]", line: "tool <branch> <from> --onto <ref>", values: [v1 v2], spans: [[28 33] [28 33]], taken: "tool <branch> <from> --onto v1 "}
+    # Taking one puts the cursor on the end of the placeholder that follows.
+    {test: a_placeholder_is_an_empty_token_of_its_argument_and_is_replaced_whole, setup: "def branches [] { [main topic] }\ndef refs [] { [v1 v2] }\nextern \"tool\" [first: string@branches, second?: string@refs, --onto(-o): string@refs]", line: "tool <branch> <from> --onto <ref>", at: 8, taken: "tool main <from>⌶ --onto <ref>"}
+    # Text in a string, a word with a space in it, and one that follows a letter are what they are.
+    {test: only_the_exact_shape_is_a_placeholder, setup: "def branches [] { [main topic] }\nextern \"tool\" [first: string@branches]", line: "tool \"<branch>\"", at: [13 7], ends_at_cursor: true}
+    {test: only_the_exact_shape_is_a_placeholder, setup: "def branches [] { [main topic] }\nextern \"tool\" [first: string@branches]", line: "tool <a b>", at: 9, ends_at_cursor: true}
+    {test: only_the_exact_shape_is_a_placeholder, setup: "def branches [] { [main topic] }\nextern \"tool\" [first: string@branches]", line: "tool x<branch>", at: 14, ends_at_cursor: true}
+    # `place.arguments`: what a completer is told about the rest of the call it completes in. Positionals
+    # by parameter name, the rest as a list, flags by long name, a short-only flag by its short name,
+    # a switch as `true`, in the order written, the rest last; not the argument under the cursor.
+    {test: a_completer_is_told_the_other_arguments_of_its_call, setup: r#'
+      def show [place: record] { {options: {filter: false}, completions: [($place.arguments | to nuon)]} }
+      def tool [first: string@show, second?: string@show, ...rest: string@show, --long(-l): string@show, -s: string@show, --all(-a)] {}
+    '#, line: "tool one two three four --long v -s 1 --all ", values: ["{first: one, second: two, long: v, s: \"1\", all: true, rest: [three, four]}"]}
+    {test: a_completer_is_told_the_other_arguments_of_its_call, setup: r#'
+      def show [place: record] { {options: {filter: false}, completions: [($place.arguments | to nuon)]} }
+      def tool [first: string@show, second?: string@show, ...rest: string@show, --long(-l): string@show, -s: string@show, --all(-a)] {}
+    '#, line: "tool one -l v -a two ", values: ["{first: one, long: v, all: true, second: two}"]}
+    {test: a_completer_is_told_the_other_arguments_of_its_call, setup: r#'
+      def show [place: record] { {options: {filter: false}, completions: [($place.arguments | to nuon)]} }
+      def tool [first: string@show, second?: string@show, ...rest: string@show, --long(-l): string@show, -s: string@show, --all(-a)] {}
+    '#, lines: ["tool one tw" "tool one --long " "tool one -s " "tool one --long va"], values: ["{first: one}"]}
+    {test: a_completer_is_told_the_other_arguments_of_its_call, setup: r#'
+      def show [place: record] { {options: {filter: false}, completions: [($place.arguments | to nuon)]} }
+      def tool [first: string@show, second?: string@show, ...rest: string@show, --long(-l): string@show, -s: string@show, --all(-a)] {}
+    '#, line: "tool one two thr", values: ["{first: one, second: two}"]}
+    {test: a_completer_is_told_the_other_arguments_of_its_call, setup: r#'
+      def show [place: record] { {options: {filter: false}, completions: [($place.arguments | to nuon)]} }
+      def tool [first: string@show, second?: string@show, ...rest: string@show, --long(-l): string@show, -s: string@show, --all(-a)] {}
+    '#, line: "tool ", values: ["{}"]}
+    # A value that is not a constant is its source text.
+    {test: a_completer_is_told_the_other_arguments_of_its_call, setup: r#'
+      def show [place: record] { {options: {filter: false}, completions: [($place.arguments | to nuon)]} }
+      def tool [first: string@show, second?: string@show, ...rest: string@show, --long(-l): string@show, -s: string@show, --all(-a)] {}
+    '#, line: "tool one (ls | length) ", values: ["{first: one, second: \"(ls | length)\"}"]}
+  ]
+}

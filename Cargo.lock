@@ -1573,6 +1573,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "core_detect"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1674,6 +1680,7 @@ dependencies = [
  "derive_more 2.1.1",
  "document-features",
  "filedescriptor",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix 1.1.4",
@@ -4723,6 +4730,7 @@ dependencies = [
  "lru 0.19.0",
  "lscolors",
  "miette 7.6.0",
+ "nix 0.31.3",
  "nu-ansi-term",
  "nu-cmd-base",
  "nu-cmd-lang",
@@ -4737,11 +4745,15 @@ dependencies = [
  "nu-plugin-engine",
  "nu-protocol",
  "nu-std",
+ "nu-system",
+ "nu-table",
  "nu-test-support",
  "nu-utils",
  "nucleo-matcher",
+ "nuon",
  "parking_lot",
  "percent-encoding",
+ "proptest",
  "reedline",
  "rstest",
  "strum",
@@ -5143,6 +5155,7 @@ dependencies = [
  "nu-experimental",
  "nu-glob",
  "nu-parser",
+ "nu-path",
  "nu-protocol",
  "nu-std",
  "nu-test-support",
@@ -7359,6 +7372,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8530004ccb15eae51c7e40009fbe317f341f804db54dc033eec1c50be28cfa0"
+dependencies = [
+ "bitflags 2.13.1",
+ "chacha20",
+ "core_detect",
+ "num-traits",
+ "rand 0.10.2",
+ "rand_xorshift",
+ "regex-syntax 0.8.11",
+ "unarray",
+]
+
+[[package]]
 name = "psm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7642,6 +7671,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_xorshift"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60aa6af80be32871323012e02e6e65f8a7cc7890931ae421d217ad8fe0df2ccf"
+dependencies = [
+ "rand_core 0.10.0",
+]
+
+[[package]]
 name = "ratatui"
 version = "0.30.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7814,13 +7852,13 @@ dependencies = [
 [[package]]
 name = "reedline"
 version = "0.53.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b061d8059603bc95c569166a79ca60c01ccc8f8b6065035aed66a3753fdb06c"
+source = "git+https://github.com/philocalyst/reedline?branch=pr%2Fframe#56911b0d93d303776d9a6f16265345116a5e4e58"
 dependencies = [
  "arboard",
  "crossterm",
  "crossterm_winapi",
  "fd-lock",
+ "futures-core",
  "nu-ansi-term",
  "rusqlite",
  "rustix 1.1.4",
@@ -9721,6 +9759,12 @@ checksum = "ec9a46c2549e35c054e0ffe281a3a6ec0007793db4df106604d37ed3f4d73d1c"
 dependencies = [
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
 
 [[package]]
 name = "uncased"

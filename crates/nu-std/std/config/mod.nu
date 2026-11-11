@@ -70,6 +70,10 @@ export def dark-theme [] {
         shape_variable: purple
         shape_vardecl: purple
         shape_raw_string: light_purple
+        shape_filesize: "#d7875f"
+        shape_duration: "#5fafaf"
+        shape_cell_path: "#87afd7"
+        shape_type: "#87af87"
     }
 }
 
@@ -145,6 +149,10 @@ export def light-theme [] {
         shape_variable: purple
         shape_vardecl: purple
         shape_raw_string: light_purple
+        shape_filesize: "#af5f00"
+        shape_duration: "#00878a"
+        shape_cell_path: "#005f87"
+        shape_type: "#5f875f"
     }
 }
 

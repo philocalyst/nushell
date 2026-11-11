@@ -1,67 +1,59 @@
-use super::{SemanticSuggestion, completion_options::NuMatcher};
-use crate::completions::{Completer, Context, Fetched, to_reedline_span};
+use crate::completions::{Candidates, Context, SemanticSuggestion, to_reedline_span};
 use nu_protocol::SuggestionKind;
 use reedline::Suggestion;
 
-pub struct AttributeCompletion;
-pub struct AttributableCompletion;
+/// The `attr` commands, named without the `attr ` that `@` stands for.
+pub(crate) fn attributes(ctx: &Context) -> Candidates {
+    let mut candidates = Candidates::default();
+    let span = to_reedline_span(ctx.span, ctx.offset);
 
-impl Completer for AttributeCompletion {
-    fn fetch(&mut self, ctx: &Context) -> Fetched {
-        let working_set = ctx.working_set;
-        let span = ctx.span;
-        let offset = ctx.offset;
-        let mut matcher = NuMatcher::new(ctx.prefix_str(), ctx.options, true);
-
-        let attr_commands =
-            working_set.find_commands_by_predicate(|s| s.starts_with(b"attr "), true);
-
-        for (decl_id, name, desc, ty) in attr_commands {
-            let name = name.strip_prefix(b"attr ").unwrap_or(&name);
-            matcher.add_semantic_suggestion(SemanticSuggestion {
-                suggestion: Suggestion {
-                    value: String::from_utf8_lossy(name).into_owned(),
-                    description: desc,
-                    span: to_reedline_span(span, offset),
-                    append_whitespace: false,
-                    ..Default::default()
-                },
-                kind: Some(SuggestionKind::Command(ty, Some(decl_id))),
-            });
-        }
-
-        Fetched::answering(matcher.suggestion_results())
+    for (decl_id, name, description, ty) in ctx
+        .working_set
+        .find_commands_by_predicate(|s| s.starts_with(b"attr "), true)
+    {
+        let name = name.strip_prefix(b"attr ").unwrap_or(&name);
+        candidates.push(SemanticSuggestion {
+            suggestion: Suggestion {
+                value: String::from_utf8_lossy(name).into_owned(),
+                description,
+                span,
+                append_whitespace: false,
+                ..Default::default()
+            },
+            kind: Some(SuggestionKind::Command(ty, Some(decl_id))),
+            ..Default::default()
+        });
     }
+    candidates
 }
 
-impl Completer for AttributableCompletion {
-    fn fetch(&mut self, ctx: &Context) -> Fetched {
-        let working_set = ctx.working_set;
-        let span = ctx.span;
-        let offset = ctx.offset;
-        let mut matcher = NuMatcher::new(ctx.prefix_str(), ctx.options, true);
+/// The definitions an attribute may precede.
+pub(crate) fn attributables(ctx: &Context) -> Candidates {
+    let working_set = ctx.working_set;
+    let mut candidates = Candidates::default();
+    let span = to_reedline_span(ctx.span, ctx.offset);
 
-        for s in ["def", "extern", "export def", "export extern"] {
-            let decl_id = working_set
-                .find_decl(s.as_bytes())
-                .expect("internal error, builtin declaration not found");
-            let cmd = working_set.get_decl(decl_id);
-            matcher.add_semantic_suggestion(SemanticSuggestion {
-                suggestion: Suggestion {
-                    value: cmd.name().into(),
-                    description: Some(cmd.description().into()),
-                    span: to_reedline_span(span, offset),
-                    append_whitespace: true,
-                    ..Default::default()
-                },
-                kind: Some(SuggestionKind::Command(
-                    cmd.command_type(),
-                    // for snippet completion in LSP
-                    working_set.find_decl(s.as_bytes()),
-                )),
-            });
-        }
-
-        Fetched::answering(matcher.suggestion_results())
+    for name in ["def", "extern", "export def", "export extern"] {
+        // The builtins exist in every engine; one that does not has nothing to offer.
+        let Some(decl_id) = working_set.find_decl(name.as_bytes()) else {
+            continue;
+        };
+        let command = working_set.get_decl(decl_id);
+        candidates.push(SemanticSuggestion {
+            suggestion: Suggestion {
+                value: command.name().into(),
+                description: Some(command.description().into()),
+                span,
+                append_whitespace: true,
+                ..Default::default()
+            },
+            // The declaration is for snippet completion in the LSP.
+            kind: Some(SuggestionKind::Command(
+                command.command_type(),
+                Some(decl_id),
+            )),
+            ..Default::default()
+        });
     }
+    candidates
 }

@@ -1,0 +1,95 @@
+# The REPL's history hint: which line of the history it offers for what is typed (the rest of it is
+# the hint), skipping lines that name what is no longer there. `.` as a `cwd` is the case's own
+# directory, which holds `dir/`, `file.txt` and `old.zip`.
+{
+  world: [dir/ file.txt old.zip]
+  prelude: r#'
+    def branches [] { [main feature] }
+    def tool [--force, target: string@branches] {}
+    def free [target: string] {}
+  '#
+  cases: [
+    # The hinter reads the answer the completer gave for the line being typed: the newest line
+    # names a branch that is gone, so the older one is offered; part of the word typed gets the
+    # rest of a word that is still there; with nothing to fall back on there is no hint; a flag is
+    # no value, and what follows it is; an argument with no completer can be anything.
+    {test: a_word_its_completer_no_longer_knows_is_not_hinted, history: ["tool feature" "tool gone"], line: "tool ", hint: feature}
+    {test: a_word_its_completer_no_longer_knows_is_not_hinted, history: ["tool feature" "tool fegone"], line: "tool fe", hint: ature}
+    {test: a_word_its_completer_no_longer_knows_is_not_hinted, history: ["tool gone"], line: "tool ", hint: ""}
+    {test: a_word_its_completer_no_longer_knows_is_not_hinted, history: ["tool --force feature" "tool --force gone"], line: "tool ", hint: "--force feature"}
+    {test: a_word_its_completer_no_longer_knows_is_not_hinted, history: ["free anything"], line: "free ", hint: anything}
+    # A missing path is skipped for an older valid line.
+    {test: missing_path_is_skipped_for_an_older_valid_line, history: ["cd dir" "cd gone"], line: "cd ", hint: dir}
+    {test: missing_path_is_skipped_for_an_older_valid_line, history: ["open file.txt" "open gone.txt"], line: "open ", hint: file.txt}
+    {test: missing_path_is_skipped_for_an_older_valid_line, history: ["rm old.zip" "rm build/old.zip"], line: "rm ", hint: old.zip}
+    {test: missing_path_is_skipped_for_an_older_valid_line, history: ["rm *.zip" "rm *.rar"], line: "rm ", hint: "*.zip"}
+    {test: missing_path_is_skipped_for_an_older_valid_line, history: ["ls ~" "ls /no/such/place"], line: "ls ", hint: "~"}
+    {test: missing_path_is_skipped_for_an_older_valid_line, history: ["du dir" "du gone"], line: "du ", hint: dir}
+    {test: missing_path_is_skipped_for_an_older_valid_line, history: ["source file.txt" "source gone.nu"], line: "source ", hint: file.txt}
+    {test: missing_path_is_skipped_for_an_older_valid_line, history: ["source-env file.txt" "source-env gone.nu"], line: "source-env ", hint: file.txt}
+    {test: missing_path_is_skipped_for_an_older_valid_line, history: ["watch dir { ls }" "watch gone { ls }"], line: "watch ", hint: "dir { ls }"}
+    {test: missing_path_is_skipped_for_an_older_valid_line, history: ["cp file.txt new.txt" "cp gone.txt new.txt"], line: "cp ", hint: "file.txt new.txt"}
+    {test: missing_path_is_skipped_for_an_older_valid_line, history: ["mv old.zip x.zip" "mv gone.zip x.zip"], line: "mv ", hint: "old.zip x.zip"}
+    # Without a valid alternative there is no hint; a file is not a directory.
+    {test: a_line_without_a_valid_alternative_gives_no_hint, history: ["cd gone"], line: "cd ", hint: ""}
+    {test: a_line_without_a_valid_alternative_gives_no_hint, history: ["cd file.txt"], line: "cd ", hint: ""}
+    {test: a_line_without_a_valid_alternative_gives_no_hint, history: ["cd file.txt" "cd dir"], line: "cd ", hint: dir}
+    # Creating commands do not require their path; the destination of cp and mv need not exist.
+    {test: creating_commands_do_not_require_their_path, history: ["save new.json"], line: "save", hint: " new.json"}
+    {test: creating_commands_do_not_require_their_path, history: ["touch new.txt"], line: "touch", hint: " new.txt"}
+    {test: creating_commands_do_not_require_their_path, history: ["mkdir new/deeper"], line: "mkdir", hint: " new/deeper"}
+    {test: creating_commands_do_not_require_their_path, history: ["glob *.nothing"], line: "glob", hint: " *.nothing"}
+    {test: creating_commands_do_not_require_their_path, history: ["cp file.txt new.txt"], line: "cp", hint: " file.txt new.txt"}
+    {test: creating_commands_do_not_require_their_path, history: ["mv old.zip renamed.zip"], line: "mv", hint: " old.zip renamed.zip"}
+    {test: creating_commands_do_not_require_their_path, history: ["cp file.txt old.zip dir/new"], line: "cp", hint: " file.txt old.zip dir/new"}
+    # External and unknown commands, and what is not a literal path, are never skipped.
+    {test: external_and_unknown_commands_are_never_skipped, history: ["^cd gone"], line: "^cd", hint: " gone"}
+    {test: external_and_unknown_commands_are_never_skipped, history: ["git add gone.txt"], line: "git", hint: " add gone.txt"}
+    {test: external_and_unknown_commands_are_never_skipped, history: ["totally-unknown gone"], line: "totally-unknown", hint: " gone"}
+    {test: external_and_unknown_commands_are_never_skipped, history: ["cd $env.HOME"], line: "cd", hint: " $env.HOME"}
+    {test: external_and_unknown_commands_are_never_skipped, history: ["cd (pwd)"], line: "cd", hint: " (pwd)"}
+    {test: external_and_unknown_commands_are_never_skipped, history: ["open $nothing"], line: "open", hint: " $nothing"}
+    {test: external_and_unknown_commands_are_never_skipped, history: ["cd -"], line: "cd", hint: " -"}
+    {test: only_the_first_statement_is_checked, history: ["mkdir out; cd out"], line: "mkdir", hint: " out; cd out"}
+    {test: only_the_first_statement_is_checked, history: ["cd gone; ls"], line: "cd", hint: ""}
+    # A complete line is never its own hint, so the older, longer line is the only one left.
+    {test: a_complete_line_is_never_its_own_hint, history: ["cd dir/" "cd dir"], line: "cd dir", hint: "/"}
+    {test: a_complete_line_is_never_its_own_hint, history: ["cd dir"], line: "cd dir", hint: ""}
+    # A run here wins over newer, successful and more frequent runs elsewhere; a success beats a
+    # failure and an unknown outcome, however new; run twice beats being the newest; otherwise the
+    # newest wins.
+    {test: ranking_prefers_cwd_then_success_then_frequency_then_recency, line: "open ", hint: old.zip, history: [
+      {line: "open old.zip", cwd: ., exit: 1} {line: "open file.txt", cwd: /elsewhere, exit: 0}
+      {line: "open file.txt", cwd: /elsewhere, exit: 0} {line: "open dir", cwd: /elsewhere, exit: 0}
+    ]}
+    {test: ranking_prefers_cwd_then_success_then_frequency_then_recency, line: "open ", hint: old.zip, history: [
+      {line: "open old.zip", cwd: /elsewhere, exit: 0} {line: "open file.txt", cwd: /elsewhere, exit: 1}
+    ]}
+    {test: ranking_prefers_cwd_then_success_then_frequency_then_recency, line: "open ", hint: old.zip, history: [
+      {line: "open old.zip", cwd: /elsewhere} {line: "open file.txt", cwd: /elsewhere, exit: 1}
+    ]}
+    {test: ranking_prefers_cwd_then_success_then_frequency_then_recency, line: "open ", hint: file.txt, history: [
+      {line: "open file.txt", cwd: /elsewhere, exit: 0} {line: "open dir", cwd: /elsewhere, exit: 0}
+      {line: "open file.txt", cwd: /elsewhere, exit: 0} {line: "open old.zip", cwd: /elsewhere, exit: 0}
+    ]}
+    {test: ranking_prefers_cwd_then_success_then_frequency_then_recency, line: "open ", hint: old.zip, history: [
+      {line: "open file.txt", cwd: /elsewhere, exit: 0} {line: "open old.zip", cwd: /elsewhere, exit: 0}
+    ]}
+    # A run in this cwd older than the cap of what is read still counts.
+    {test: a_run_in_this_cwd_older_than_the_cap_still_counts, line: "open ", hint: file.txt, setup: "$env.runs = ([{line: 'open file.txt', cwd: ., exit: 0}] | append (1..200 | each { {line: 'open old.zip', cwd: /elsewhere, exit: 0} }))", history_from: "$env.runs"}
+    # At most sixteen lines are checked: twenty newer lines naming paths that are gone hide the
+    # valid one, fifteen leave it within reach.
+    {test: at_most_sixteen_lines_are_checked_and_the_answer_never_depends_on_earlier_keystrokes, line: "open ", hint: "", history_from: "['open file.txt'] | append (0..<20 | each {|n| $'open gone($n).txt' })"}
+    {test: at_most_sixteen_lines_are_checked_and_the_answer_never_depends_on_earlier_keystrokes, line: "open ", hint: file.txt, history_from: "['open file.txt'] | append (0..<15 | each {|n| $'open gone($n).txt' })"}
+    # A recursive glob is not walked to decide a hint: the line is offered. A glob of one directory
+    # is looked up, and loses when it matches nothing.
+    {test: a_recursive_glob_is_not_walked_to_decide_a_hint, history: ["rm **/*.orig"], line: "rm ", hint: "**/*.orig"}
+    {test: a_recursive_glob_is_not_walked_to_decide_a_hint, history: ["rm *.orig"], line: "rm ", hint: ""}
+    # `BuiltinCompletion::Path { dirs: true, .. }` completes directories only, `dirs: false` files
+    # too, and commands that create paths keep completing paths by their own shape.
+    {test: path_requirements_complete_directories_or_files, line: "cd ", values: [dir/], paths: true}
+    {test: path_requirements_complete_directories_or_files, lines: ["open " "rm " "ls " "du " "source " "cp " "mv " "watch "], has: [dir/ file.txt old.zip], paths: true}
+    {test: path_requirements_complete_directories_or_files, line: "save ", has: [file.txt]}
+    {test: path_requirements_complete_directories_or_files, line: "mkdir ", has: [dir/], paths: true}
+  ]
+}

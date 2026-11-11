@@ -2,8 +2,11 @@ use lsp_types::{
     Documentation, MarkupContent, MarkupKind, ParameterInformation, SignatureHelp,
     SignatureHelpParams, SignatureInformation,
 };
-use nu_cli::{SignatureLabel, find_active_call};
-use nu_protocol::{Flag, PositionalArg, Signature, SyntaxShape, Value, engine::StateWorkingSet};
+use nu_protocol::{
+    Flag, PositionalArg, Signature, SyntaxShape, Value,
+    ast::Argument,
+    engine::{Expect, StateWorkingSet, probe::innermost_call},
+};
 
 use crate::{LanguageServer, uri_to_path};
 use std::fmt::Write;
@@ -58,7 +61,7 @@ pub(crate) fn doc_for_arg(
 }
 
 pub(crate) fn get_signature_label(signature: &Signature, indent: bool) -> String {
-    let label = SignatureLabel::new(signature);
+    let label = signature.usage();
     if indent {
         format!("  {label}")
     } else {
@@ -80,47 +83,30 @@ impl LanguageServer {
 
         let engine_state = self.new_engine_state(Some(path_uri));
         let mut working_set = StateWorkingSet::new(&engine_state);
-
-        // NOTE: in case the cursor is at the end of the call expression
-        let need_placeholder = location == 0
-            || file_text
-                .get(location - 1..location)
-                .is_some_and(|s| s.chars().all(|c| c.is_whitespace()));
         let file_path = uri_to_path(path_uri);
-        let filename = if need_placeholder {
-            "lsp_signature_helper_temp_file"
-        } else {
-            file_path.to_str()?
-        };
-
-        let block = if need_placeholder {
-            nu_parser::parse(
-                &mut working_set,
-                Some(filename),
-                format!(
-                    "{}a{}",
-                    file_text.get(..location).unwrap_or_default(),
-                    file_text.get(location..).unwrap_or_default()
-                )
-                .as_bytes(),
-                false,
-            )
-        } else {
-            nu_parser::parse(
-                &mut working_set,
-                Some(filename),
-                file_text.as_bytes(),
-                false,
-            )
-        };
-        let span = working_set.get_span_for_filename(filename)?;
-
-        let pos_to_search = location.saturating_add(span.start).saturating_sub(1);
-        let active_call = find_active_call(&block, &working_set, pos_to_search, false)?;
-        let active_signature = working_set.get_decl(active_call.call.decl_id).signature();
+        let (block, probe) = nu_parser::parse_probed(
+            &mut working_set,
+            file_path.to_str(),
+            file_text.as_bytes(),
+            location,
+        );
+        // The call the cursor is in an argument of, and which positional that is: on a flag, the
+        // one after the positionals written before it.
+        let found = probe.narrowest(false)?;
+        let active_signature = working_set.get_decl(found.decl_id()?).signature();
         let label = get_signature_label(&active_signature, false);
-
-        let param_num_before_pos = active_call.positionals_before(pos_to_search + 1) as u32;
+        let param_num_before_pos = match found.what {
+            Expect::Positional { index, .. } => index,
+            _ => innermost_call(&block, &working_set, |call| {
+                call.head.start == found.within.start
+            })
+            .map_or(0, |call| {
+                (call.arguments.iter())
+                    .filter(|arg| matches!(arg, Argument::Positional(_)))
+                    .take_while(|arg| arg.span().end <= probe.at)
+                    .count()
+            }),
+        } as u32;
 
         let str_to_doc = |s: String| {
             Some(Documentation::MarkupContent(MarkupContent {

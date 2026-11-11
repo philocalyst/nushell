@@ -6,6 +6,7 @@ export use std/util *
 # std submodules
 export use std/assert
 export use std/bench
+export use std/completions
 export use std/dt
 export use std/formats
 export use std/help

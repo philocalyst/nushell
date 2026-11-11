@@ -1,0 +1,118 @@
+# The values of a column are offered wherever the rows of the pipeline that makes them flow: in the
+# closures and blocks that are run on them, however deep, and through the keywords and commands that
+# only pass them on (`try`, `do`, `if`, `match`, `for`, `let`). Two files and a directory, so that
+# `type` holds `file` twice and `dir` once.
+{
+  world: [alpha.txt beta.md gamma/]
+  cases: [
+    # The row is the first parameter, however it is named and written; `$in` is the row too.
+    {test: a_closure_run_per_row_offers_the_values_of_its_rows, values: [file dir], lines: [
+      "ls | where {|r| $r.type == " "ls | where {|r| $r.type != " "ls | where { |row| $row.type == "
+      "ls | where {|r| $r.size > 0b and $r.type == " "ls | where {|r| not ($r.size > 0b) or $r.type == "
+      "ls | each {|f| $f.type == " "ls | each { |x| $x.type == " "ls | each {|f| if $f.type == "
+      "ls | each {|f| if $f.size > 0b and $f.type == " "ls | par-each {|f| $f.type == "
+      "ls | reduce {|it, acc| $it.type == " "ls | all {|f| $f.type == " "ls | any {|f| $f.type == "
+      "ls | group-by {|f| $f.type == " "ls | chunk-by {|f| $f.type == " "ls | skip while {|f| $f.type == "
+      "ls | take while {|f| $f.type == " "ls | update name {|f| $f.type == " "ls | insert extra {|f| $f.type == "
+      "ls | upsert extra {|f| $f.type == " "ls | each { $in.type == " "ls | par-each { $in.type == "
+    ]}
+    # What is typed narrows them, in a quote too.
+    {test: a_closure_run_per_row_offers_the_values_of_its_rows, values: [dir], lines: [
+      "ls | each {|f| $f.type == d" "ls | each {|f| $f.type == 'd" "ls | each {|f| $f.type == \"d" "ls | where {|f| $f.type == d"
+    ]}
+    {test: a_closure_parameter_is_the_element_when_the_elements_are_not_rows, values: [alpha.txt beta.md gamma], lines: [
+      "ls | get name | each {|n| $n == " "ls | get name | each { $in == " "ls | get name | par-each {|n| $n == "
+      "ls | get name | where {|n| $n == " "ls | get name | where $it == " "ls | get name | each {|n| $n =~ "
+      "ls | get name | each {|n| if $n == " "ls | get name | skip while {|n| $n == "
+    ]}
+    # The elements of what the pipeline before was reshaped into; only numbers are ordered by.
+    {test: a_closure_parameter_is_the_element_when_the_elements_are_not_rows, line: "ls | where type == dir | get name | each {|n| $n == ", values: [gamma]}
+    {test: a_closure_parameter_is_the_element_when_the_elements_are_not_rows, line: "ls | get size | each {|s| $s > ", has: ["17b" "15b"]}
+    # The rows that were kept, not every row; a closure inside a closure is run on its own rows,
+    # and the outer row is still the outer one, whatever is around it.
+    {test: what_a_closure_is_run_on_is_what_the_pipeline_before_it_made, values: [gamma], lines: [
+      "ls | where type == dir | each {|d| $d.name == " "ls | where type == dir | where {|d| $d.name == "
+      "ls | where type == dir | sort-by name | each {|d| $d.name == " "ls | where type == dir | first 1 | each {|d| $d.name == "
+      "ls | where type == dir | select name | each {|d| $d.name == " "ls | sort-by type | where type == dir | each {|d| $d.name == "
+      "ls | where type == dir | each {|a| ls | each {|b| $a.name == " "ls | each {|a| ls | where type == dir | each {|b| $b.name == "
+    ]}
+    {test: what_a_closure_is_run_on_is_what_the_pipeline_before_it_made, values: [file dir], lines: [
+      "ls | each {|a| ls | where type == " "ls | each {|a| ls | each {|b| $b.type == "
+    ]}
+    # What flows into a block is what flows into the call that runs it.
+    {test: the_rows_flow_through_what_only_runs_a_block, values: [file dir], lines: [
+      "try { ls | where type == " "try { ls | each {|f| $f.type == " "try { ls } catch { ls | where type == "
+      "try { ls | where type == dir } catch { ls | where type == " "do { ls | where type == " "do { ls | each {|f| $f.type == "
+      "do { try { ls | where type == " "if true { ls | where type == " "if (ls | length) > 1 { ls | where type == "
+      "if true { 1 } else { ls | where type == " "if true { 1 } else if false { ls | where type == "
+      "match 1 { 1 => { ls | where type == " "match 1 { _ => (ls | where type == " "for x in [1] { ls | where type == "
+      "while true { ls | where type == " "loop { ls | where type == " "def f [] { ls | where type == " "(ls | where type == "
+      "$\"abc (ls | where type == " "[(ls | where type == " "{a: (ls | where type == " "echo (ls | where type == "
+      "ls | try { $in | where type == " "ls | do { $in | where type == " "ls | do { $in | each {|f| $f.type == "
+      "ls | try { each {|f| $f.type == " "ls | do { where type == " "ls | if true { $in | where type == "
+    ]}
+    # The arms of a `match` on a column offer its values as patterns, and a guard compares as any
+    # condition does.
+    {test: a_keyword_that_binds_a_row_offers_the_values_of_its_rows, values: [file dir], lines: [
+      "for x in (ls) { $x.type == " "for x in (ls) { if $x.type == " "for x in (ls | where size > 0b) { $x.type == "
+      "for x in (ls | sort-by name) { $x.type == " "for row in (ls) { ls | where type == "
+      "match (ls | first) { _ if (ls | length) > 0 => 1, _ => 2 }; ls | where type == "
+      "ls | each {|f| match $f.type { " "ls | each {|f| match $f.type { 'dir' => 1, " "ls | each {|f|\n  match $f.type {\n    'dir' => 1\n    "
+      "ls | each {|f| match $f.type { 'dir' => 1, _ if $f.type == " "ls | each {|f| match 1 { _ if $f.type == "
+      "ls | each {|f| match $f.type { 'dir' => ($f.type == "
+    ]}
+    {test: a_keyword_that_binds_a_row_offers_the_values_of_its_rows, line: "for x in (ls | where type == dir) { $x.name == ", values: [gamma]}
+    {test: a_keyword_that_binds_a_row_offers_the_values_of_its_rows, line: "ls | each {|f| match $f.type { d", values: [dir]}
+    # Not where a result is written.
+    {test: a_keyword_that_binds_a_row_offers_the_values_of_its_rows, line: "ls | each {|f| match $f.type { 'dir' => ", values: []}
+    {test: the_row_of_a_closure_names_its_columns_wherever_it_is, values: [name type size modified], lines: [
+      "ls | do { each {|f| $f." "ls | try { each {|f| $f." "ls | each {|f| match $f." "ls | each {|a| ls | each {|b| $a."
+      "ls | each {|a| ls | each {|b| $b." "for x in (ls) { $x." "for x in (ls) { if $x." "let rows = (ls); $rows | each {|r| $r."
+      "let rows = (ls); for r in $rows { $r." "ls | try { $in." "ls | try { $in | where " "ls | do { where " "ls | do { sort-by "
+    ]}
+    {test: the_row_of_a_closure_names_its_columns_wherever_it_is, line: "ls | try { each {|f| $f.n", values: [name]}
+    {test: a_variable_holding_rows_is_read, values: [file dir], lines: [
+      "let rows = (ls); $rows | where type == " "let rows = ls; $rows | where type == " "let rows = (ls)\n$rows | where type == "
+      "let rows = (ls); $rows | each {|r| $r.type == " "let rows = (ls); for r in $rows { $r.type == "
+      "const rows = [[type]; [file] [dir] [file]]; $rows | where type == "
+      "let a = (ls); let b = ($a | where size > 0b); $b | where type == " "let a = 1; let rows = (ls); $rows | where type == "
+      "let rows = (ls); do { $rows | where type == " "let rows = (ls); ls | each {|a| $rows | where type == "
+      "let rows = (ls); ls | each {|a| $rows | each {|b| $b.type == " "let rows: table = (ls); $rows | where type == "
+    ]}
+    {test: a_variable_holding_rows_is_read, line: "let a = (ls); let b = ($a | where type == dir); $b | where name == ", values: [gamma]}
+    # A variable of the session is read as it is.
+    {test: a_variable_holding_rows_is_read, setup: "let kept = (ls | where type == dir)", values: [gamma], lines: [
+      "$kept | where name == " "$kept | each {|k| $k.name == "
+    ]}
+    # A statement that may write is not run to find out what a variable holds.
+    {test: a_variable_holding_rows_is_read, values: [], lines: [
+      "let rows = (rm alpha.txt; ls); $rows | where type == " "let rows = (ls | save out.txt); $rows | where type == "
+      "let rows = (^ls | lines | wrap type); $rows | where type == "
+    ]}
+    {test: a_custom_command_that_promises_it_is_non_destructive_is_a_source, setup: r#'
+      @non-destructive
+      def people [] { ['ann' 'bob' 'ann'] | each {|n| {name: $n, kind: 'person'}} }
+      def people-unsure [] { ['ann' 'bob' 'ann'] | each {|n| {name: $n, kind: 'person'}} }
+      @non-destructive
+      def --env people-home [] { ['ann'] | each {|n| {name: $n}} }
+      alias people-too = people
+    '#, values: [ann bob], lines: [
+      "people | where name == " "people | where {|p| $p.name == " "people | each {|p| $p.name == "
+      "people | each { $in.name == " "people | sort-by name | where name == " "people | where kind == 'person' | where name == "
+      "people-too | where name == " "let rows = (people); $rows | where name == " "try { people | where name == "
+    ]}
+    {test: a_custom_command_that_promises_it_is_non_destructive_is_a_source, setup: "@non-destructive\ndef people [] { ['ann' 'bob' 'ann'] | each {|n| {name: $n, kind: 'person'}} }", line: "people | where kind == ", values: [person]}
+    # Without the promise a body that runs a closure is not run, and the promise does not excuse a
+    # command that changes the environment.
+    {test: a_custom_command_that_promises_it_is_non_destructive_is_a_source, setup: r#'
+      def people-unsure [] { ['ann' 'bob' 'ann'] | each {|n| {name: $n, kind: 'person'}} }
+      @non-destructive
+      def --env people-home [] { ['ann'] | each {|n| {name: $n}} }
+    '#, values: [], lines: ["people-unsure | where name == " "people-home | where name == "]}
+    # The values are the first rows' and a bounded number of them.
+    {test: what_is_read_is_still_bounded_and_does_not_write, line: "1..5000 | each {|i| {n: $i}} | where n == ", values: []}
+    {test: what_is_read_is_still_bounded_and_does_not_write, at_most: 50, lines: [
+      "(1..5000 | wrap n) | where n == " "1..5000 | wrap n | each {|r| $r.n == "
+    ]}
+  ]
+}
