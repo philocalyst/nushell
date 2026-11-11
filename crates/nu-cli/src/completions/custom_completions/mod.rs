@@ -5,12 +5,15 @@ pub(crate) use output::report;
 pub(crate) use output::{Returned, SpanClamp, map_value_completions};
 
 use crate::completions::{
-    Completer, Context, Fetched,
+    Candidates, Context, Origin,
+    cache::AnswerKey,
     completer::{closure_is_interactive, decl_is_interactive},
+    completion_common, to_reedline_span,
 };
 pub use input::DeclaredInputs;
 pub(crate) use input::{command_tokens, completer_input, legacy_context, legacy_pos};
 use nu_engine::compile;
+use nu_path::expand_path_with;
 use nu_protocol::{
     BlockId, DeclId, PipelineData, ReportMode, ShellError, ShellWarning, Signature, Span, Value,
     VarId,
@@ -19,7 +22,7 @@ use nu_protocol::{
     engine::{Closure, Command, EngineState, Stack, StateWorkingSet},
     report_shell_warning,
 };
-pub(crate) use output::CompleterOutput;
+use output::{capturing, read_candidates};
 use std::{
     borrow::Cow,
     hash::{DefaultHasher, Hash, Hasher},
@@ -71,7 +74,7 @@ impl Narrowing {
 
 /// Borrow the permanent engine state when the completer lives in it (no per-keystroke
 /// clone); otherwise clone it and merge the working-set delta.
-fn engine_state_for_completion<'a>(
+pub(crate) fn engine_state_for_completion<'a>(
     working_set: &'a StateWorkingSet<'_>,
     is_permanent: bool,
 ) -> Cow<'a, EngineState> {
@@ -313,6 +316,24 @@ fn block_of(command: &dyn Command) -> Option<BlockId> {
         .or_else(|| block_of(command.as_alias()?.command.as_deref()?))
 }
 
+/// Whether `candidates` are not empty and every one names a path that exists, relative to the
+/// current directory: a trailing space (`hx` completed by carapace leaves one) and a quote do not
+/// count as part of the name.
+fn names_only_paths(candidates: &Candidates, ctx: &Context) -> bool {
+    let Ok(cwd) = ctx
+        .working_set
+        .permanent_state
+        .cwd_as_string(Some(ctx.stack))
+    else {
+        return false;
+    };
+    !candidates.items.is_empty()
+        && candidates.items.iter().all(|(_, item)| {
+            let name = item.suggestion.value.trim().trim_matches(['"', '\'', '`']);
+            !name.is_empty() && expand_path_with(name, &cwd, true).exists()
+        })
+}
+
 /// A user-defined completer: a block called with the input record. Parameter,
 /// command-wide, and external completers share this one implementation.
 pub(crate) struct UserCompletion {
@@ -321,6 +342,10 @@ pub(crate) struct UserCompletion {
     narrowing: Narrowing,
     /// Whether this completer is `@interactive`: it takes the terminal and asks the user.
     interactive: bool,
+    /// What its suggestions report as their source: `custom: <name>` or `external completer`.
+    pub(crate) source: Cow<'static, str>,
+    /// Whether this is the configured external completer, which another program answers for.
+    external: bool,
 }
 
 impl UserCompletion {
@@ -342,6 +367,8 @@ impl UserCompletion {
             captures: closure.captures.clone(),
             narrowing: Narrowing::Completer,
             interactive: closure_is_interactive(working_set, closure),
+            source: Cow::Borrowed("external completer"),
+            external: true,
         }
     }
 
@@ -361,7 +388,57 @@ impl UserCompletion {
             captures: vec![],
             narrowing,
             interactive: decl_is_interactive(working_set, decl_id),
+            source: Cow::Owned(format!("custom: {}", working_set.get_decl(decl_id).name())),
+            external: false,
         })
+    }
+
+    /// Whether this completer is `@interactive`: it asks the user in the terminal.
+    pub(crate) fn is_interactive(&self) -> bool {
+        self.interactive
+    }
+
+    /// What the cache keys this completer's answer by at `ctx`, if the answer may be kept.
+    ///
+    /// The engine narrows a parameter completer's list against the token, so a list that the
+    /// token cannot change is the same one for every token typed after the same line. That
+    /// holds for a completer that declares no input: it is handed nothing, so nothing can
+    /// vary but the environment, which the cache is keyed by too. One that declares `token`,
+    /// `place`, `buffer` or an old positional input is handed the token, and runs every time. So
+    /// does an `@interactive` one, which asks the user, and one defined on this very line, whose
+    /// block is not permanent yet.
+    fn answer_key(&self, ctx: &Context) -> Option<AnswerKey> {
+        let working_set = ctx.working_set;
+        if !matches!(self.narrowing, Narrowing::Engine)
+            || self.interactive
+            || !self.captures.is_empty()
+            || self.block_id.get() >= working_set.permanent_state.num_blocks()
+        {
+            return None;
+        }
+        let signature = &working_set.get_block(self.block_id).signature;
+        if !signature.required_positional.is_empty() || !signature.optional_positional.is_empty() {
+            return None;
+        }
+        let token_start = to_reedline_span(ctx.span, ctx.offset).start;
+        Some(AnswerKey {
+            block: self.block_id,
+            before: Arc::from(ctx.buffer.get(..token_start)?),
+        })
+    }
+
+    /// [`Self::eval`], or the answer that the cache kept for the same question, and whether it
+    /// is the kept one.
+    fn eval_kept(&self, ctx: &Context) -> Result<(Value, bool), ShellError> {
+        let Some(key) = self.answer_key(ctx) else {
+            return Ok((self.eval(ctx)?, false));
+        };
+        if let Some(value) = ctx.cache.answer(&key, ctx.trace) {
+            return Ok((value, true));
+        }
+        let value = self.eval(ctx)?;
+        ctx.cache.remember(key, value.clone());
+        Ok((value, false))
     }
 
     /// Call the completer with the record it asked for; panics become `Err`
@@ -388,6 +465,9 @@ impl UserCompletion {
         // fields (`token`, `place`, `buffer`) it names, bound by name. Order is free. The
         // compatibility bridge retains old positional inputs for one migration cycle.
         let wanted = DeclaredInputs::from_signature(&block.signature);
+        if let Some(trace) = ctx.trace {
+            trace.handed(wanted);
+        }
         let legacy = match self.narrowing {
             Narrowing::Engine => LegacyInputs::parameter(ctx, &block),
             Narrowing::Completer => LegacyInputs::command(ctx, &block),
@@ -438,30 +518,59 @@ pub(crate) fn panic_to_shell_error(payload: &(dyn std::any::Any + Send), span: S
 }
 
 impl UserCompletion {
-    /// Empty answer when the block declines (`failed: false`) or errors (`failed: true`):
-    /// interactive pickers answer empty on dismiss, and engine-narrowed (parameter)
-    /// completers answer empty on error since no fallback can serve their slot —
-    /// anything else declines so the next source runs.
-    fn empty(&self, failed: bool) -> Fetched {
-        if self.interactive || (failed && matches!(self.narrowing, Narrowing::Engine)) {
-            Fetched::answering(vec![])
-        } else {
-            Fetched::declining()
+    /// `found`, the answer of this completer for `ctx`'s token, unless it is the external
+    /// completer's and only lists files. Such a list has no fuzzy matching, previews or colours
+    /// and repeats what Nushell lists itself, so the files of the token answer instead.
+    pub(crate) fn or_files(&self, found: Candidates, ctx: &Context) -> Candidates {
+        if self.external && names_only_paths(&found, ctx) {
+            if let Some(trace) = ctx.trace {
+                trace.note("replaced by files");
+            }
+            return completion_common::paths(ctx, false);
         }
+        found
     }
-}
 
-impl Completer for UserCompletion {
-    fn fetch(&mut self, ctx: &Context) -> Fetched {
-        match self.eval(ctx) {
+    /// What the source offers for `ctx`'s token, or `None` where it declines so the next one
+    /// answers. A block that declines (`failed: false`) or errors (`failed: true`) answers
+    /// empty when it is an interactive picker, which answers empty on dismiss, or an
+    /// engine-narrowed (parameter) completer, since no fallback can serve its slot on error.
+    pub(crate) fn candidates(&self, ctx: &Context) -> Option<Candidates> {
+        let mut from_cache = false;
+        let (failed, found) = match self.eval_kept(ctx) {
             Err(err) => {
                 report(format!("failed to eval completer block: {err}"));
-                self.empty(true).worth_keeping()
+                ctx.notice.fail(format!("the completer failed: {err}"));
+                if let Some(trace) = ctx.trace {
+                    trace.fail(err);
+                }
+                (true, None)
             }
-            Ok(value) => match CompleterOutput::read(value, ctx, self.narrowing) {
-                None => self.empty(false),
-                Some(output) => output.into_fetched(ctx),
-            },
+            Ok((value, kept)) => {
+                from_cache = kept;
+                match ctx.trace {
+                    // A traced answer keeps what came back and the faults found reading it.
+                    Some(trace) => {
+                        trace.raw(value.clone());
+                        let (found, faults) =
+                            capturing(|| read_candidates(value, ctx, self.narrowing));
+                        trace.faults(faults);
+                        (false, found)
+                    }
+                    None => (false, read_candidates(value, ctx, self.narrowing)),
+                }
+            }
+        };
+        let mut found = found.or_else(|| {
+            (self.interactive || (failed && matches!(self.narrowing, Narrowing::Engine)))
+                .then(Candidates::default)
+        });
+        // What the cache kept may be out of date, which `debug complete` says of each suggestion.
+        if from_cache && let Some(candidates) = &mut found {
+            for (_, item) in &mut candidates.items {
+                item.origin = Origin::Cached;
+            }
         }
+        found
     }
 }

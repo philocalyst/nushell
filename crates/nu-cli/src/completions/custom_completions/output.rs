@@ -1,26 +1,51 @@
 use super::Narrowing;
 use crate::completions::{
-    CompletionOptions, Context, Fetched, MatchAlgorithm, NuMatcher, SemanticSuggestion,
-    to_reedline_span,
+    Candidates, CompletionOptions, Context, Fault, MatchAlgorithm, SemanticSuggestion,
+    delegation::{self, Sources},
+    quote::Quote,
+    taking, to_reedline_span,
+    usage::Used,
 };
 use nu_color_config::{color_record_to_nustyle, lookup_ansi_color_style};
-use nu_protocol::{FromValue, ShellError, SuggestionKind, Type, Value, engine::CommandType};
+use nu_protocol::{
+    FromValue, Record, ShellError, SuggestionKind, Type, Value,
+    engine::{Closure, CommandType},
+    levenshtein_distance,
+};
 use nu_utils::strip_ansi_string_unlikely;
 use reedline::Suggestion;
+use std::{
+    cell::{Cell, RefCell},
+    sync::Arc,
+};
 
-/// A completer's return value, after both accepted shapes are normalized.
-pub(crate) struct CompleterOutput {
-    suggestions: Vec<SemanticSuggestion>,
-    options: CompletionOptions,
-    sort: bool,
-    filter: bool,
-    /// Whether the completer requested the next source.
-    fallback: bool,
+thread_local! {
+    /// What [`report`] collects while a traced answer is read; see [`capturing`].
+    static CAPTURED: RefCell<Option<Vec<Fault>>> = const { RefCell::new(None) };
+    /// The position in the returned list of the item being read.
+    static ITEM: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 /// Log a non-fatal completer error without disrupting line editing.
 pub(crate) fn report(message: impl AsRef<str>) {
-    log::error!("nu::shell::completion: {}", message.as_ref());
+    let message = message.as_ref();
+    log::error!("nu::shell::completion: {message}");
+    CAPTURED.with_borrow_mut(|captured| {
+        if let Some(faults) = captured {
+            faults.push(Fault {
+                at: ITEM.get(),
+                reason: message.to_owned(),
+            });
+        }
+    });
+}
+
+/// Run `f`, which reads a completer's answer, and give back what it [`report`]ed, for a trace
+/// to show as the faults of the answer.
+pub(crate) fn capturing<T>(f: impl FnOnce() -> T) -> (T, Vec<Fault>) {
+    let outer = CAPTURED.replace(Some(Vec::new()));
+    let result = f();
+    (result, CAPTURED.replace(outer).unwrap_or_default())
 }
 
 /// Convert a completer result field, logging conversion failures.
@@ -64,6 +89,32 @@ fn lint_keys(value: &Value, what: &str, keys: &[&str]) {
             "a {what} has no `{unknown}` field, so it is ignored; expected one of {}",
             keys.join(", ")
         ));
+    }
+}
+
+/// Warn on keys of a suggestion that look like a misspelled known key (`descripton`). Any other
+/// key is a field of the completer's own, kept as an extra column.
+fn lint_misspelled_keys(value: &Value, what: &str, keys: &[&str]) {
+    let Ok(record) = value.as_record() else {
+        return;
+    };
+
+    for unknown in record
+        .columns()
+        .filter(|column| !keys.contains(&column.as_str()))
+    {
+        // One slip in a short name, two in a long one: `style` is not `stale` by accident,
+        // but nothing else is as close as this to a name the engine reads.
+        let allowed = if unknown.len() > 5 { 2 } else { 1 };
+        if let Some(known) = keys
+            .iter()
+            .find(|known| levenshtein_distance(unknown, known) <= allowed)
+        {
+            report(format!(
+                "a {what} has a `{unknown}` field, which looks like a misspelled `{known}`; it \
+                 is kept as an extra column"
+            ));
+        }
     }
 }
 
@@ -125,6 +176,8 @@ returned_record! {
         /// Value to insert, coerced to a string.
         value: Value,
         display_override: Option<Text>,
+        /// What carapace and fish name `display_override`.
+        display: Option<Text>,
         description: Option<Text>,
         /// Optional suggestion kind.
         kind: Option<Value>,
@@ -138,6 +191,11 @@ returned_record! {
         append_whitespace: Option<bool>,
         /// Character indices matching the typed text.
         match_indices: Option<Vec<usize>>,
+        /// What to show while the suggestion is selected: a value, drawn as a table, or a
+        /// closure that returns one, called only once the suggestion is selected.
+        preview: Option<Value>,
+        /// What shows once the preview is unfolded: a value or a closure, as `preview` is.
+        help: Option<Value>,
     }
 }
 
@@ -184,8 +242,66 @@ returned_record! {
     }
 }
 
+returned_record! {
+    /// The `delegate` a completer may return: complete the rest of the line as a command line
+    /// of its own, the way `sudo`'s arguments are.
+    struct ReturnedDelegate is "delegate" {
+        /// Byte offset into the line the completer was given, where the delegated line starts.
+        from: i64,
+        /// `{|dir| ...}`: the names in `dir`, directories ending in `/`, standing in for the
+        /// local filesystem in path completion.
+        paths: Option<Closure>,
+        /// `{|| ...}`: command names, standing in for `PATH` when the line's command is completed.
+        commands: Option<Closure>,
+        /// The quote (`'`, `"` or a backtick) of the string that `from` is inside of, as in
+        /// `ssh host 'cat f`, where `from` is the byte after the quote. What the delegated line
+        /// inserts is then written to stay within the string.
+        inside: Option<String>,
+        /// Whether `from` starts one path of the other machine (`scp host:dir/f`) and not a
+        /// command line; `paths` lists its directories.
+        path: Option<bool>,
+    }
+}
+
+impl ReturnedDelegate {
+    /// What the delegated line answers. `None` declines: `from` is negative, out of range or
+    /// inside a character.
+    fn resolve(self, ctx: &Context) -> Option<Vec<SemanticSuggestion>> {
+        let from = usize::try_from(self.from)
+            .map_err(|_| report(format!("a delegate's `from` ({}) is negative", self.from)))
+            .ok()?;
+        let inside = self.inside.and_then(|quote| {
+            let read = Quote::opened_by(&quote).filter(|_| quote.chars().count() == 1);
+            if read.is_none() {
+                report(format!(
+                    "a delegate's `inside` ({quote:?}) must be a single quote character"
+                ));
+            }
+            read
+        });
+        let sources = Sources {
+            paths: self.paths.map(Arc::new),
+            commands: self.commands.map(Arc::new),
+            inside,
+        };
+
+        let fetched = if self.path == Some(true) {
+            delegation::complete_path(ctx, from, sources)
+        } else {
+            delegation::complete(ctx, from, sources)
+        };
+        if fetched.is_none() {
+            report(format!(
+                "a delegate's `from` ({from}) is not a position on the {}-byte line it was given",
+                ctx.buffer.len()
+            ));
+        }
+        fetched
+    }
+}
+
 /// Keys accepted by the completion envelope.
-const ENVELOPE_KEYS: [&str; 3] = ["completions", "options", "fallback"];
+const ENVELOPE_KEYS: [&str; 5] = ["completions", "options", "fallback", "delegate", "message"];
 
 /// What a completer or menu source returned, before any options are applied. See the
 /// [module docs](self) for the shapes accepted.
@@ -194,6 +310,11 @@ pub(crate) struct Returned {
     options: Option<ReturnedOptions>,
     /// Whether to continue with the next source.
     fallback: bool,
+    /// A request to complete part of the line as a line of its own. It answers on its own;
+    /// `options` and `fallback` do not apply to it.
+    delegate: Option<ReturnedDelegate>,
+    /// Why there is nothing to suggest, which the status line shows when nothing is.
+    message: Option<String>,
 }
 
 impl Returned {
@@ -204,6 +325,8 @@ impl Returned {
                 completions,
                 options: None,
                 fallback: false,
+                delegate: None,
+                message: None,
             })
         };
 
@@ -217,6 +340,12 @@ impl Returned {
             lint_keys(&value, "completion envelope", &ENVELOPE_KEYS);
             let mut record = value.into_record().unwrap_or_default();
 
+            // A delegate that cannot be read is no answer, unless the record has completions.
+            let delegate = record.remove("delegate").map(ReturnedDelegate::read);
+            if matches!(delegate, Some(None)) && !record.contains("completions") {
+                return None;
+            }
+
             // Read each part independently.
             return Some(Self {
                 completions: record
@@ -228,6 +357,12 @@ impl Returned {
                     .remove("fallback")
                     .and_then(|fallback| read_part(fallback, "`fallback`"))
                     .unwrap_or(false),
+                delegate: delegate.flatten(),
+                message: record
+                    .remove("message")
+                    .and_then(|message| read_part::<Option<Text>>(message, "`message`"))
+                    .flatten()
+                    .map(String::from),
             });
         }
 
@@ -242,92 +377,106 @@ impl Returned {
     }
 }
 
-impl CompleterOutput {
-    /// Read what a completer returned; `None` when it declined with `null`.
-    pub(crate) fn read(value: Value, ctx: &Context, narrowing: Narrowing) -> Option<Self> {
-        let returned = Returned::read(value)?;
-
-        let mut output = Self {
-            suggestions: map_value_completions(
-                returned.completions.into_iter(),
-                to_reedline_span(ctx.span, ctx.offset),
-                SpanClamp::within(ctx.buffer),
-            ),
-            options: ctx.options.clone(),
-            sort: true,
-            filter: narrowing.filters_by_default(),
-            fallback: returned.fallback,
-        };
-
-        if let Some(options) = returned.options {
-            output.read_options(options);
-        }
-
-        Some(output)
+/// What a completer returned, as candidates for `ctx`'s token; `None` where it declined with
+/// `null`. `narrowing` says who filters them unless the completer's `options` say otherwise.
+pub(crate) fn read_candidates(
+    value: Value,
+    ctx: &Context,
+    narrowing: Narrowing,
+) -> Option<Candidates> {
+    let mut returned = Returned::read(value)?;
+    if let Some(message) = returned.message.take() {
+        ctx.notice.say(message);
     }
 
-    /// Apply the `options` record a completer returned alongside its completions.
-    fn read_options(&mut self, options: ReturnedOptions) {
-        if let Some(filter) = options.filter {
-            self.filter = filter;
-        }
-
-        if let Some(sort) = options.sort {
-            self.sort = sort;
-            if self.sort && !self.filter {
-                log::warn!("Sorting won't happen because filtering is disabled.");
-            }
-        }
-
-        if let Some(case_sensitive) = options.case_sensitive {
-            self.options.case_sensitive = case_sensitive;
-        }
-
-        if let Some(match_description) = options.match_description {
-            self.options.match_description = match_description;
-        }
-
-        if let Some(algorithm) = options
-            .completion_algorithm
-            .and_then(|algorithm| MatchAlgorithm::try_from(algorithm).ok())
-        {
-            self.options.match_algorithm = algorithm;
+    // A delegate answers for the whole slot, as it was ranked. One that cannot be honoured
+    // declines, unless the record also carries completions.
+    if let Some(delegate) = returned.delegate.take() {
+        match delegate.resolve(ctx) {
+            Some(delegated) => return Some(Candidates::kept(delegated)),
+            None if returned.completions.is_empty() => return None,
+            None => {}
         }
     }
 
-    /// Narrow suggestions and preserve the completer's fallback request.
-    pub(crate) fn into_fetched(self, ctx: &Context) -> Fetched {
-        let fallback = self.fallback;
-        let outcome = |suggestions| {
-            if fallback {
-                Fetched::contributing(suggestions)
-            } else {
-                Fetched::answering(suggestions).worth_keeping()
-            }
-        };
+    let mut options = ctx.options.clone();
+    let mut candidates = Candidates {
+        used: Some(Used::Argument),
+        filter: narrowing.filters_by_default(),
+        partial: returned.fallback,
+        ordered: true,
+        ..Candidates::default()
+    };
+    if let Some(returned) = returned.options {
+        read_options(returned, &mut options, &mut candidates);
+    }
+    candidates.options = Some(options);
 
-        if !self.filter {
-            return outcome(self.suggestions);
+    let token = to_reedline_span(ctx.span, ctx.offset);
+    for suggestion in map_value_completions(
+        returned.completions.into_iter(),
+        token,
+        SpanClamp::within(ctx.buffer),
+    ) {
+        let text = strip_ansi_string_unlikely(suggestion.suggestion.display_value().to_string());
+        candidates.push_as(text, suggestion);
+    }
+    // Suggestions for a part of the word, as the host after `user@`, are matched against what
+    // is typed of that part.
+    if candidates.needle.is_none()
+        && let Some(part) = part_typed(&candidates, token.start, &ctx.prefix_str())
+    {
+        candidates.needle = Some(part);
+    }
+    Some(candidates)
+}
+
+/// What is typed of the part of the word `typed`, which starts at `token_start`, that every
+/// suggestion of `candidates` replaces, when they all start at one place inside it.
+fn part_typed(candidates: &Candidates, token_start: usize, typed: &str) -> Option<String> {
+    let mut starts = candidates
+        .items
+        .iter()
+        .map(|(_, item)| item.suggestion.span.start);
+    let start = starts.next()?;
+    if start <= token_start || starts.any(|other| other != start) {
+        return None;
+    }
+    typed.get(start - token_start..).map(str::to_owned)
+}
+
+/// Apply the `options` record a completer returned alongside its completions.
+fn read_options(
+    returned: ReturnedOptions,
+    options: &mut CompletionOptions,
+    candidates: &mut Candidates,
+) {
+    if let Some(filter) = returned.filter {
+        candidates.filter = filter;
+    }
+
+    if let Some(sort) = returned.sort {
+        candidates.sort = sort;
+        // Asking for a sort asks for the alphabetical order where nothing is typed.
+        candidates.ordered = !sort;
+        if sort && !candidates.filter {
+            log::warn!("Sorting won't happen because filtering is disabled.");
         }
+    }
 
-        let prefix = ctx.prefix_str();
-        let mut matcher = NuMatcher::new(prefix.as_ref(), &self.options, self.sort);
+    if let Some(case_sensitive) = returned.case_sensitive {
+        options.case_sensitive = case_sensitive;
+    }
 
-        for suggestion in self.suggestions {
-            let value =
-                strip_ansi_string_unlikely(suggestion.suggestion.display_value().to_string());
-            if matcher.check_match(&value).is_some() {
-                matcher.add(value, suggestion);
-            } else if self.options.match_description
-                && let Some(description) = suggestion.suggestion.description.as_deref()
-                && matcher.check_match(description).is_some()
-            {
-                let description = description.to_string();
-                matcher.add(description, suggestion);
-            }
-        }
+    if let Some(match_description) = returned.match_description {
+        options.match_description = match_description;
+    }
 
-        outcome(matcher.suggestion_results())
+    if let Some(algorithm) = returned
+        .completion_algorithm
+        .and_then(|algorithm| MatchAlgorithm::try_from(algorithm).ok())
+    {
+        options.match_algorithm = algorithm;
     }
 }
 
@@ -349,22 +498,47 @@ fn style_of(style: Value) -> Option<nu_ansi_term::Style> {
 }
 
 impl ReturnedSuggestion {
-    /// Resolve against the span a suggestion replaces when it names none.
+    /// Read one. Unlike the other records, it may carry fields of the completer's own: see
+    /// [`Self::extra_fields`]. Only a key that looks like a misspelled known one is reported.
+    fn read(value: Value) -> Option<Self> {
+        lint_misspelled_keys(&value, Self::LABEL, Self::KEYS);
+        read_part(value, Self::LABEL)
+    }
+
+    /// The fields of `value` that the engine does not read, in the completer's order, such as
+    /// `updated` and `remote` of `{value: main, updated: 2hr, remote: origin}`. `None` when
+    /// there are none.
+    fn extra_fields(value: &Value) -> Option<Record> {
+        let record = value.as_record().ok()?;
+        let fields: Record = record
+            .iter()
+            .filter(|(column, _)| !Self::KEYS.contains(&column.as_str()))
+            .map(|(column, field)| (column.clone(), field.clone()))
+            .collect();
+        (!fields.is_empty()).then_some(fields)
+    }
+
+    /// Resolve against the span a suggestion replaces when it names none, carrying `fields`
+    /// along.
     fn into_semantic(
         self,
+        fields: Option<Record>,
         default_span: reedline::Span,
         clamp: SpanClamp<'_>,
     ) -> SemanticSuggestion {
         let kind = suggestion_kind(self.kind, &self.value);
+        let value = self
+            .value
+            .coerce_into_string()
+            .map(strip_ansi_string_unlikely)
+            .unwrap_or_default();
+        let chose_spacing = self.append_whitespace.is_some() || value.ends_with(' ');
+        let (value, append_whitespace) = spaced(value, self.append_whitespace, &kind);
 
         SemanticSuggestion {
             suggestion: Suggestion {
-                value: self
-                    .value
-                    .coerce_into_string()
-                    .map(strip_ansi_string_unlikely)
-                    .unwrap_or_default(),
-                display_override: self.display_override.map(Into::into),
+                value,
+                display_override: self.display_override.or(self.display).map(Into::into),
                 description: self.description.map(Into::into),
                 style: self.style.and_then(style_of),
                 span: self
@@ -374,10 +548,17 @@ impl ReturnedSuggestion {
                 extra: self
                     .extra
                     .map(|extra| extra.into_iter().map(Into::into).collect()),
-                append_whitespace: self.append_whitespace.unwrap_or_default(),
+                append_whitespace,
                 match_indices: self.match_indices,
+                cursor: None,
             },
             kind: Some(kind),
+            fields,
+            // `null` says there is nothing to preview.
+            preview: self.preview.filter(|preview| !preview.is_nothing()),
+            help: self.help.filter(|help| !help.is_nothing()),
+            chose_spacing,
+            ..Default::default()
         }
     }
 }
@@ -411,32 +592,65 @@ impl ReturnedSpan {
     }
 }
 
+/// `value` and whether a space follows it once taken: as the completer says, or, when it says
+/// nothing, after a value that ends an argument. A value that ends in a space itself, as
+/// carapace's do, has it taken off and given back as the space that follows.
+fn spaced(mut value: String, said: Option<bool>, kind: &SuggestionKind) -> (String, bool) {
+    let trimmed = value.trim_end_matches(' ').len();
+    if trimmed < value.len() && trimmed > 0 && !value[..trimmed].ends_with('\\') {
+        value.truncate(trimmed);
+        return (value, true);
+    }
+    let spaced = said.unwrap_or_else(|| taking::ends_an_argument(&value, Some(kind)));
+    (value, spaced)
+}
+
 /// Parse one `Value` of a completer's list into a SemanticSuggestion.
 pub(crate) fn map_value_completions(
     list: impl Iterator<Item = Value>,
     default_span: reedline::Span,
     clamp: SpanClamp<'_>,
 ) -> Vec<SemanticSuggestion> {
-    list.filter_map(move |value| {
-        if matches!(value, Value::Record { .. }) {
-            return ReturnedSuggestion::read(value)
-                .map(|suggestion| suggestion.into_semantic(default_span, clamp));
-        }
+    let found = list
+        .enumerate()
+        .filter_map(move |(index, value)| {
+            ITEM.set(Some(index));
+            if matches!(value, Value::Record { .. }) {
+                let fields = ReturnedSuggestion::extra_fields(&value);
+                return ReturnedSuggestion::read(value)
+                    .map(|suggestion| suggestion.into_semantic(fields, default_span, clamp));
+            }
 
-        let kind = nu_protocol::SuggestionKind::Value(value.get_type());
-        value
-            .coerce_into_string()
-            .ok()
-            .map(|string| SemanticSuggestion {
-                suggestion: Suggestion {
-                    value: strip_ansi_string_unlikely(string),
-                    span: default_span,
-                    ..Suggestion::default()
-                },
-                kind: Some(kind),
-            })
-    })
-    .collect()
+            let ty = value.get_type();
+            value
+                .coerce_into_string()
+                .map_err(|_| {
+                    report(format!(
+                        "a suggestion must be a string or a record; got {ty}"
+                    ))
+                })
+                .ok()
+                .map(|string| {
+                    let kind = nu_protocol::SuggestionKind::Value(ty);
+                    let string = strip_ansi_string_unlikely(string);
+                    let chose_spacing = string.ends_with(' ');
+                    let (value, append_whitespace) = spaced(string, None, &kind);
+                    SemanticSuggestion {
+                        suggestion: Suggestion {
+                            value,
+                            span: default_span,
+                            append_whitespace,
+                            ..Suggestion::default()
+                        },
+                        kind: Some(kind),
+                        chose_spacing,
+                        ..Default::default()
+                    }
+                })
+        })
+        .collect();
+    ITEM.set(None);
+    found
 }
 
 /// Clamps returned spans to the text the source saw, snapping offsets to its char boundaries.
@@ -453,5 +667,85 @@ impl<'a> SpanClamp<'a> {
 
     pub(crate) fn apply(&self, value: usize) -> usize {
         self.seen.floor_char_boundary(value.min(self.seen.len()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nu_protocol::{Span as NuSpan, record};
+
+    fn suggestions(value: Value) -> Vec<SemanticSuggestion> {
+        map_value_completions(
+            std::iter::once(value),
+            reedline::Span::new(0, 0),
+            SpanClamp::within(""),
+        )
+    }
+
+    #[test]
+    fn fields_beyond_the_known_ones_are_kept_in_order() {
+        let found = suggestions(Value::test_record(record! {
+            "value" => Value::test_string("main"),
+            "updated" => Value::test_string("2hr"),
+            "description" => Value::test_string("default branch"),
+            "remote" => Value::test_string("origin"),
+        }));
+        let [main] = found.as_slice() else {
+            panic!("one suggestion, got {found:?}");
+        };
+        assert_eq!(main.suggestion.value, "main");
+        assert_eq!(
+            main.suggestion.description.as_deref(),
+            Some("default branch")
+        );
+        let fields = main.fields.as_ref().expect("the extra fields");
+        assert_eq!(fields.columns().collect::<Vec<_>>(), ["updated", "remote"]);
+        assert_eq!(fields.get("updated"), Some(&Value::test_string("2hr")));
+    }
+
+    #[test]
+    fn a_suggestion_of_known_fields_has_none() {
+        let found = suggestions(Value::test_record(record! {
+            "value" => Value::test_string("main"),
+            "type" => Value::test_string("string"),
+            "extra" => Value::test_list(vec![Value::test_string("x")]),
+        }));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].fields, None);
+        // A bare value has nothing beyond itself either.
+        let bare = suggestions(Value::string("main", NuSpan::test_data()));
+        assert_eq!(bare[0].fields, None);
+    }
+
+    #[test]
+    fn a_preview_is_kept_for_the_panel_and_is_no_extra_column() {
+        let found = suggestions(Value::test_record(record! {
+            "value" => Value::test_string("main"),
+            "preview" => Value::test_record(record! { "commits" => Value::test_int(3) }),
+        }));
+        assert_eq!(found[0].fields, None);
+        assert!(matches!(found[0].preview, Some(Value::Record { .. })));
+
+        let nothing = suggestions(Value::test_record(record! {
+            "value" => Value::test_string("topic"),
+            "preview" => Value::test_nothing(),
+        }));
+        assert_eq!(
+            nothing[0].preview, None,
+            "null says there is nothing to preview"
+        );
+    }
+
+    #[test]
+    fn an_extra_field_does_not_cost_the_suggestion() {
+        let found = suggestions(Value::test_record(record! {
+            "value" => Value::test_string("main"),
+            // Looks like a misspelled `description`: reported, and still kept as a column.
+            "descripton" => Value::test_string("typo"),
+        }));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].suggestion.description, None);
+        assert_eq!(found[0].fields.as_ref().map(|fields| fields.len()), Some(1));
     }
 }

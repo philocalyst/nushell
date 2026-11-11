@@ -1,0 +1,176 @@
+# Completion over what flows down a pipeline: the columns of the rows piped in, the commands that
+# take what is piped, and, where the pipeline only reads, the data it holds. The files are named
+# like the columns `ls` lists, so that a path offered where a column is wanted cannot pass for one.
+{
+  world: [name.txt size.log type/ modified other.md]
+  programs: [fd fs]
+  prelude: r#'
+    alias ls-builtin = ls
+    def ls [...args: glob] {
+      if ($args | is-empty) { ls-builtin --all | sort-by type name } else { ls-builtin --all ...$args | sort-by type name }
+    }
+    def pick [n: int] { match $n { 1 => { ls-builtin }, _ => null } }
+    def guarded [] { try { ls-builtin } catch { [] } }
+    def --env lsd [] { cd .; ls-builtin }
+    def lsw [] { ls | sort-by type }
+    def input [place: record] { [$place.input.type, ($place.input.columns? | default [] | get name | str join '+')] }
+    def foo [x: string@input] {}
+    def column-names [place: record] { $place.input.columns? | default [] | get name }
+    def bar [x: string@column-names] {}
+    "[package]\nname = \"fixture\"\nversion = \"1.0.0\"\n\n[dependencies]\nserde = \"1\"\n" | save fixture.toml
+  '#
+  cases: [
+    # Each column is described by its type, in the order the table has them.
+    {test: a_condition_names_the_columns_of_what_is_piped, line: "ls | where ", values: [name type size modified], types: [string string filesize datetime]}
+    {test: a_condition_names_the_columns_of_what_is_piped, line: "ls | where size > 1kb and ", values: [name type size modified], types: [string string filesize datetime]}
+    {test: a_condition_names_the_columns_of_what_is_piped, line: "ls | where name == 'a' or ", values: [name type size modified]}
+    {test: a_condition_names_the_columns_of_what_is_piped, line: "ls | where si", values: [size], types: [filesize]}
+    # After a column the operators that fit its type, and after the operator a value.
+    {test: a_condition_names_the_columns_of_what_is_piped, line: "ls | where size ", has: ["*"], lacks: [starts-with]}
+    {test: a_condition_names_the_columns_of_what_is_piped, line: "ls | where name ", has: [starts-with], lacks: ["*"]}
+    {test: a_condition_names_the_columns_of_what_is_piped, line: "ls | where modified > ", first: "(date now) - 1hr"}
+    {test: arguments_that_name_columns_offer_them, line: "ls | sort-by ", values: [name type size modified], types: [string string filesize datetime]}
+    {test: arguments_that_name_columns_offer_them, line: "ls | select ", values: [name type size modified]}
+    {test: arguments_that_name_columns_offer_them, line: "ls | reject ", values: [name type size modified]}
+    {test: arguments_that_name_columns_offer_them, line: "ls | get ", values: [name type size modified], types: [string string filesize datetime]}
+    {test: arguments_that_name_columns_offer_them, line: "ls | group-by ", values: [name type size modified]}
+    {test: arguments_that_name_columns_offer_them, line: "ls | update ", values: [name type size modified]}
+    {test: arguments_that_name_columns_offer_them, line: "ls | upsert ", values: [name type size modified]}
+    {test: arguments_that_name_columns_offer_them, line: "ls | insert ", values: [name type size modified]}
+    {test: arguments_that_name_columns_offer_them, line: "ls | move ", values: [name type size modified]}
+    {test: arguments_that_name_columns_offer_them, line: "ls | uniq-by ", values: [name type size modified]}
+    {test: arguments_that_name_columns_offer_them, line: "ls | default 0 ", values: [name type size modified]}
+    {test: arguments_that_name_columns_offer_them, line: "ls | move --after ", values: [name type size modified]}
+    {test: arguments_that_name_columns_offer_them, line: "ls | sort-by size --reverse ", same_as: "ls | sort-by size "}
+    {test: the_type_flows_down_the_pipeline, line: "{a: 1, b: 2} | get ", values: [a b], types: [int int]}
+    # A custom command that declares no output has the output of its body.
+    {test: the_type_flows_down_the_pipeline, line: "lsw | where ", values: [name type size modified], types: [string string filesize datetime]}
+    # Filters pass the columns on; `select` and `reject` narrow them, `insert` adds one.
+    {test: the_type_flows_down_the_pipeline, line: "ls | where size > 1kb | sort-by size | first 3 | get ", values: [name type size modified]}
+    {test: the_type_flows_down_the_pipeline, line: "ls | select name size | get ", values: [name size], types: [string filesize]}
+    {test: the_type_flows_down_the_pipeline, line: "ls | reject name | where ", values: [type size modified], types: [string filesize datetime]}
+    {test: the_type_flows_down_the_pipeline, line: "ls | insert ext 'md' | where ex", values: [ext], types: [string]}
+    # A variable that holds rows.
+    {test: the_type_flows_down_the_pipeline, line: "let rows = ls; $rows | get ", values: [name type size modified]}
+    {test: the_type_flows_down_the_pipeline, line: "let rows = [[a b]; [1 'x']]; $rows | get ", values: [a b], types: [int string]}
+    # `each` makes something else of the rows, and nothing is piped into the first command.
+    {test: the_type_flows_down_the_pipeline, line: "ls | each {|r| $r.name} | where ", values: []}
+    {test: the_type_flows_down_the_pipeline, line: "where ", values: []}
+    {test: a_closure_names_the_columns_of_its_row, line: "[{x: 1}] | each {|r| $r.", values: [x], types: [int]}
+    {test: a_closure_names_the_columns_of_its_row, line: "[{x: 1}] | each { $in.", values: [x], types: [int]}
+    {test: a_closure_names_the_columns_of_its_row, line: "[{x: 1}] | where {|r| $r.", values: [x], types: [int]}
+    {test: a_closure_names_the_columns_of_its_row, line: "[{x: 1}] | update x {|r| $r.", values: [x], types: [int]}
+    {test: a_closure_names_the_columns_of_its_row, line: "[{x: 1}] | sort-by --custom {|a, b| $a.", values: [x], types: [int]}
+    {test: a_closure_names_the_columns_of_its_row, line: "[{x: 1}] | each {|r| $r | get ", values: [x], types: [int]}
+    # `$in` outside a closure is all the rows.
+    {test: a_closure_names_the_columns_of_its_row, line: "ls | $in.", values: [name type size modified]}
+    # A completer that declares `place` is told what is piped into the command, and its columns.
+    {test: a_completer_is_told_what_is_piped, line: "foo ", set: ["" nothing]}
+    {test: a_completer_is_told_what_is_piped, line: "[1 2] | foo ", set: ["" "list<int>"]}
+    {test: a_completer_is_told_what_is_piped, line: "ls | foo ", set: ["name+type+size+modified" "table<name: string, type: string, size: filesize, modified: datetime>"]}
+    # Commands that take a table rank ahead of those that take nothing piped, none is left out.
+    {test: commands_that_take_the_piped_type_rank_first, line: "ls | where size > 1kb | f", order: [first fd], has: [find flatten fs for]}
+    {test: commands_that_take_the_piped_type_rank_first, line: "ls | where size > 1kb | f", order: [find fs]}
+    {test: commands_that_take_the_piped_type_rank_first, line: "ls | where size > 1kb | f", order: [flatten for]}
+    # A site that wants a column never offers a path, whatever has been typed.
+    {test: a_column_site_never_offers_a_path, line: "ls | where n", within: [name type size modified]}
+    {test: a_column_site_never_offers_a_path, line: "ls | select s", within: [name type size modified]}
+    {test: a_column_site_never_offers_a_path, line: "ls | get t", within: [name type size modified]}
+    {test: a_column_site_never_offers_a_path, line: "ls | sort-by m", within: [name type size modified]}
+    {test: a_column_site_never_offers_a_path, line: "ls | default 0 o", within: [name type size modified]}
+    {test: a_column_site_never_offers_a_path, line: "ls | move --after na.x", within: [name type size modified]}
+    {test: a_column_site_never_offers_a_path, line: "ls | $in.si", within: [name type size modified]}
+    {test: a_column_site_never_offers_a_path, line: "ls | each {|r| $r.ty", within: [name type size modified]}
+    # A command that ends in a branch outputs what its branches agree on.
+    {test: the_type_flows_through_branches, line: "ls | where ", values: [name type size modified]}
+    {test: the_type_flows_through_branches, line: "pick 1 | where ", values: [name type size modified]}
+    {test: the_type_flows_through_branches, line: "guarded | where ", values: [name type size modified]}
+    {test: the_type_flows_through_branches, line: "ls-builtin --long | get ", has: [mode name]}
+    # The value most rows have first, and how many have it; four files and a directory.
+    {test: a_condition_offers_the_values_of_its_column, line: "ls | where type == ", values: [file dir], descriptions: ["5 rows" "1 row"]}
+    {test: a_condition_offers_the_values_of_its_column, line: "ls | where type != ", values: [file dir]}
+    {test: a_condition_offers_the_values_of_its_column, line: "ls | where size >= 0 and type == ", values: [file dir]}
+    {test: a_condition_offers_the_values_of_its_column, line: "ls | where not type == ", values: [file dir]}
+    {test: a_condition_offers_the_values_of_its_column, line: "ls | where type == d", values: [dir]}
+    {test: a_condition_offers_the_values_of_its_column, line: "ls | where type == \"d", values: [dir]}
+    {test: a_condition_offers_the_values_of_its_column, line: "ls | where type == 'd", values: [dir]}
+    # Only the strings fit the operators that match text, and only the numbers those that order.
+    {test: a_condition_offers_the_values_of_its_column, line: "[[a]; [x] [1] [2.5]] | where a =~ ", values: [x]}
+    {test: a_condition_offers_the_values_of_its_column, line: "[[a]; [x] [1] [2.5]] | where a > ", values: ["1" "2.5"]}
+    {test: a_condition_offers_the_values_of_its_column, line: "[[a]; [x] [1] [2.5]] | where a == ", values: [x "1" "2.5"]}
+    # Once the condition has its value, what joins it to the next.
+    {test: a_condition_offers_the_values_of_its_column, line: "ls | where type == dir ", values: [and or xor]}
+    # Text that needs it is quoted; a string that reads as a number or a boolean stays a string.
+    {test: a_value_is_spelled_so_that_it_means_what_the_data_has, line: "[[a]; [x] ['y y'] ['1'] ['true'] [x] [\"it's\"]] | where a == ", values: [x "'y y'" "'1'" "'true'" "`it's`"]}
+    {test: a_value_is_spelled_so_that_it_means_what_the_data_has, line: "[[n]; [3] [3] [5] [true]] | where n == ", values: ["3" "5" "true"]}
+    {test: a_value_is_spelled_so_that_it_means_what_the_data_has, line: "[[s]; [4kb] [1mb] [4kb]] | where s > ", values: ["4000b" "1000000b"]}
+    # Dates are never offered, nor numbers when there are many; text fifty at a time.
+    {test: a_wall_of_values_is_not_a_choice, line: "ls | where modified == ", values: []}
+    {test: a_wall_of_values_is_not_a_choice, setup: "$env.rows = (1..60 | each { $'[($in)]' } | str join ' ')", line_from: "$'[[a]; ($env.rows)] | where a == '", values: []}
+    {test: a_wall_of_values_is_not_a_choice, setup: "$env.rows = (1..60 | each { $'[w($in)]' } | str join ' ')", line_from: "$'[[a]; ($env.rows)] | where a == '", count: 50}
+    {test: a_wall_of_values_is_not_a_choice, setup: "$env.rows = (1..60 | each { $'[w($in)]' } | str join ' ')", line_from: "$'[[a]; ($env.rows)] | where a == w60'", values: [w60]}
+    # A key is described by its type; what its cells hold is its preview's to show.
+    {test: a_key_is_described_by_its_type, line: "open fixture.toml | get ", values: [package dependencies], descriptions: [record record]}
+    {test: a_key_is_described_by_its_type, line: "open fixture.toml | get package.", values: [name version], descriptions: [string string]}
+    {test: a_key_is_described_by_its_type, line: "(open fixture.toml).dependencies.", values: [serde]}
+    {test: a_key_is_described_by_its_type, line: "ls | get ", descriptions: [string string filesize datetime]}
+    # Nothing declares what a file or a grouping holds: the keys are known only by reading.
+    {test: the_keys_are_known_only_by_reading, line: "open fixture.toml | select ", set: [dependencies package]}
+    {test: the_keys_are_known_only_by_reading, line: "ls | group-by type | get ", set: [dir file]}
+    {test: the_keys_are_known_only_by_reading, line: "[[a b]; [1 2]] | transpose | get ", set: [column0 column1]}
+    # A file that is not there, or is not data, gives nothing and a reason.
+    {test: the_keys_are_known_only_by_reading, line: "open nothing.toml | get ", values: [], evaluated: [refused]}
+    # The user's `ls` only reads, so it runs; one that changes the environment does not, and its
+    # type still names the columns. An alias of the builtin is the builtin.
+    {test: a_pipeline_that_may_write_is_not_run, line: "ls | where type == ", values: [file dir], evaluated: [ran]}
+    {test: a_pipeline_that_may_write_is_not_run, line: "lsd | where type == ", values: [], evaluated: [refused], reason: environment}
+    {test: a_pipeline_that_may_write_is_not_run, line: "lsd | where ", count: 4}
+    {test: a_pipeline_that_may_write_is_not_run, line: "ls-builtin | where type == ", values: [file dir], evaluated: [ran]}
+    # Whatever may write, run other code or reach out, anywhere before the cursor, is refused.
+    {test: a_pipeline_that_may_write_is_not_run, line: "rm other.md | where type == ", values: [], evaluated: [refused]}
+    {test: a_pipeline_that_may_write_is_not_run, line: "ls-builtin | save out.txt | where type == ", values: [], evaluated: [refused]}
+    {test: a_pipeline_that_may_write_is_not_run, line: "ls-builtin out> out.txt | where type == ", values: [], evaluated: [refused]}
+    {test: a_pipeline_that_may_write_is_not_run, line: "ls-builtin | where name == (rm other.md) | where type == ", values: [], evaluated: [refused]}
+    {test: a_pipeline_that_may_write_is_not_run, line: "ls-builtin | each {|f| $f.name} | where name == ", values: [], evaluated: [refused]}
+    {test: a_pipeline_that_may_write_is_not_run, line: "^ls | where type == ", values: [], evaluated: [refused]}
+    {test: a_pipeline_that_may_write_is_not_run, line: "http get https://example.com | get ", values: [], evaluated: [refused]}
+    {test: a_pipeline_that_may_write_is_not_run, line: "open https://example.com/a.json | get ", values: [], evaluated: [refused]}
+    {test: a_pipeline_that_may_write_is_not_run, line: "history --clear | get ", values: [], evaluated: [refused]}
+    {test: the_columns_follow_a_rename, line: "ls | rename foo | each {|r| $r.", values: [foo type size modified]}
+    {test: the_columns_follow_a_rename, line: "ls | rename --column {name: nom, size: bytes} | each {|r| $r.", values: [nom type bytes modified]}
+    # More names than columns are ignored; read from the data, the same; a block's names are not known.
+    {test: the_columns_follow_a_rename, line: "ls | rename a b c d e | each {|r| $r.", values: [a b c d]}
+    {test: the_columns_follow_a_rename, line: "ls | rename foo | get ", values: [foo type size modified]}
+    {test: the_columns_follow_a_rename, line: "ls | rename --block {str upcase} | each {|r| $r.", values: []}
+    {test: a_negated_condition_names_the_columns, line: "ls | where not ", values: [name type size modified], types: [string string filesize datetime]}
+    {test: a_negated_condition_names_the_columns, line: "ls | where size > 1kb and not ", values: [name type size modified]}
+    {test: a_negated_condition_names_the_columns, line: "ls | where not size > 1kb and ", values: [name type size modified]}
+    {test: a_negated_condition_names_the_columns, line: "ls | where not (size > 1kb) or not ", values: [name type size modified]}
+    {test: a_negated_condition_names_the_columns, line: "ls | where not si", values: [size], types: [filesize]}
+    {test: the_system_commands_declare_their_columns, line: "sys host | bar ", has: [hostname]}
+    {test: the_system_commands_declare_their_columns, line: "sys mem | bar ", has: ["swap used"]}
+    {test: the_system_commands_declare_their_columns, line: "sys temp | bar ", has: [temp]}
+    {test: the_system_commands_declare_their_columns, line: "sys users | bar ", has: [groups]}
+    {test: the_system_commands_declare_their_columns, line: "sys disks | bar ", has: [mount]}
+    {test: the_system_commands_declare_their_columns, line: "sys cpu | bar ", has: [brand]}
+    {test: the_system_commands_declare_their_columns, line: "sys net | bar ", has: [name]}
+    {test: the_system_commands_declare_their_columns, line: "sys host | get ", has: [hostname]}
+    # Where the type that flows and the data both say what the columns are, they say the same.
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | each {|r| $r.", same_as: "ls | get ", count: 4}
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | select name size | each {|r| $r.", same_as: "ls | select name size | get ", count: 2}
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | reject name | each {|r| $r.", same_as: "ls | reject name | get ", count: 3}
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | sort-by size | first 2 | each {|r| $r.", same_as: "ls | sort-by size | first 2 | get ", count: 4}
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | insert x 1 | each {|r| $r.", same_as: "ls | insert x 1 | get ", count: 5}
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | enumerate | each {|r| $r.", same_as: "ls | enumerate | get ", count: 2}
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | rename a b | each {|r| $r.", same_as: "ls | rename a b | get ", count: 4}
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | rename --column {name: n} | each {|r| $r.", same_as: "ls | rename --column {name: n} | get ", count: 4}
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | where size >= 0 | each {|r| $r.", same_as: "ls | where size >= 0 | get ", count: 4}
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | skip 1 | take 2 | each {|r| $r.", same_as: "ls | skip 1 | take 2 | get ", count: 4}
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | uniq-by type | each {|r| $r.", same_as: "ls | uniq-by type | get ", count: 4}
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | reverse | compact | each {|r| $r.", same_as: "ls | reverse | compact | get ", count: 4}
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | append {name: x} | each {|r| $r.", same_as: "ls | append {name: x} | get ", count: 4}
+    {test: the_data_and_the_type_name_the_same_columns, line: "ls | select name | insert y 2 | rename z | each {|r| $r.", same_as: "ls | select name | insert y 2 | rename z | get ", count: 2}
+    {test: the_data_and_the_type_name_the_same_columns, line: "[[a b]; [1 2]] | each {|r| $r.", same_as: "[[a b]; [1 2]] | get ", count: 2}
+    {test: the_data_and_the_type_name_the_same_columns, line: "[[a b]; [1 2]] | insert c 3 | rename x | each {|r| $r.", same_as: "[[a b]; [1 2]] | insert c 3 | rename x | get ", count: 3}
+  ]
+}

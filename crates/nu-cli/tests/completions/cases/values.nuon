@@ -1,0 +1,186 @@
+# Flags, attributes, variables, cell paths, aliases and operators, and what completers are handed.
+# In the `completions` fixture, by prefix; `ext` cases set the external completer they name.
+{
+  fixture: completions
+  prelude: "$env.config.completions.algorithm = 'prefix'"
+  cases: [
+    # Each flag of `ls` once, its short form beside it (#16375); a short form typed is itself.
+    {test: flag_completions, line: "ls -", values: [--all --directory --du --full-paths --help --long --mime-type --short-names --threads]}
+    {test: flag_completions, line: "table -", count: 12}
+    {test: flag_completions, line: "ls -l", has: [-l]}
+    {test: attribute_completions, line: "@", values_from: "scope commands | where name starts-with 'attr ' | get name | str substring 5.."}
+    {test: attributable_completions, line: "@example; ", values: [def "export def" "export extern" extern], taken: "@example; def "}
+    {setup: "let actor = { name: 'Tom Hardy', age: 44 }", cases: [
+      {test: variables_completions, line: "$nu.", values_from: "$nu | columns | sort"}
+      {test: variables_completions, line: "$nu.h", values: [history-enabled history-path home-dir]}
+      {test: variables_completions, line: "$nu.os-info.", values: [arch family kernel_version name]}
+      {test: variables_completions, line: "$actor.", values: [age name]}
+      {test: variables_completions, line: "$actor.n", values: [name]}
+      {test: variables_completions, line: "$env.", values: [config PATH PWD TEST], os: unix}
+      {test: variables_completions, line: "$env.", values: [config Path PWD TEST], os: windows}
+      {test: variables_completions, line: "$env.T", values: [TEST]}
+      {test: variables_completions, line: "$", values: ["$actor" "$ans" "$env" "$in" "$nu"]}
+    ]}
+    # https://github.com/nushell/nushell/issues/15291
+    {test: local_variable_completion, line: "def test [foo?: string, --foo1: bool, ...foo2] { let foo3 = true; $foo", values: ["$foo" "$foo1" "$foo2" "$foo3"]}
+    {test: local_variable_completion, lines: ["if true { let foo = true; $foo" "if true {let foo1 = 1} else {let foo = true; $foo" "(let foo = true; $foo" "match {a: {b: 3}} {{a: {b: $foo}} => $foo"], values: ["$foo"]}
+    {test: local_variable_completion, line: "for foo in [1] { let foo1 = true; $foo", values: ["$foo" "$foo1"]}
+    {test: local_variable_completion, line: "for foo in [1] { let foo1 = true }; $foo", values: []}
+    {test: record_cell_path_completions, setup: "let foo = {a: [1 {a: 2}]}; const bar = {a: [1 {a: 2}]}", lines: ["$foo." "$foo.a.1." "($foo)." "$bar." "$bar.a.1." "{a: [1 {a: 2}]}.a.1."], values: [a]}
+    {setup: "let foo = [{a:{b:1}}, {a:{b:2}}]; const bar = [[a b]; [1 2]]", cases: [
+      {test: table_cell_path_completions, lines: ["$foo." "($foo)."], values: [a]}
+      {test: table_cell_path_completions, lines: ["$foo.a." "($foo).a."], values: [b]}
+      {test: table_cell_path_completions, lines: ["$bar." "($bar)."], values: [a b]}
+    ]}
+    {test: custom_value_cell_path_completions, setup: "let v = \"1.2.3-alpha.1+build\" | into semver", line: "$v.", set: [major minor patch pre build prefix]}
+    {test: quoted_cell_path_completions, setup: r#'let foo = {'foo bar':1 'foo\\"bar"': 1 '.': 1 '|': 1 1: 1 "": 1}'#, cases: [
+      {line: "$foo.", values: ['""' '"."' '"1"' '"foo bar"' r#'"foo\\\\\"bar\""'# '"|"']}
+      {lines: ["$foo.`foo" "$foo.foo"], values: ['"foo bar"' r#'"foo\\\\\"bar\""'#]}
+    ]}
+    {test: alias_of_command_and_flags, setup: "alias ll = ls -l", line: "ll t", values: [test_a/ test_a_symlink/ test_b/], paths: true}
+    {test: alias_of_basic_command, setup: "alias ll = ls ", line: "ll t", values: [test_a/ test_a_symlink/ test_b/], paths: true}
+    {test: alias_of_another_alias, setup: "alias ll = ls -la\nalias lf = ll -f", line: "lf t", values: [test_a/ test_a_symlink/ test_b/], paths: true}
+    # The `buffer` is the line up to the cursor, across pipes and closures; `place` resolves the
+    # site, the same record for a parameter completer as for an external one.
+    {test: external_completer_receives_the_unified_input, setup: r#'$env.config.completions.external.completer = {|buffer, place| [$buffer $"cursor=($place.cursor)" $"place-kind=($place.kind)" $"target=($place.target | to nuon)"]}'#, line: "before | ext --ma later", at: 17, values: ["before | ext --ma" "cursor=17" "place-kind=external-arg" "target={start: 13, end: 17}"]}
+    {test: a_completer_inside_a_closure_receives_the_whole_line, setup: r#'$env.config.completions.external.completer = {|buffer, place| [$buffer $"place-kind=($place.kind)"]}'#, line: "ignored | each { ext --ma", values: ["ignored | each { ext --ma" "place-kind=external-arg"]}
+    {test: parameter_completer_receives_the_unified_input, setup: r#'
+      def comp [buffer, place] { { options: { filter: false }, completions: [$buffer $"cursor=($place.cursor)" $"place-kind=($place.kind)" $"index=($place.index)" $"target=($place.target | to nuon)"] } }
+      def my-command [arg: string@comp] {}
+    '#, line: "my-command ma later", at: 13, values: ["my-command ma" "cursor=13" "place-kind=positional" "index=0" "target={start: 11, end: 13}"]}
+    # The engine narrows a parameter completer's list, but not an external one's.
+    {test: parameter_completions_are_narrowed_but_external_ones_are_not, setup: "def comp [] { [alpha, beta] }\ndef my-command [arg: string@comp] {}", line: "my-command al", values: [alpha]}
+    {test: parameter_completions_are_narrowed_but_external_ones_are_not, setup: "$env.config.completions.external.completer = {|input| [alpha, beta] }", line: "ext al", values: [alpha beta]}
+    # A span is clamped to the buffer and floored to a char boundary (#5127); past the cursor it
+    # clamps to it. Text past the cursor never reaches a completer.
+    {test: a_returned_span_is_clamped_to_the_buffer, setup: "$env.config.completions.external.completer = {|input| [{ value: v, span: { start: 5, end: 99 } }] }", line: "ext é", spans: [[4 6]]}
+    {test: a_returned_span_is_clamped_to_the_buffer, setup: "$env.config.completions.external.completer = {|input| [{ value: v, span: { start: 4, end: 99 } }] }", line: "ext ab cd", at: 6, spans: [[4 6]]}
+    {test: the_text_after_the_cursor_never_reaches_the_completer, setup: "$env.config.completions.external.completer = {|buffer| [$'[($buffer)]']}", lines: ["ext bar" "ext qux"], at: 4, values: ["[ext ]"]}
+    {test: unknown_command_completion, line: "thiscommanddoesnotexist ", values: [another/ custom_completion.nu directory_completion/ nushell test_a/ test_a_symlink/ test_b/ .hidden_file .hidden_folder/], paths: true}
+    {test: filecompletions_triggers_after_cursor, line: "cp   test_c", at: 3, values: [another/ custom_completion.nu directory_completion/ nushell test_a/ test_a_symlink/ test_b/ .hidden_file .hidden_folder/], paths: true}
+    {test: filecompletions_for_redirection_target, fixture: external_completions, lines: ["(echo 'foo' o+e> `dir with space/`" "echo 'foo' o> foo e> `dir with space/`"], values: ["`dir with space/bar baz`" "`dir with space/foo`"]}
+    # Custom completions of an extern's positionals, flags and options; not where a flag's own name
+    # is completed (#16860).
+    {setup: r#'
+      def animals [] { [ "cat", "dog", "eel" ] }
+      def fruits [] { [ "apple", "banana" ] }
+      def options [] { [ '"first item"', '"second item"', '"third item' ] }
+      extern spam [animal: string@animals, fruit?: string@fruits, ...rest: string@animals, --foo (-f): string@animals, -b: string@animals, --options: string@options]
+    '#, cases: [
+      {test: extern_custom_completion, lines: ["spam " "spam foo -f bar baz " "spam foo -f bar baz qux " "spam --foo=" "spam -f " "spam -b "], values: [cat dog eel]}
+      {test: extern_custom_completion, line: "spam foo -f bar ", values: [apple banana]}
+      {test: extern_custom_completion, line: "spam --f", values: [--foo]}
+      {test: extern_custom_completion, line: "spam -f", values: [-f]}
+      {test: extern_custom_completion, line: "spam -", values: [--foo --options -b]}
+      {test: extern_custom_completion, lines: ["spam --options " "spam --options \"" "spam --options `"], values: ['"first item"' '"second item"' '"third item']}
+      {test: extern_custom_completion, line: "spam --options 'third", values: ['"third item']}
+    ]}
+    # The external completer triggers wherever the cursor sits in an argument position.
+    {test: custom_completer_triggers_at_the_cursor, setup: "$env.config.completions.external = { enable: true, max_results: 100, completer: {|buffer| [$'[($buffer)]'] } }", cases: [
+      {line: "cmd foo  bar ", at: 8, values: ["[cmd foo ]"]}
+      {line: "cmd foo  bar ", at: 9, values: ["[cmd foo  ]"]}
+      {line: "cmd foo  bar ", at: 12, values: ["[cmd foo  bar]"]}
+      {line: "cmd foo  bar ", at: 13, values: ["[cmd foo  bar ]"]}
+    ]}
+    # Even though "nushell" is a better match, alphabetical sort puts it second.
+    {test: sort_fuzzy_completions_in_alphabetical_order, setup: "$env.config.completions.algorithm = 'fuzzy'\n$env.config.completions.sort = 'alphabetical'", line: "ls nu", values: [custom_completion.nu nushell]}
+    {test: alias_offset_bug_7648, setup: "alias ea = ^$env.EDITOR /tmp/test.s", lines: ["e" "^(ls | e"], at_least: 1}
+    {test: alias_offset_bug_7754, setup: "alias ll = ls -l", line: "ll -a | c", at_least: 1}
+    # The operators that fit the type of what is before them.
+    {setup: "$env.config.completions.external = { enable: true, max_results: 100, completer: {|buffer| [$'[($buffer)]'] } }", cases: [
+      {test: operator_completions, lines: ["1 " "-(1) " "[1].0 "], count: 20}
+      {test: operator_completions, lines: ["1 bit-s" "[1].0 bit-s"], values: [bit-shl bit-shr]}
+      {test: operator_completions, lines: ["'str' " "const f = {'foo': [1, '1']}; $f.foo.1 "], count: 15}
+      {test: operator_completions, lines: ["'str' +" "const f = {'foo': [1, '1']}; $f.foo.1 ++"], values: ["++"]}
+      {test: operator_completions, lines: ["1ms " "{'foo': [1, 1kb]}.foo.1 "], count: 14}
+      {test: operator_completions, line: "1ms /", values: ["/" "//"]}
+      {test: operator_completions, line: "{'foo': [1, 1kb]}.foo.1 mo", values: [mod]}
+      {test: operator_completions, line: "..2 ", count: 6}
+      {test: operator_completions, lines: ["..2 h" "[[];[]] h"], values: [has]}
+      {test: operator_completions, line: "[[];[]] ", count: 7}
+      {test: operator_completions, line: "(date now) ", count: 10}
+      {test: operator_completions, line: "(date now) o", values: [older-than]}
+      {test: operator_completions, line: "(date now) <", values: ["<" "<="]}
+      {test: operator_completions, lines: ["{1} " "null "], values: ["==" "!=" in not-in]}
+      {test: assignment_operator_completions, line: "mut foo = ''; $foo ", count: 17}
+      {test: assignment_operator_completions, lines: ["mut foo = ''; $foo ++" "$env.config.keybindings +"], values: ["++" "++="]}
+      {test: assignment_operator_completions, line: "mut foo = date now; $foo ", count: 11}
+      {test: assignment_operator_completions, line: "mut foo = date now; $foo =", values: ["=" "=="]}
+      {test: assignment_operator_completions, line: "mut foo = 1ms; $foo ", count: 19}
+      {test: assignment_operator_completions, line: "mut foo = 1ms; $foo +", values: ["+" "+="]}
+      {test: assignment_operator_completions, line: "mut foo = null; $foo ", values: ["==" "!=" in not-in "="]}
+      {test: assignment_operator_completions, line: "$env.config.keybindings ", count: 9}
+      # All operators for a column `ls` does not have, only those of its type for one it has.
+      {test: assignment_operator_completions, line: "ls | where nope ", count: 34}
+      {test: assignment_operator_completions, line: "ls | where size ", has: ["*"], lacks: [starts-with]}
+      {test: assignment_operator_completions, line: "ls | where name starts", values: [starts-with]}
+      {test: assignment_operator_completions, line: "ls | where modified old", values: [older-than]}
+      {test: type_inferenced_operator_completions, ignore: "type inference", line: "let f = {'foo': [1, '1']}; $f.foo.1 ", count: 15}
+    ]}
+    {test: cellpath_assignment_operator_completions, setup: "mut foo = {'foo': [1, '1']}", cases: [
+      {line: "$foo.foo.1 ", count: 17}
+      {line: "$foo.foo.1 ++", values: ["++" "++="]}
+    ]}
+    {test: cellpath_assignment_operator_completions, setup: "mut foo = {'foo': [1, (date now)]}", cases: [
+      {line: "$foo.foo.1 ", count: 11}
+      {line: "$foo.foo.1 =", values: ["=" "=="]}
+    ]}
+    # The `buffer` is the line exactly as typed: an alias reaches the completer as its alias.
+    {test: external_completer_receives_the_raw_line_with_aliases_unexpanded, setup: "alias example_alias = example_cmd arg1 arg2\n$env.config.completions.external.completer = {|buffer| ($buffer | split row ' ') }", line: "example_alias extra_arg", values: [example_alias extra_arg]}
+    # `substring` is deprecated and read as `fuzzy`.
+    {test: "suggestion_match_indices::substring_is_fuzzy", setup: "$env.config.completions.algorithm = 'substring'", line: "def foo [a: string@[😏foo かなfoo abfoo]] {}; foo f", values: [😏foo abfoo かなfoo], indices: [[1] [2] [2]]}
+    {test: "suggestion_match_indices::fuzzy", setup: "$env.config.completions.algorithm = 'fuzzy'", line: "def foo [a: string@[😏foo かなfoo abfoo]] {}; foo f", values: [😏foo abfoo かなfoo], indices: [[1] [2] [2]]}
+    {test: "suggestion_match_indices::fuzzy_unicode_with_quotes", setup: "$env.config.completions.algorithm = 'fuzzy'", line: "def foo [a: string@[かなfoo '`かなbar`']] {}; foo な", values: ["`かなbar`" かなfoo], indices: [[2] [1]]}
+    {test: "suggestion_match_indices::prefix_unicode_with_quotes", setup: "$env.config.completions.algorithm = 'prefix'", line: "def foo [a: string@[かなfoo '`かなbar`']] {}; foo か", values: ["`かなbar`" かなfoo], indices: [[1] [0]]}
+    {test: clip_subcommands_show_before_and_after_use, ignore: "only with the experimental option native-clip", lines: ["clip " "clip"], has: ["clip copy"]}
+    # A directory-typed argument with nothing typed offers directories only.
+    {test: empty_directory_arg_slot_completes_directories_only, world: [alpha_dir/ beta_dir/ gamma.txt], setup: "def my-cd [dir: directory] {}; def my-flag [--dir: directory] {}", lines: ["cd " "my-cd " "my-flag --dir "], has: [alpha_dir/ beta_dir/], lacks: [gamma.txt], paths: true}
+    # Legacy shapes: `[context, pos]` (older zoxide), `[spans]` command-wide, `{|spans|}` (fzf).
+    {test: legacy_zoxide_style_parameter_completer_receives_context_and_pos, setup: r#'
+      def comp [context: string, pos: int] { { options: { filter: false }, completions: [$context, $"pos=($pos)"] } }
+      def my-command [arg: string@comp] {}
+    '#, line: "my-command foo", values: ["my-command foo" "pos=14"]}
+    {test: legacy_command_wide_completer_receives_spans, setup: "$env.config.completions.external = { enable: true, max_results: 100, completer: {|buffer| [$'[($buffer)]'] } }\ndef \"nu-complete foo\" [spans] { [($spans | str join \",\")] }\n@complete \"nu-complete foo\"\ndef --wrapped \"foo\" [...rest] {}", line: "foo bar baz", values: ["foo,bar,baz"]}
+    {setup: r#'
+      $env.config.completions.external.completer = {|spans|
+        let trigger = "**"
+        if ($spans | last | str ends-with $trigger) {
+          let prefix = $spans | last | str substring 0..(-1 * ($trigger | str length) - 1)
+          [$"picked=($prefix)"]
+        } else {
+          null
+        }
+      }
+    '#, cases: [
+      {test: legacy_fzf_style_external_completer_receives_spans, line: "vim file**", values: ["picked=file"]}
+      {test: legacy_fzf_style_external_completer_receives_spans, line: "vim file", lacks: ["picked=file"]}
+    ]}
+    {test: legacy_fzf_style_external_completer_receives_spans, setup: "$env.config.completions.external.completer = {|spans| $spans}", line: "gh alias ", values: [gh alias ""]}
+    # `place.command` names the call the cursor is in, after pipes, closures, and `;` (#19016).
+    {test: external_completer_place_command_is_the_command_being_completed, setup: "$env.config.completions.external.completer = {|place| $place.command}", lines: ["ls | cargo bld" "echo (cargo bld" "do { cargo bld" "ls; cargo bld"], values: [cargo bld]}
+    # What a completer is told the cursor is at: an operator, a condition's operand as the condition
+    # the call takes, and the head of a command; and the token that is the target it replaces.
+    {test: where_size_place_kind_matches_hackmd, lines: ["ls | where size >" "ls | where size ==" "ls | where size >="], traced: "get inputs.place | [$in.kind ($in.index? | default none)]", traced_is: [operator none]}
+    {test: where_size_place_kind_matches_hackmd, lines: ["ls | where size > 1" "ls | where size > " "ls | where size >= 1" "ls | where size == " "ls | where size > 1kb" "ls | where size > 1 | get name" "ls | where size > 1 | get " "ls | where "], traced: "get inputs.place | [$in.kind ($in.index? | default none)]", traced_is: [positional 0]}
+    {test: pipeline_head_where_is_command_not_file, lines: ["ls | where" "ls | get" "ls | each" "ls | filter" "ls |" "ls | "], traced: "get inputs.place | [$in.kind ($in.index? | default none)]", traced_is: [command none]}
+    {test: token_span_matches_place_target_for_flags_and_values, line: "ls -al", at: 6, traced: "get inputs | [$in.token.text $in.token.span.start $in.place.target.start]", traced_is: ["-al" 3 3]}
+    {test: token_span_matches_place_target_for_flags_and_values, line: "ls -al", at: 4, traced: "get inputs | [$in.token.text $in.token.span.start $in.place.target.start]", traced_is: ["-" 3 3]}
+    {test: token_span_matches_place_target_for_flags_and_values, line: "ls -al", at: 5, traced: "get inputs | [$in.token.text $in.token.span.start $in.place.target.start]", traced_is: ["-a" 3 3]}
+    {test: token_span_matches_place_target_for_flags_and_values, line: "str tri", at: 7, traced: "get inputs | [$in.token.text $in.token.span.start $in.place.target.start]", traced_is: [tri 4 4]}
+    {test: token_span_matches_place_target_for_flags_and_values, line: "str tri", at: 5, traced: "get inputs | [$in.token.text $in.token.span.start $in.place.target.start]", traced_is: [t 4 4]}
+    # What is read from data, a column's values or a piped table's columns, may differ next run (`origin`).
+    {test: what_is_read_from_data_is_marked_as_derived, line: "[[a]; [x] [y]] | where a == ", traced: "get shown.origin", traced_is: [derived derived]}
+    {test: what_is_read_from_data_is_marked_as_derived, line: "[[abc]; [x]] | where a", traced: "get shown | where value == abc | get origin", traced_is: [derived]}
+    {test: what_is_read_from_data_is_marked_as_derived, line: "wher", traced: "get shown.origin | uniq", traced_is: [live]}
+    {test: token_span_matches_place_target_for_flags_and_values, line: "str tri", at: 6, traced: "get inputs | [$in.token.text $in.token.span.start $in.place.target.start]", traced_is: [tr 4 4]}
+    {test: token_span_matches_place_target_for_flags_and_values, line: "ls | where size > 1", at: 13, traced: "get inputs | [$in.token.text $in.token.span.start $in.place.target.start]", traced_is: [si 11 11]}
+    {test: token_span_matches_place_target_for_flags_and_values, line: "ls | where size > 1", at: 15, traced: "get inputs | [$in.token.text $in.token.span.start $in.place.target.start]", traced_is: [size 11 11]}
+    {test: token_span_matches_place_target_for_flags_and_values, line: "ls | where size > 1", at: 17, traced: "get inputs | [$in.token.text $in.token.span.start $in.place.target.start]", traced_is: [">" 16 16]}
+    {test: token_span_matches_place_target_for_flags_and_values, line: "ls | where size > 1", at: 19, traced: "get inputs | [$in.token.text $in.token.span.start $in.place.target.start]", traced_is: ["1" 18 18]}
+    {test: token_span_matches_place_target_for_flags_and_values, line: "ls | where size > ", at: 18, traced: "get inputs | [$in.token.text $in.token.span.start $in.place.target.start]", traced_is: ["" 18 18]}
+    # An unsorted completer's order is kept rather than sorted again.
+    {test: an_unsorted_completer_keeps_the_producers_order, setup: "def comp [token] { {completions: [zzz-two, zzz-one], options: {sort: false, filter: false}} }\n@complete comp\ndef --wrapped my-cmd [...rest] {}", lines: ["my-cmd zzz" "my-cmd zzz-"], values: [zzz-two zzz-one]}
+    # A variable `unlet` is offered no more.
+    {test: unlet_variable_current_stack_not_in_completions, line: "$my", cases: [{setup: "let myvar = 123", has: ["$myvar"]} {setup: "let myvar = 123; unlet $myvar", lacks: ["$myvar"]}]}
+  ]
+}

@@ -8,6 +8,7 @@ mod test_config;
 mod test_config_path;
 mod test_converters;
 mod test_custom_commands;
+mod test_debug_complete;
 mod test_engine;
 mod test_env;
 mod test_help;

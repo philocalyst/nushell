@@ -1,7 +1,4 @@
-use crate::completions::{
-    Completer, Context, Fetched, SemanticSuggestion, completion_options::NuMatcher,
-    to_reedline_span,
-};
+use crate::completions::{Candidates, Context, SemanticSuggestion, to_reedline_span};
 use nu_protocol::{
     ENV_VARIABLE_ID, SuggestionKind, Type, Value,
     ast::{self, Comparison, Expr, Expression},
@@ -11,11 +8,6 @@ use reedline::Suggestion;
 use strum::{EnumMessage, IntoEnumIterator};
 
 use super::cell_path_completions::eval_cell_path;
-
-#[derive(Clone)]
-pub struct OperatorCompletion<'a> {
-    pub left_hand_side: &'a Expression,
-}
 
 struct OperatorItem {
     pub symbols: String,
@@ -31,10 +23,10 @@ fn operator_to_item<T: EnumMessage + AsRef<str>>(op: T) -> OperatorItem {
 
 fn common_comparison_ops() -> Vec<OperatorItem> {
     vec![
-        operator_to_item(Comparison::In),
-        operator_to_item(Comparison::NotIn),
         operator_to_item(Comparison::Equal),
         operator_to_item(Comparison::NotEqual),
+        operator_to_item(Comparison::In),
+        operator_to_item(Comparison::NotIn),
     ]
 }
 
@@ -124,9 +116,21 @@ fn valid_float_ops() -> Vec<OperatorItem> {
     ops
 }
 
+/// Comparisons offered after a string. Ordering a string (`<`, `>`) is legal but rarely meant, so
+/// it is left for the user to type; dates have `older-than` and `newer-than` instead.
 fn valid_string_ops() -> Vec<OperatorItem> {
     let mut ops: Vec<OperatorItem> = Comparison::iter()
-        .filter(|op| !matches!(op, Comparison::OlderThan | Comparison::NewerThan))
+        .filter(|op| {
+            !matches!(
+                op,
+                Comparison::OlderThan
+                    | Comparison::NewerThan
+                    | Comparison::LessThan
+                    | Comparison::GreaterThan
+                    | Comparison::LessThanOrEqual
+                    | Comparison::GreaterThanOrEqual
+            )
+        })
         .map(operator_to_item)
         .collect();
     ops.push(operator_to_item(ast::Math::Concatenate));
@@ -222,76 +226,125 @@ fn is_expression_mutable(expr: &Expr, working_set: &StateWorkingSet) -> bool {
     var.mutable
 }
 
-impl Completer for OperatorCompletion<'_> {
-    fn fetch(&mut self, ctx: &Context) -> Fetched {
-        let working_set = ctx.working_set;
-        let stack = ctx.stack;
-        let span = ctx.span;
-        let offset = ctx.offset;
-        let options = ctx.options;
-        let prefix = ctx.prefix_str();
-        let mut needs_assignment_ops = true;
-        // Complete according expression type
-        // TODO: type inference on self.left_hand_side to get more accurate completions
-        let mut possible_operations: Vec<OperatorItem> = match &self.left_hand_side.ty {
-            Type::Int | Type::Number => valid_int_ops(),
-            Type::Float => valid_float_ops(),
-            Type::String => valid_string_ops(),
-            Type::Binary => valid_binary_ops(),
-            Type::Bool => valid_bool_ops(),
-            Type::Date => date_comparison_ops(),
-            Type::Filesize | Type::Duration => valid_value_with_unit_ops(),
-            Type::Record(_) | Type::Range => collection_comparison_ops(),
-            Type::List(_) | Type::Table(_) => valid_list_ops(),
-            // Unknown type, resort to evaluated values
-            Type::Any | Type::OneOf(_) => match &self.left_hand_side.expr {
-                Expr::FullCellPath(path) => {
-                    // for `$ <tab>`
-                    if let Expr::Garbage = path.head.expr {
-                        return Fetched::answering(vec![]);
-                    }
-                    let value =
-                        eval_cell_path(working_set, stack, &path.head, &path.tail, path.head.span)
-                            .unwrap_or_default();
-                    let mutable = is_expression_mutable(&self.left_hand_side.expr, working_set);
-                    // to avoid duplication
-                    needs_assignment_ops = false;
-                    ops_by_value(&value, mutable)
-                }
-                _ => all_ops_for_immutable(),
-            },
-            _ => common_comparison_ops(),
-        };
-        // If the left hand side is a variable, add assignment operators if mutable
-        if needs_assignment_ops && is_expression_mutable(&self.left_hand_side.expr, working_set) {
-            possible_operations.extend(match &self.left_hand_side.ty {
-                Type::Int | Type::Float | Type::Number => numeric_assignment_ops(),
-                Type::Filesize | Type::Duration => numeric_assignment_ops(),
-                Type::String | Type::Binary | Type::List(_) => concat_assignment_ops(),
-                Type::Any => all_assignment_ops(),
-                _ => vec![operator_to_item(ast::Assignment::Assign)],
-            });
-        }
-
-        let mut matcher = NuMatcher::new(prefix, options, true);
-        let suggestion_span = to_reedline_span(span, offset);
-        for OperatorItem {
+/// What may join a finished comparison to the next.
+pub(crate) fn connectors(ctx: &Context) -> Candidates {
+    let mut candidates = Candidates {
+        ordered: true,
+        typos: false,
+        needle: Some(ctx.prefix_str().into_owned()),
+        ..Candidates::default()
+    };
+    let span = to_reedline_span(ctx.span, ctx.offset);
+    use ast::Boolean::{And, Or, Xor};
+    for op in [And, Or, Xor] {
+        let OperatorItem {
             symbols,
             description,
-        } in possible_operations
-        {
-            matcher.add_semantic_suggestion(SemanticSuggestion {
+        } = operator_to_item(op);
+        candidates.push_as(
+            symbols.clone(),
+            SemanticSuggestion {
                 suggestion: Suggestion {
-                    // Already owned — moved, not cloned.
                     value: symbols,
                     description: Some(description),
-                    span: suggestion_span,
+                    span,
                     append_whitespace: true,
                     ..Suggestion::default()
                 },
                 kind: Some(SuggestionKind::Operator),
-            });
-        }
-        Fetched::answering(matcher.suggestion_results())
+                ..Default::default()
+            },
+        );
     }
+    candidates
+}
+
+/// The operators that may follow `left_hand_side`, by its type, or by its value when the type is
+/// not known.
+pub(crate) fn operators(left_hand_side: &Expression, ctx: &Context) -> Candidates {
+    // After a comparison a condition goes on with a connector.
+    if let Expr::BinaryOp(_, op, _) = &left_hand_side.expr
+        && matches!(op.expr, Expr::Operator(ast::Operator::Comparison(_)))
+    {
+        return connectors(ctx);
+    }
+    let working_set = ctx.working_set;
+    let stack = ctx.stack;
+    // Kept in the order they are listed, which puts the equality that is nearly always meant
+    // first, rather than the alphabetical order that starts with `!=`.
+    let mut candidates = Candidates {
+        ordered: true,
+        ..Candidates::default()
+    };
+    let mut needs_assignment_ops = true;
+    // A column of the rows piped in (`size` in `ls | where size`) has the type the rows give it.
+    let column_type = match (&left_hand_side.expr, ctx.rows) {
+        (Expr::FullCellPath(path), Some(rows)) => {
+            rows.follow_cell_path(&path.tail).map(|ty| ty.into_owned())
+        }
+        _ => None,
+    };
+    let left_hand_side_type = column_type.as_ref().unwrap_or(&left_hand_side.ty);
+    // Complete according expression type
+    // TODO: type inference on left_hand_side to get more accurate completions
+    let mut possible_operations: Vec<OperatorItem> = match left_hand_side_type {
+        Type::Int | Type::Number => valid_int_ops(),
+        Type::Float => valid_float_ops(),
+        Type::String => valid_string_ops(),
+        Type::Binary => valid_binary_ops(),
+        Type::Bool => valid_bool_ops(),
+        Type::Date => date_comparison_ops(),
+        Type::Filesize | Type::Duration => valid_value_with_unit_ops(),
+        Type::Record(_) | Type::Range => collection_comparison_ops(),
+        Type::List(_) | Type::Table(_) => valid_list_ops(),
+        // Unknown type, resort to evaluated values
+        Type::Any | Type::OneOf(_) => match &left_hand_side.expr {
+            Expr::FullCellPath(path) => {
+                // for `$ <tab>`
+                if let Expr::Garbage = path.head.expr {
+                    return candidates;
+                }
+                let value =
+                    eval_cell_path(working_set, stack, &path.head, &path.tail, path.head.span)
+                        .unwrap_or_default();
+                let mutable = is_expression_mutable(&left_hand_side.expr, working_set);
+                // to avoid duplication
+                needs_assignment_ops = false;
+                ops_by_value(&value, mutable)
+            }
+            _ => all_ops_for_immutable(),
+        },
+        _ => common_comparison_ops(),
+    };
+    // If the left hand side is a variable, add assignment operators if mutable
+    if needs_assignment_ops && is_expression_mutable(&left_hand_side.expr, working_set) {
+        possible_operations.extend(match left_hand_side_type {
+            Type::Int | Type::Float | Type::Number => numeric_assignment_ops(),
+            Type::Filesize | Type::Duration => numeric_assignment_ops(),
+            Type::String | Type::Binary | Type::List(_) => concat_assignment_ops(),
+            Type::Any => all_assignment_ops(),
+            _ => vec![operator_to_item(ast::Assignment::Assign)],
+        });
+    }
+
+    let span = to_reedline_span(ctx.span, ctx.offset);
+    for OperatorItem {
+        symbols,
+        description,
+    } in possible_operations
+    {
+        candidates.push(SemanticSuggestion {
+            suggestion: Suggestion {
+                // Already owned — moved, not cloned.
+                value: symbols,
+                description: Some(description),
+                span,
+                append_whitespace: true,
+                ..Suggestion::default()
+            },
+            kind: Some(SuggestionKind::Operator),
+            ..Default::default()
+        });
+    }
+    candidates
 }

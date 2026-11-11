@@ -1,0 +1,211 @@
+# Custom completers: what their answers say (options, spans, display, descriptions), how a part of
+# an answer that cannot be read costs only that part, inline and constant lists, and which run on
+# the line editor's thread (`@interactive`). The cases run in the `completions` fixture, by prefix.
+{
+  fixture: completions
+  prelude: "$env.config.completions.algorithm = 'prefix'"
+  cases: [
+    {setup: r#'
+      $env.config.completions.algorithm = 'fuzzy'
+      $env.config.plugins = {fake-cmd: {completion: 'from fake-cmd plugin config'}}
+      def tst [--mod -s] {}
+    '#, cases: [
+      {test: "misc_command_argument_completions::double_dash_long_flag", line: "tst --", values: [--help --mod]}
+      {test: "misc_command_argument_completions::single_dash_all_flags", line: "tst -", values: [--help --mod -s]}
+      {test: "misc_command_argument_completions::flags_after_cursor", line: "tst -h", at: 5, values: [--help --mod -s]}
+      {test: "misc_command_argument_completions::flags_after_cursor_piped", line: "tst -h | ls", at: 5, values: [--help --mod -s]}
+      {test: "misc_command_argument_completions::flags_in_nested_block1", line: "somecmd | lines | each { tst - }", at: 30, values: [--help --mod -s]}
+      {test: "misc_command_argument_completions::flags_in_nested_block2", line: "somecmd | lines | each { tst -}", at: 30, values: [--help --mod -s]}
+      {test: "misc_command_argument_completions::flags_in_incomplete_nested_block", line: "somecmd | lines | each { tst -", values: [--help --mod -s]}
+      {test: "misc_command_argument_completions::flags_in_deeply_nested_block", line: "somecmd | lines | each { print ([each (print) (tst -)]) }", at: 52, values: [--help --mod -s]}
+      {test: "misc_command_argument_completions::dynamic_long_flag_value", line: "fake-cmd --flag ", values: ["flag:0" "flag:1" "flag:2"]}
+      {test: "misc_command_argument_completions::dynamic_short_flag_value", line: "fake-cmd arg0:0 -f ", values: ["flag:0" "flag:1" "flag:2"]}
+      {test: "misc_command_argument_completions::dynamic_1st_positional", line: "fake-cmd -f flag:0 ", values: ["arg0:0"]}
+      {test: "misc_command_argument_completions::dynamic_2nd_positional", line: "fake-cmd -f flag:0 foo --unknown ", values: ["arg1:0" "arg1:1"]}
+      {test: "misc_command_argument_completions::dynamic_plugin_config", line: "fake-cmd --plugin-config ", values: ["from fake-cmd plugin config"]}
+    ]}
+    {setup: "def animals [] { ['cat', 'dog', 'eel' ] }\ndef my-command [animal: string@animals] { print $animal }", cases: [
+      {test: "misc_custom_completions::command_name", line: "my-c", values: [my-command]}
+      {test: "misc_custom_completions::command_argument", line: "my-command ", values: [cat dog eel]}
+      {test: "misc_custom_completions::command_argument_after_cursor", line: "my-command c", at: 11, values: [cat dog eel]}
+      {test: "misc_custom_completions::command_argument_after_cursor_piped", line: "my-command c | ls", at: 11, values: [cat dog eel]}
+    ]}
+    # External completer errors fall back to file completion, not an empty menu.
+    {test: external_completer_error_falls_back_to_file_completion, setup: "$env.config.completions.external = { enable: true, completer: {|input| error make {msg: 'simulated completer failure'} } }", line: "somecmd test", has: [test_a/], paths: true}
+    # The completer's options win over the config, and the config is inherited where they say nothing.
+    {test: customcompletions_override_options, setup: r#'
+      $env.config.completions.algorithm = "fuzzy"
+      $env.config.completions.case_sensitive = false
+      def comp [] { { completions: ['Foo Abcdef', 'Abcdef', 'Acd Bar'], options: { completion_algorithm: "prefix", case_sensitive: true, sort: true } } }
+      def my-command [arg: string@comp] {}
+    '#, cases: [
+      {line: "my-command Abcd", values: [Abcdef]}
+      {line: "my-command aBcD", values: []}
+    ]}
+    {test: customcompletions_inherit_options, setup: r#'
+      $env.config.completions.algorithm = "fuzzy"
+      $env.config.completions.case_sensitive = false
+      def comp [] { { completions: ['Foo Abcdef', 'Abcdef', 'Acd Bar'], options: { } } }
+      def my-command [arg: string@comp] {}
+    '#, lines: ["my-command Acd" "my-command acd"], values: ["Acd Bar" Abcdef "Foo Abcdef"]}
+    {test: customcompletions_no_sort, setup: "def comp [] { { completions: ['zzzfoo', 'foo', 'not matched', 'abcfoo'], options: { completion_algorithm: 'fuzzy', sort: false } } }\ndef my-command [arg: string@comp] {}", line: "my-command foo", values: [zzzfoo foo abcfoo], indices: [[3 4 5] [0 1 2] [3 4 5]]}
+    {test: customcompletions_no_filter, setup: "def comp [] { { completions: ['zzzfoo', 'foo', 'not matched', 'abcfoo'], options: { filter: false } } }\ndef my-command [arg: string@comp] {}", line: "my-command foo", values: [zzzfoo foo "not matched" abcfoo]}
+    # A returned `span` is byte offsets; ends beyond what was shown clamp. A span that cannot be
+    # read, or names no position on the line, costs the span, not the suggestion: the range the
+    # engine would have replaced stands.
+    {test: "custom_completions_override_span::happy", setup: "def comp [] { [{ value: foobarbaz, span: { start: 7, end: 20 } }] }\ndef my-command [arg: string@comp] {}", line: "foo | my-command foobar", values: [foobarbaz], spans: [[7 20]]}
+    {test: "custom_completions_override_span::no_start", setup: "def comp [] { [{ value: foobarbaz, span: { end: 20 } }] }\ndef my-command [arg: string@comp] {}", line: "foo | my-command foobar", values: [foobarbaz], spans: [[17 20]]}
+    {test: "custom_completions_override_span::no_end", setup: "def comp [] { [{ value: foobarbaz, span: { start: 7 } }] }\ndef my-command [arg: string@comp] {}", line: "foo | my-command foobar", values: [foobarbaz], spans: [[7 23]]}
+    {test: "custom_completions_override_span::bad_start", setup: "def comp [] { [{ value: foobarbaz, span: { start: 100 } }] }\ndef my-command [arg: string@comp] {}", line: "foo | my-command foobar", values: [foobarbaz], spans: [[23 23]]}
+    {test: "custom_completions_override_span::bad_end", setup: "def comp [] { [{ value: foobarbaz, span: { end: 100 } }] }\ndef my-command [arg: string@comp] {}", line: "foo | my-command foobar", values: [foobarbaz], spans: [[17 23]]}
+    {test: "custom_completions_override_span::not_a_record", setup: "def comp [] { [{ value: foobarbaz, span: \"nope\" }] }\ndef my-command [arg: string@comp] {}", line: "foo | my-command foobar", values: [foobarbaz], spans: [[17 23]]}
+    {test: "custom_completions_override_span::not_an_int", setup: "def comp [] { [{ value: foobarbaz, span: { start: \"3\" } }] }\ndef my-command [arg: string@comp] {}", line: "foo | my-command foobar", values: [foobarbaz], spans: [[17 23]]}
+    {test: "custom_completions_override_span::misspelled_key", setup: "def comp [] { [{ value: foobarbaz, span: { strat: 3 } }] }\ndef my-command [arg: string@comp] {}", line: "foo | my-command foobar", values: [foobarbaz], spans: [[17 23]]}
+    {test: "custom_completions_override_span::negative_start", setup: "def comp [] { [{ value: foobarbaz, span: { start: -1 } }] }\ndef my-command [arg: string@comp] {}", line: "foo | my-command foobar", values: [foobarbaz], spans: [[17 23]]}
+    {test: "custom_completions_override_span::negative_end", setup: "def comp [] { [{ value: foobarbaz, span: { end: -1 } }] }\ndef my-command [arg: string@comp] {}", line: "foo | my-command foobar", values: [foobarbaz], spans: [[17 23]]}
+    # A completer's return is read part by part, and a part that does not fit costs that part alone:
+    # a string field takes anything that coerces, unknown keys are ignored, carapace's `display` is
+    # tolerated, and what `--detailed` emits beside a suggestion pipes straight back in.
+    {test: "a_malformed_part_costs_only_that_part::coerced_description", setup: "def comp [] { [{value: alpha, description: 5}, beta] }\ndef my-command [arg: string@comp] {}", line: "my-command ", values: [alpha beta]}
+    {test: "a_malformed_part_costs_only_that_part::coerced_extra", setup: "def comp [] { [{value: alpha, extra: [1 2]}, beta] }\ndef my-command [arg: string@comp] {}", line: "my-command ", values: [alpha beta]}
+    {test: "a_malformed_part_costs_only_that_part::unknown_key", setup: "def comp [] { [{value: alpha, discription: hi}, beta] }\ndef my-command [arg: string@comp] {}", line: "my-command ", values: [alpha beta]}
+    {test: "a_malformed_part_costs_only_that_part::carapace_display", setup: "def comp [] { [{value: alpha, display: 'alpha (a)'}, beta] }\ndef my-command [arg: string@comp] {}", line: "my-command ", values: [alpha beta]}
+    {test: "a_malformed_part_costs_only_that_part::echoed_keys", setup: "def comp [] { [{value: alpha, kind: {Value: string}, type: string}, beta] }\ndef my-command [arg: string@comp] {}", line: "my-command ", values: [alpha beta]}
+    # An `options` that cannot be read costs the settings it names, not the completions beside it.
+    {test: "a_malformed_options_keeps_the_completions_beside_it::not_a_record", setup: "def comp [] { {completions: [alpha], options: \"nope\"} }\ndef my-command [arg: string@comp] {}", line: "my-command ", values: [alpha]}
+    {test: "a_malformed_options_keeps_the_completions_beside_it::unknown_key", setup: "def comp [] { {completions: [alpha], options: {fiter: false}} }\ndef my-command [arg: string@comp] {}", line: "my-command ", values: [alpha]}
+    {test: "a_malformed_options_keeps_the_completions_beside_it::bad_value", setup: "def comp [] { {completions: [alpha], options: {filter: 0}} }\ndef my-command [arg: string@comp] {}", line: "my-command ", values: [alpha]}
+    # The text that is shown is matched, not the value; the one that starts with `sir` is first.
+    {test: custom_completions_override_display_value, setup: r#'
+      def comp [] { { completions: [
+        { value: first, display_override: "\u{1b}[2mansi\u{1b}[3mrocks" },
+        { value: second, display_override: "sir\u{1b}[1mlancelot" },
+        { value: nonmatching, display_override: "asdf" },
+      ], options: { completion_algorithm: "fuzzy" } } }
+      def my-command [arg: string@comp] {}
+    '#, line: "my-command sir", values: [second first]}
+    {test: custom_completions_filter_by_description, setup: r#'
+      def comp [] { { completions: [
+        { value: red, description: "warm color" }, { value: blue, description: "cool color" },
+        { value: green, description: "warm-ish color" }, { value: cyan, description: "another cool one" },
+      ], options: { match_description: true } } }
+      def my-command [arg: string@comp] {}
+    '#, line: "my-command warm", values: [red green]}
+    {test: custom_completions_match_description_disabled_by_default, setup: r#'
+      def comp [] { [
+        { value: red, description: "warm color" }, { value: blue, description: "cool color" },
+        { value: green, description: "warm-ish color" }, { value: cyan, description: "another cool one" },
+      ] }
+      def my-command [arg: string@comp] {}
+    '#, line: "my-command warm", values: []}
+    # Styles are stripped from values; with nothing typed the completer's order is kept.
+    {test: custom_completions_strip_ansi_from_values, setup: r#'
+      def comp [] { [$"\u{1b}[35mfoo", $"\u{1b}[31mbar", $"\u{1b}]8;;http://example.com\u{7}baz\u{1b}]8;;\u{7}"] }
+      def my-command [arg: string@comp] {}
+    '#, line: "my-command ", values: [foo bar baz]}
+    {test: custom_completions_strip_ansi_from_record_values, setup: r#'
+      def comp [] { [{ value: $"\u{1b}[35mmagenta_dir" }, { value: "plain_dir" }] }
+      def my-command [arg: string@comp] {}
+    '#, line: "my-command ", values: [magenta_dir plain_dir]}
+    {test: custom_completions_wraps_builtin_commandline_complete, setup: r#'
+      def comp [] { '%ls ' | commandline complete --detailed | prepend { value: 'test', display_override: 'test', description: 'dummy', style: { attr: b } } }
+      def my-ls [arg: string@comp] {}
+    '#, line: "my-ls test", values: [test test_a/ test_a_symlink/ test_b/], paths: true}
+    {test: custom_completions_wraps_builtin_commandline_complete_path, fixture: quoted_completions, setup: r#'
+      def completer [buffer] {
+        ($buffer | split row ' ') | last | commandline complete --type path --detailed
+        | reject span | prepend { value: `'ten more'`, display_override: 'ten more' }
+      }
+      def my-ls [arg: path@completer] {}
+    '#, line: "my-ls te", values: ["`te st.txt`" "te#st.txt" "`te'st.txt`" "`te(st).txt`" "'ten more'" "`test dir/`"], spans: [[6 8] [6 8] [6 8] [6 8] [6 8] [6 8]], paths: true}
+    # A custom completer that returns null declines, and the argument's type answers: files for a
+    # path; arguments are mixed with subcommands, and only subcommands complete for other types.
+    {test: "command_argument_completions::fallback", setup: "def comp [] { null }\ndef my-command [arg: path@comp] {}", line: "my-command test", values: [test_a/ test_a_symlink/ test_b/], last_span: [11 15], paths: true}
+    {test: "command_argument_completions::arguments_and_subcommands", setup: "def foo [i: directory] {}\ndef \"foo test bar\" [] {}", line: "foo test", values: [test_a/ test_a_symlink/ test_b/ "foo test bar"], last_span: [0 8], paths: true}
+    {test: "command_argument_completions::arguments_vs_subcommands", setup: "def foo [i: string] {}\ndef \"foo test bar\" [] {}", line: "foo test", values: ["foo test bar"], last_span: [0 8]}
+    {test: "command_argument_completions::flags_and_subcommands", setup: "def foo [--test: directory] {}\ndef \"foo --test bar\" [] {}", line: "foo --test", values: [--test "foo --test bar"], last_span: [0 10]}
+    {test: "command_argument_completions::flag_value_and_subcommands", setup: "def foo [--test: directory] {}\ndef \"foo --test test\" [] {}", line: "foo --test test", values: [test_a/ test_a_symlink/ test_b/ "foo --test test"], last_span: [0 15], paths: true}
+    {test: "command_argument_completions::flag_value_respect_to_type", setup: "def foo [--test: directory] {}", line: "foo --test=directory_completion/", values: [directory_completion/folder_inside_folder/], last_span: [11 32], paths: true}
+    {test: "command_argument_completions::short_flag_value", setup: "def foo [-t: directory] {}", line: "foo -t directory_completion/", values: [directory_completion/folder_inside_folder/], last_span: [7 28], paths: true}
+    {test: "command_argument_completions::mixed_positional_and_flag1", setup: "def foo [-t: directory, --path: path, pos: string, opt?: directory] {}", line: "foo --path directory_completion/", values: [directory_completion/folder_inside_folder/ directory_completion/mod.nu], last_span: [11 32], paths: true}
+    {test: "command_argument_completions::mixed_positional_and_flag2", setup: "def foo [-t: directory, --path: path, pos: string, opt?: directory] {}", line: "foo --path bar baz directory_completion/", values: [directory_completion/folder_inside_folder/], last_span: [19 40], paths: true}
+    {test: "command_argument_completions::mixed_positional_and_flag3", setup: "def foo [-t: directory, --path: path, pos: string, opt?: directory] {}", line: "foo --path bar baz qux -t directory_completion/", values: [directory_completion/folder_inside_folder/], last_span: [26 47], paths: true}
+    {test: "command_argument_completions::defined_inline", line: "export def say [\n    animal: string@[cat dog]\n    ] { }; say ", values: [cat dog], last_span: [61 61]}
+    {test: "command_argument_completions::short_flags", setup: "def foo [-A, -B: string@[cat dog] ] {}", line: "foo -B ", values: [cat dog], last_span: [7 7]}
+    {test: "command_argument_completions::flag_name_vs_value", setup: "def foo [-A, -B: string@[cat dog] ] {}", line: "foo -B cat", at: 6, values: [-B], last_span: [4 6]}
+    {test: "command_argument_completions::type_alias_parameter_completer", setup: "def animals [] { [cat dog eel] }; type Animal = string; def adopt [animal: Animal@animals] {}", line: "adopt ", values: [cat dog eel], last_span: [6 6]}
+    {setup: "def comp_foo [input] { ['[foo]', '[f, bar]', '[f, baz]'] }\ndef foo [--foo: list<string>@comp_foo bar: list<string>@comp_foo] { }", cases: [
+      {test: "custom_completion_for_list_typed_argument::list_flag_value1", line: "foo --foo=", values: ["[foo]" "[f, bar]" "[f, baz]"]}
+      {test: "custom_completion_for_list_typed_argument::list_flag_value2", line: "foo --foo=[foo", values: ["[foo]"]}
+      {test: "custom_completion_for_list_typed_argument::list_flag_value3", line: "foo --foo [f, b", values: ["[f, bar]" "[f, baz]"]}
+      {test: "custom_completion_for_list_typed_argument::positional1", line: "foo [f, b", values: ["[f, bar]" "[f, baz]"]}
+      {test: "custom_completion_for_list_typed_argument::positional2", line: "foo [foo, b", at: 8, values: ["[foo]"]}
+      {test: "custom_completion_for_list_typed_argument::positional3", line: "foo --foo [] [foo", values: ["[foo]"]}
+    ]}
+    {test: list_completions_defined_inline, line: "\n        export def say [\n          animal: string@[cat dog]\n        ] { }\n        say ", values: [cat dog]}
+    {test: list_completions_extern, line: "\n        export extern say [\n          animal: string@[cat dog]\n        ]\n        say ", values: [cat dog]}
+    {test: list_completions_from_constant_and_allows_record, line: "\n        const animals = [\n            cat\n            {value: \"dog\"}\n        ]\n        export def say [\n          animal: string@$animals\n        ] { }\n        say ", values: [cat dog]}
+    {test: list_completions_invalid_type, setup: "const animals = {cat: \"meow\", dog: \"woof!\"}\nexport def say [animal: string@$animals] { }", setup_error: OperatorUnsupportedType, line: ""}
+    # A parameter completer that errors declines with nothing rather than the whole directory; only
+    # external and command-wide completers fall back to files. So does one that calls a picker
+    # without `@interactive`: it runs where it cannot take the terminal.
+    {test: parameter_completer_error_yields_no_suggestions, setup: "def comp [] { error make {msg: 'boom'} }; def my-command [arg: string@comp] {}", line: "my-command custom_completion.", values: []}
+    {test: "non_interactive_completer_calling_a_picker_yields_no_suggestions::input", setup: "def comp [] { input }; def my-command [arg: string@comp] {}", line: "my-command custom_completion.", values: []}
+    {test: "non_interactive_completer_calling_a_picker_yields_no_suggestions::input_reedline", setup: "def comp [] { input --reedline }; def my-command [arg: string@comp] {}", line: "my-command custom_completion.", values: []}
+    {test: "non_interactive_completer_calling_a_picker_yields_no_suggestions::input_list", setup: "def comp [] { ['a' 'b'] | input list }; def my-command [arg: string@comp] {}", line: "my-command custom_completion.", values: []}
+    {test: "non_interactive_completer_calling_a_picker_yields_no_suggestions::input_listen", setup: "def comp [] { input listen }; def my-command [arg: string@comp] {}", line: "my-command custom_completion.", values: []}
+    {test: "non_interactive_completer_calling_a_picker_yields_no_suggestions::term_query", setup: "def comp [] { term query 'x' }; def my-command [arg: string@comp] {}", line: "my-command custom_completion.", values: []}
+    # `@interactive` decides that a completer runs on the line editor's thread, seen through a
+    # shorter head, an alias, a command-wide completer at a flag name, and the command an external
+    # completer calls; ordinary completers use the worker.
+    {test: "the_interactive_attribute_decides_inline_or_worker::carries_the_attribute", setup: "@interactive\ndef comp [token] { [alpha beta] }\ndef my-command [arg: string@comp] {}", line: "my-command al", interactive: true, values: [alpha]}
+    {test: "the_interactive_attribute_decides_inline_or_worker::plain_completer", setup: "def comp [token] { [alpha beta] }\ndef my-command [arg: string@comp] {}", line: "my-command al", interactive: false}
+    {test: interactive_completer_on_a_shorter_head_argument_runs_inline, setup: "@interactive\ndef comp [token] { [alpha beta] }\ndef foo [arg: string@comp] {}\ndef \"foo bar\" [] {}", line: "foo bar", interactive: true}
+    {test: interactive_completer_through_an_alias_runs_inline, setup: "@interactive\ndef comp [token] { [alpha beta] }\nalias comp-alias = comp\ndef my-command [arg: string@comp-alias] {}", line: "my-command al", interactive: true}
+    {test: interactive_command_wide_completer_runs_inline_at_a_flag_name, setup: "@interactive\ndef comp [token] { [--alpha --beta] }\n@complete comp\ndef my-command [--alpha, --beta] {}", line: "my-command --al", interactive: true}
+    {test: external_completer_is_interactive_through_the_command_it_calls, setup: "@interactive\ndef pick [buffer] { [$buffer] }\n$env.config.completions.external.completer = {|buffer| pick $buffer }", line: "some-external al", interactive: true}
+    {test: external_completer_is_interactive_through_the_command_it_calls, setup: "$env.config.completions.external.completer = {|buffer| [$buffer] }", line: "some-external al", interactive: false}
+    # A cancelled interactive completer offers nothing, not the files declining would fall to.
+    {test: "a_cancelled_interactive_completer_offers_nothing::block_failed", setup: "@interactive\ndef comp [token] { error make {msg: 'cancelled'} }\n@complete comp\ndef my-command [arg: string] {}", line: "my-command ", values: []}
+    {test: "a_cancelled_interactive_completer_offers_nothing::returned_null", setup: "@interactive\ndef comp [token] { null }\n@complete comp\ndef my-command [arg: string] {}", line: "my-command ", values: []}
+    {test: a_cancelled_interactive_external_completer_offers_nothing, setup: "@interactive\ndef pick [buffer] { error make {msg: 'cancelled'} }\n$env.config.completions.external.completer = {|buffer| pick $buffer }", line: "some-external ", values: []}
+    {test: "a_bare_value_is_one_completion::string", setup: "def comp [] { '123' }\ndef my-command [arg: string@comp] {}", line: "my-command 12", values: ["123"]}
+    {test: "a_bare_value_is_one_completion::int", setup: "def comp [] { 123 }\ndef my-command [arg: string@comp] {}", line: "my-command 12", values: ["123"]}
+    # External commands only where `^` asks; the program `sleep` hides behind the builtin, and `%`
+    # names only builtins, even one a custom command shadows.
+    {setup: "$env.PATH = ['{fixtures}/external_completions/path']", cases: [
+      {test: external_commands, line: "ls; ^sleep", values: ["sleep{exe}"]}
+      {test: external_commands, line: "sleep", values: [sleep], os: unix}
+      {test: external_commands, line: "sleep", values: [sleep sleep.exe], os: windows}
+      {test: external_commands, line: "ls; %sl", values: [sleep slice]}
+      {test: external_commands, line: "scri", values: [script.ps1], os: windows}
+      {test: external_commands_disabled, setup: "$env.PATH = ['{fixtures}/external_completions/path']\n$env.config.completions.external.enable = false", line: "ls; ^sleep", values: ["sleep{exe}"]}
+      {test: external_commands_disabled, setup: "$env.PATH = ['{fixtures}/external_completions/path']\n$env.config.completions.external.enable = false", line: "sleep", values: [sleep]}
+      {test: which_command_completions, line: "which --all", values: [--all]}
+      {test: which_command_completions, line: "which sleep", values: [sleep], os: unix}
+      {test: which_command_completions, line: "which sleep", values: [sleep sleep.exe], os: windows}
+    ]}
+    {test: percent_completion_only_shows_builtins, setup: "def slimy [] { }\nalias slalias = slimy", line: "%sli", values: [slice]}
+    {test: percent_completion_includes_shadowed_builtin, setup: "def ls [] { 'custom-ls' }", line: "%ls", values: [ls]}
+    # Commands with spaces or quotes are quoted.
+    {test: which_command_quoted_completions, setup: r#'
+      def "foo's" [] {}
+      def "foo\"b\"a'r" [] {}
+      def 'foo"s' [] {}
+      def "foo\\'s'" [] {}
+    '#, cases: [
+      {line: "which \"detect", values: [detect "\"detect columns\"" "\"detect type\""]}
+      {line: "which foo", values: [r#'`foo"b"a'r`'# r#'`foo"s`'# "`foo's`" r#'foo\'s''#]}
+    ]}
+    {test: hide_env_completions, line: "hide-env T", values: [TEST]}
+    # A cancelled answer stays empty for the same line, without the picker running again.
+    {test: a_cancelled_interactive_answer_is_sticky_for_the_same_query, setup: "@interactive\ndef comp [token] { null }\ndef my-command [arg: string@comp] {}", lines: ["my-command " "my-command "], values: []}
+    # A panicking completer offers nothing, again, and leaves the engine to answer for another.
+    {test: a_panicking_completer_does_not_unwind_the_engine, setup: r#'
+      def c-panic [token: record] { panic "boom" }
+      def f7-panic [x: string@c-panic] { $x }
+      def c-ok [token: record] { [alive] }
+      def f7-ok [x: string@c-ok] { $x }
+    '#, cases: [{lines: ["f7-panic " "f7-panic "], values: []} {before: "f7-panic ", line: "f7-ok ", values: [alive]}]}
+  ]
+}

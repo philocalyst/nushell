@@ -1,6 +1,6 @@
 use nu_engine::eval_block;
 use nu_parser::parse;
-use nu_path::{AbsolutePathBuf, PathBuf};
+use nu_path::AbsolutePathBuf;
 use nu_protocol::{
     DynamicCompletionCallRef, DynamicSuggestion, PipelineData, ShellError, Signature, Span,
     SyntaxShape, Value,
@@ -8,13 +8,21 @@ use nu_protocol::{
     engine::{ArgType, Command, EngineState, Stack, StateWorkingSet},
 };
 use nu_test_support::prelude::*;
-use reedline::Suggestion;
-use std::path::MAIN_SEPARATOR;
 
 fn create_default_context() -> EngineState {
     let state = nu_cmd_lang::create_default_context();
     let state = nu_command::add_shell_command_context(state);
     nu_cli::add_cli_context(state)
+}
+
+/// `engine_state` completing by prefix, as the fixture-based tests of this suite were written
+/// for. The default is `fuzzy`; the tests that want it use `new_engine_helper`, whose engines
+/// keep the default, or ask for it in their config.
+pub fn match_by_prefix(mut engine_state: EngineState) -> EngineState {
+    let mut config = engine_state.get_config().as_ref().clone();
+    config.completions.algorithm = nu_protocol::CompletionAlgorithm::Prefix;
+    engine_state.set_config(config);
+    engine_state
 }
 
 // A fake cmd for testing.
@@ -175,12 +183,13 @@ pub fn new_engine_helper(pwd: AbsolutePathBuf) -> (AbsolutePathBuf, String, Engi
 
 /// creates a new engine with the current path in the completions fixtures folder
 pub fn new_engine() -> (AbsolutePathBuf, String, EngineState, Stack) {
-    new_engine_helper(
+    let (dir, dir_str, engine_state, stack) = new_engine_helper(
         FIXTURES
             .join("completions")
             .try_into()
             .expect("fixtures is absolute"),
-    )
+    );
+    (dir, dir_str, match_by_prefix(engine_state), stack)
 }
 
 /// Adds pseudo PATH env for external completion tests
@@ -193,107 +202,45 @@ pub fn new_external_engine() -> EngineState {
         "PATH".to_string(),
         Value::list(vec![Value::string(dir_str, span)], span),
     );
-    engine
+    match_by_prefix(engine)
 }
 
-/// creates a new engine with the current path in the dotnu_completions fixtures folder
-pub fn new_dotnu_engine() -> (AbsolutePathBuf, String, EngineState, Stack) {
-    // Target folder inside assets
-    let dir = FIXTURES
-        .join("dotnu_completions")
-        .try_into()
-        .expect("fixtures is absolute");
-    let (dir, dir_str, mut engine_state, mut stack) = new_engine_helper(dir);
-    let dir_span = nu_protocol::Span::new(0, dir_str.len());
+/// An engine whose `PATH` holds exactly the given programs, with a working directory of
+/// its own holding `notes.txt` and a `docs` directory.
+///
+/// The temporary directory lives as long as the returned guard.
+pub fn new_program_engine(programs: &[&str]) -> (tempfile::TempDir, EngineState, Stack) {
+    let root = tempfile::tempdir().expect("temporary fixture directory");
+    let bin = root.path().join("bin");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&bin).expect("bin directory");
+    std::fs::create_dir_all(work.join("docs")).expect("work directory");
+    std::fs::write(work.join("notes.txt"), "").expect("a file to complete");
 
-    // const $NU_LIB_DIRS
-    let mut working_set = StateWorkingSet::new(&engine_state);
-    let var_id = working_set.add_variable(
-        b"$NU_LIB_DIRS".into(),
-        Span::test_data(),
-        nu_protocol::Type::List(Box::new(nu_protocol::Type::String)),
-        false,
-    );
-    working_set.set_variable_const_val(
-        var_id,
-        Value::test_list(vec![
-            Value::string(file(dir.join("lib-dir1")), dir_span),
-            Value::string(file(dir.join("lib-dir3")), dir_span),
-        ]),
-    );
-    let _ = engine_state.merge_delta(working_set.render());
-
-    stack.add_env_var(
-        "NU_LIB_DIRS".into(),
-        Value::test_list(vec![
-            Value::string(file(dir.join("lib-dir2")), dir_span),
-            Value::string(file(dir.join("lib-dir3")), dir_span),
-        ]),
-    );
-
-    // Merge environment into the permanent state
-    let merge_result = engine_state.merge_env(&mut stack);
-    assert!(merge_result.is_ok());
-
-    (dir, dir_str, engine_state, stack)
-}
-
-pub fn new_quote_engine() -> (AbsolutePathBuf, String, EngineState, Stack) {
-    new_engine_helper(
-        FIXTURES
-            .join("quoted_completions")
-            .try_into()
-            .expect("fixtures is absolute"),
-    )
-}
-
-pub fn new_partial_engine() -> (AbsolutePathBuf, String, EngineState, Stack) {
-    new_engine_helper(
-        FIXTURES
-            .join("partial_completions")
-            .try_into()
-            .expect("fixtures is absolute"),
-    )
-}
-
-/// match a list of suggestions with the expected values
-#[track_caller]
-pub fn match_suggestions(expected: &Vec<&str>, suggestions: &[Suggestion]) {
-    let expected_len = expected.len();
-    let suggestions_len = suggestions.len();
-    if expected_len != suggestions_len {
-        panic!(
-            "\nexpected {expected_len} suggestions but got {suggestions_len}: \n\
-            Suggestions: {suggestions:#?} \n\
-            Expected: {expected:#?}\n"
-        )
+    for program in programs {
+        let path = bin.join(format!("{program}{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&path, "").expect("a program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("an executable program");
+        }
     }
 
-    let suggestions_str = suggestions
-        .iter()
-        .map(|it| it.value.as_str())
-        .collect::<Vec<_>>();
-
-    assert_eq!(expected, &suggestions_str);
-}
-
-/// match a list of suggestions with the expected values
-#[track_caller]
-pub fn match_suggestions_by_string(expected: &[String], suggestions: &[Suggestion]) {
-    let expected = expected.iter().map(|it| it.as_str()).collect::<Vec<_>>();
-    match_suggestions(&expected, suggestions);
-}
-
-/// append the separator to the converted path
-pub fn folder(path: impl Into<PathBuf>) -> String {
-    let mut converted_path = file(path);
-    converted_path.push(MAIN_SEPARATOR);
-    converted_path
-}
-
-/// convert a given path to string
-pub fn file(path: impl Into<PathBuf>) -> String {
-    path.into().into_os_string().into_string().unwrap()
+    let (_, _, mut engine_state, mut stack) = new_engine_helper(
+        work.canonicalize()
+            .expect("work directory exists")
+            .try_into()
+            .expect("work directory is absolute"),
+    );
+    let bin = bin.to_string_lossy().into_owned();
+    let span = Span::unknown();
+    let path = Value::list(vec![Value::string(bin, span)], span);
+    engine_state.add_env_var("PATH".to_string(), path.clone());
+    // Programs the completers run are found through the stack's.
+    stack.add_env_var("PATH".to_string(), path);
+    (root, engine_state, stack)
 }
 
 /// merge_input executes the given input into the engine

@@ -260,20 +260,22 @@ $env.config.hinter.closure = null
 # Default: true
 $env.config.status_line.enable = true
 
-# status_line.errors (bool): Show the first parse or type error in the line,
-# unless it touches the cursor (you are still typing it) or the line is
-# unfinished, as with an open `{`. A line that `use`s a module not loaded yet
-# is not checked, since the module loads only when the line runs.
+# status_line.errors (bool): Draw in red what is wrong with the line, unless the
+# cursor is still typing it or the line is unfinished, as with an open `{`, and
+# say what is wrong while the cursor is on it. A line that `use`s a module not
+# loaded yet is not checked, since the module loads only when the line runs.
 # Default: true
 $env.config.status_line.errors = true
 
-# status_line.signature (bool): Show the signature of the command under the
-# cursor, with the parameter being typed emphasized.
+# status_line.signature (bool): Say what is still to come at the cursor: the
+# parameter being typed and those after it. In a row condition, how many rows
+# it lets through; in a closure and after a `|`, what is handed on.
 # Default: true
 $env.config.status_line.signature = true
 
 # status_line.type (bool): Show the type the pipeline at the cursor outputs, as
-# far as the parser can infer it (`any` and `nothing` are not shown).
+# far as the parser can infer it, where nothing else is being said (`any`,
+# `nothing` and a choice of types are not shown).
 # Default: true
 $env.config.status_line.type = true
 
@@ -284,16 +286,27 @@ $env.config.status_line.type = true
 $env.config.status_line.preview = true
 
 # completions.algorithm (string): The algorithm used for matching completions.
+# "fuzzy": Match the typed characters in order anywhere in the candidate, and rank the matches:
+#   an exact name first, then names that start with the text, then the rest by how well the
+#   characters line up (word starts count more), shorter names first. A file name is matched on
+#   its last component, and dotfiles come last unless the text starts with a dot. When nothing
+#   matches, a name that is one typo away (four or more typed characters) is offered instead.
+#   Text with spaces, like `git ch`, matches word by word: every word but the last must be the
+#   start of a word of the candidate.
 # "prefix": Match from the beginning of the text.
-# "substring": Match anywhere in the text.
-# "fuzzy": Match using fuzzy matching algorithm.
-# Default: "prefix"
-$env.config.completions.algorithm = "prefix"
+# "substring": Deprecated, read as "fuzzy".
+# Default: "fuzzy"
+$env.config.completions.algorithm = "fuzzy"
 
 # completions.sort (string): How completion results are sorted.
-# "smart": Sort order depends on the algorithm setting.
+# "smart": Sort order depends on the algorithm setting. With nothing typed yet, a custom
+#   completer's suggestions keep the order it gave them (recent branches first, say), unless it
+#   returned `options: {sort: true}`; the history lifts what was used lately and often to the front,
+#   in the order zoxide would rank it (a use in the last hour counts four times, in the last day
+#   twice, in the last week half, and older a quarter). An argument counts most for the command it
+#   was given to, and in the directory it was used in; with `cd`, so do the directories visited.
 # "alphabetical": Always sort alphabetically.
-# In "smart",  mode: prefix/substring use alphabetical; fuzzy uses match score.
+# In "smart" mode: prefix uses alphabetical; fuzzy uses match score.
 # Default: "smart"
 $env.config.completions.sort = "smart"
 
@@ -319,14 +332,31 @@ $env.config.completions.partial = true
 # typing "ls " and pressing Tab will partially complete the first matching letters.
 # If the directory also includes "faster", only "f" would be partially completed.
 
-# completions.persistent_menus (bool): Controls whether active menus stay open while editing.
-# true: Erasing characters (or emptying the commandline) refilters the menu instead of
-# closing it; the menu closes on Esc, Ctrl-C, or when a value is accepted.
-# Applies to all menus, including the history menu.
-# false: A backspace closes the menu when completions.quick is enabled, and any edit
-# that empties the commandline closes it.
-# Default: false
-$env.config.completions.persistent_menus = false
+# completions.passive (bool): Show completions as you type, before any Tab.
+# true: The best candidates for the word being typed show under the word, with
+# nothing selected, so Enter still runs the line. Tab selects; Esc hides them
+# until the next word. A single candidate is drawn in the line, underlined.
+# false: Completions show only after Tab.
+# Default: true
+$env.config.completions.passive = true
+
+# completions.opening (bool): Put in what the line can only go on with once a space
+# is typed, with the cursor where the writing goes on: the closure of `each `, the
+# `= ` of `let x `, the `in ` of `for x `, the parameters of `def foo `. Backspace
+# takes it back, and typing a `-` or what it starts with goes where it was.
+# Default: true
+$env.config.completions.opening = true
+
+# completions.examples (string): How the examples of a command's help show in its preview.
+# "folded": Behind the preview, a `▸ 5 examples` label on its frame; the key that cycles
+#           previews unfolds them, and Alt+Down walks through them to take one.
+# "shown":  Unfolded from the start, under the rest of the preview.
+# "off":    Never. A preview holds no examples, and nothing in it can be taken.
+# Default: "folded"
+$env.config.completions.examples = "folded"
+
+# completions.persistent_menus: no longer has any effect. Completions stay
+# open while the line is edited.
 
 # completions.use_ls_colors (bool): Apply LS_COLORS to file/path completions.
 # true: Use LS_COLORS for styling file completions.
@@ -334,18 +364,20 @@ $env.config.completions.persistent_menus = false
 # Default: true
 $env.config.completions.use_ls_colors = true
 
-# completions.cache_size (int): How many Tab-completion prefixes to remember.
-# Results are stored by the text up to the cursor (for example `ls fo`) and
-# reused on the next Tab of that same prefix so Nushell does not re-scan
-# files or command names. Least-recently-used entries are dropped when the
-# limit is reached. The cache is shared across prompts and is discarded when
-# PATH, the working directory, the set of commands, or `$env.config` changes.
-# 0: Disable the cache; every Tab recomputes.
-# A larger value remembers more prefixes (uses more memory).
-# A smaller value forgets sooner.
-# Closures on `$env.config.completions.external.completer` and custom
-# `@comp` / `@complete` completers are not stored, so an interactive picker
-# (fzf, `input list`) runs again on the next Tab.
+# completions.cache_size (int): How many answers of custom completers to remember.
+# Completion remembers what is slow to find out, by what was asked and not by the text typed,
+# so typing more of a word, or deleting from it, ranks what is known again instead of finding it
+# out again:
+#   - the programs on PATH, until a directory of PATH is modified;
+#   - the entries of a directory, until it is modified;
+#   - what a parameter completer returned (`x: string@comp`), for the same text before the word.
+#     Only a completer that declares no `token`, `place` or `buffer` input is remembered, since
+#     one that is handed the word can answer differently for each, and an `@interactive` one is
+#     never remembered. An answer is reused for 30 seconds at most.
+# It is shared across prompts. Remembered completer answers are discarded when PATH, the working
+# directory, the set of commands, or `$env.config` changes. The setting is the number of them
+# kept: least-recently-used ones are dropped when the limit is reached.
+# 0: Remember nothing; every request finds everything out again.
 # Default: 100
 $env.config.completions.cache_size = 100
 
@@ -373,13 +405,22 @@ $env.config.completions.external.max_results = 100
 #   token: record    the token being completed, as {text, kind, span}
 #   place: record    where in the line that is: `cursor` (a byte offset) and `target`
 #                    ({start, end}, the range a suggestion replaces), plus the resolution
-#                    (`kind`, plus `flag`/`index`). Read `target` rather than `token.span`:
+#                    (`kind`, plus `flag`/`index`, and `shape`, the declared type, where a
+#                    value is completed). Read `target` rather than `token.span`:
 #                    they differ wherever a completion spans several tokens, such as a
-#                    multiword command head or a cell path. `command` is the token list of the
+#                    multiword command head or a cell path. `arguments` is a record of the
+#                    other arguments of the call, those known before it runs, by the
+#                    parameter they bind: a positional by its name (the rest parameter as a
+#                    list), a flag by its long name (its short name if it has only that), as
+#                    `true` for a switch and else its value. A value is evaluated as a
+#                    constant where it can be, else it is its source text. The argument being
+#                    completed is not among them. `command` is the token list of the
 #                    command being completed -- the element the cursor is in, plus `""` for a
 #                    fresh empty argument slot. Unlike `buffer`, it is the command after a
 #                    pipe, inside a closure, or after a `;`, so `$place.command.0` is the
-#                    command name a completer like Carapace needs.
+#                    command name a completer like Carapace needs. `input` is what is
+#                    piped into that command: `{type}` (`nothing` where nothing is), and
+#                    for a table or record, `columns` as a table of `{name, type}`.
 #   buffer: string   the whole command line up to the cursor, across pipes and closures, for
 #                    completers that need more than the current token. `std/util structure`
 #                    turns it into a {text, kind, span} table. Prefer it over calling
@@ -389,9 +430,204 @@ $env.config.completions.external.max_results = 100
 # `commandline complete --input` returns all three at once, for inspecting a completer.
 # A completer never sees text past the cursor.
 #
-# Returns a list of suggestions (a string, or a record of {value, description?, style?,
-# span?, extra?}) or a record of {options, completions}. External/command-wide completers
-# are not filtered by default; parameter completers are. See `options.filter`.
+# Returns a list of suggestions (a string, or a record of {value, description?, style?, preview?,
+# help?, span?, extra?, display_override?, append_whitespace?}) or a record of {options,
+# completions}. External/command-wide completers are not filtered by default; parameter
+# completers are. See `options.filter`. `display` is read as `display_override`, as carapace
+# writes it.
+#
+# A suggestion replaces the whole word at the cursor, the part after the cursor too: taking
+# `size` in `si|ze` makes `size`. Once taken, a space follows it if `append_whitespace` says so.
+# Left out, a space follows a value that finishes an argument, and none follows a directory or a
+# value ending in `/`, `@`, `=`, `:`, `.` or `,`, after which more is typed. A value that ends in
+# a space, as carapace's do, has the space taken off and given back as the one that follows it,
+# so that it is never doubled.
+#
+# A completer can say something of the line in a record {completions: [...], message: "..."}: why
+# it has nothing to offer, or what is wrong with what was typed and what was meant (a host
+# misspelt, a path given to ssh that scp would take). The hint line shows the message, dim, where a
+# description would go, while no suggestion is selected. A completer that fails says so the same way, and so does
+# a delegated source (see `paths` below) that raises an error with `error make {msg: "..."}`.
+# `debug complete` reports the message too.
+#
+# The completion panel is a small frame under the word being completed, one row for each
+# suggestion, its value coloured as the line will colour it once it is taken (from the
+# `shape_*` styles of `color_config`, and `LS_COLORS` for paths). Paths that are all in one
+# directory name it once, in the frame's top edge. A lone suggestion that is already what the
+# line holds is not shown. Nothing is selected until Tab or an arrow selects it; the description
+# of the selected suggestion goes on the hint line, after the status line.
+#
+# Tab takes a lone suggestion, types what several share (with `completions.quick` and
+# `completions.partial` on), and otherwise selects one without changing the line; Enter takes
+# it. A command that takes only a closure, such as `each`, opens one once taken: `each { | }`,
+# the cursor in its body, and `reduce {|it, acc| | }` names its parameters as its examples do.
+#
+# Selecting a suggestion pops its preview out of the frame to the right, and Alt+P unfolds and
+# hides previews. A long preview scrolls with Alt+Up and Alt+Down or the mouse wheel over it;
+# its top edge says how many rows are above. A command previews its examples; one that takes
+# nothing but what is piped into it, such as `first`, `length` or `str upcase`, previews what it
+# gives for the line before it, with its examples folded behind, when that line only reads (see
+# the data a completion reads, below). A directory previews its entries, a file its metadata and
+# its start (a json, toml, yaml, csv, tsv or nuon file as a table), and a variable or environment
+# variable its value.
+#
+# What a command takes is the status line's, not the preview's: while a command is selected the
+# hint line gives its parameters before its description. The status line never repeats what is
+# written right above it: it is drawn under the word it is about, tied to it with a `╰`, and starts
+# at the parameter the cursor is at, its type inside the brackets, with what it is for after the
+# parameters still to come: `╰ <find: string> <replace> ...(rest)   The pattern to find.`. A choice
+# of types reads `glob | string`. A word that is a flag says what its value takes, and the rest of
+# a list of arguments says nothing, being for the same as the first. In a closure it says what the
+# closure is given, `╰ $in  name  type  size`, and after a `|` what is handed on, `╰ table  name
+# type  size`. In a row condition it says how many rows pass as you write it, `╰ 12 of 31 rows`,
+# dimmed while the condition does not run yet. Types take the colour of
+# `color_config.status_line_type`, a muted sage unless it is set; on a row too short for all of it,
+# what the parameter is for goes first, then the parameters farthest from it, each run a `…`.
+#
+# While a suggestion is selected, or is the only one, what taking it would write shows dim at the
+# cursor: the rest of the word, the space after it, `@` after a user, or the closure `each`
+# opens, with a gap in its underline where the cursor will land. The line itself changes only
+# when it is taken. Suggestions that would leave the line as it is show nothing.
+#
+# What is wrong with the line is drawn in red where it is, once the cursor has left it: a word
+# from another language in a condition (`=`, `&&`, `<>`), a column the rows do not have, an operand
+# its operator cannot work on, each of a chain of comparisons. A command that only reads, as the
+# completions read data, is run in the background on what is piped into it, and what fails there
+# is marked too, before Enter: `ls | first 4kb`. While the cursor is on what is wrong, the status
+# line says what it is and what was meant: `crgo is no command: cargo?`.
+#
+# A row condition is completed by what comes next, however far it is chained: a column, the
+# operators its type has, the values it holds, then `and`, `or` and `xor`. A number takes the units
+# its column can have (`1` → `1kb`, `1mb`), and a date what it is usually compared with
+# (`(date now) - 1day`), with how many rows each lets through. What another language writes is
+# offered as what nushell writes: `= → ==`, `&& → and`, `1 kb → 1kb`.
+#
+# A record is completed by what says what its keys are: the records beside it in a list, the
+# record its parameter declares, what the value it is assigned to already holds, the rows flowing
+# in, and for `merge` the columns it merges with. A key takes its `: ` with it. A word the line
+# already gave a command, a column in `select name ⌶` or a flag, is not offered to it again.
+#
+# Two lines say two things, and are drawn so that it is clear which. The status line is about
+# the line: it is tied to the word it is about by a `╰`, under that word, in the status colour.
+# Under a `|` it says what the pipe hands on (`╰ table<name, size>`), under a closure's `{` what
+# the closure is given (`╰ $in: record<name, size>`), under a condition how many rows pass, and
+# at an argument what it takes. The hint line is about the suggestion selected: its description in
+# italics, and what its mark means (`≈ from data`, `↻ cached`). While a suggestion is walked
+# through the status steps aside and the hint takes its place, so the list sits right under the
+# text. Types always take one colour, in both. A table's columns are named in brackets and never
+# listed with their values: values show for a suggestion, in its preview, and a hover over a word
+# shows the help of what the word is, and what a command gives only when that is short.
+#
+# A suggestion that is alone is not a menu of one. It is drawn after the cursor: the rest of the
+# word, dim and underlined, or, for one that replaces what was written, a correction or a fuzzy
+# match, `crgo → cargo` in dim italics, or `= → ==` after the line when the word is behind the
+# cursor. Tab takes it, as it does the one highlighted, and the history hint, when there is one,
+# stays what Ctrl+Y takes.
+#
+# A history hint is only offered while it is still true: a path it names has to exist, and the
+# next word has to be one its completer still offers, so a deleted branch is not offered again.
+#
+# A correction is offered alone and reads as one: `crgo → cargo`, `echohello → echo hello`. An
+# alias that only renames a command is offered as that command, the alias beside it
+# (`build  b`), and subcommands of one command name it once, in the frame's top edge.
+#
+# A command's examples come first that take what is piped in and write the flags already
+# written. Alt+Down reaches each example of a preview in turn, and Enter or Tab takes it over the
+# command at the cursor, from the command on when something is piped into it; a click takes one
+# too. A column of what is piped in previews what its cells hold: how many rows hold each value
+# when there are few kinds, else the lowest, middle and highest, or a few of them. A setting of
+# `$env.config` or an environment variable the shell documents is described by its documentation.
+#
+# In the normal modes of vi and helix nothing is offered to insert. The panel shows instead what
+# the line gives through the command under the cursor, when it only reads, and the preview of
+# what is under the cursor folded behind it: a command's examples, the most like what is written
+# first, a path's contents, a variable's value. Alt+Up/Alt+Down and the wheel scroll it.
+#
+# A preview's help, the examples that go with what it previews, is a part of its own under a
+# rule that names it, folded until Alt+P unfolds it. Beside the list a preview runs as far down
+# as the list does, or as the screen has room for, so that opening one does not move the line.
+#
+# previewers (record): what previews each kind of suggestion in place of the shell's own preview,
+# by the kind's name as `debug complete` gives it (`file`, `directory`, `command`, `flag`,
+# `value`, `variable`, `cell-path`), or for a command its kind of command (`external`). Each is a
+# closure given {value, display, kind, description, path, width} (`path` absolute for a file or a
+# directory) that returns text, a list of lines, or a value to draw as a table; `null` leaves the
+# shell's preview. A completer's own `preview` comes first.
+#   $env.config.completions.previewers = {
+#     file: {|item| bat --color=always --style=plain --line-range :200 $item.path }
+#   }
+#
+# What was typed wrong is answered where it is typed: a misspelt name or flag is offered as the
+# one meant (`gti` → `git`, `--hepl` → `--help`), and a word that runs a command on into its
+# argument as the two with a space between (`cdcrates/` → `cd crates/`, `checkoutmain` →
+# `checkout main`). Letters that only occur scattered through a name are not offered beside a
+# name that reads as meant. Behind the cursor, the status line says what was meant:
+# `ls has no flag --hepl: --help?`.
+#
+# A suggestion record may carry fields of its own beside those: {value: main, updated: 2hr,
+# remote: origin}. The completion panel draws them as dim columns after the value, one column
+# for each name, in the order the names first appear in the list.
+# (A name that is close to a field of the list above, like `descripton`, is reported in the log,
+# and still drawn as a column.)
+#
+# A record may also carry a `preview`: a value, which is drawn as a table, or a closure that
+# returns one, called only once the suggestion is selected.
+#   {value: main, description: "the default branch", preview: {|| git log -3 --format=%s | lines}}
+#
+# A preview folds. Alt+P cycles it: folded, unfolded, hidden, folded. What shows folded is the
+# `preview`; what shows once it is unfolded is the `help`, a value or a closure like `preview`
+# (called with it), and the description past its first line, which the hint line does not show.
+# The label in the frame's bottom edge says there is more: `▸` folded, `▾` unfolded. A
+# suggestion with no `help` and a one-line description has nothing to unfold, and Alt+P only
+# hides it.
+#   {value: main, description: "the default branch", help: "Protected: pushes need review."}
+#
+# A command previews its examples (the result shown as a table where one is known), the types
+# it takes and returns, and its parameters, and never what the hint line has: its usage and the
+# first line of its description. The examples of a `def` or `extern` are its `@example`
+# attributes, whose code may hold `<placeholders>`, underlined in the preview; completing with
+# the cursor on one completes the argument it stands for, and replaces it whole. An external
+# with no `extern` of its own takes the examples of its tldr page from the cache of tealdeer,
+# tlrc or another client, if that has been filled (`tldr --update`); no client is run and
+# nothing is fetched.
+#   @example "Create and switch to a new branch" "git checkout -b <branch_name>"
+#   export extern "git checkout" [ ... ]
+# Which examples go with a flag or parameter is read from their code, or said with `--for`: the
+# flags and parameters an example is about, which then shows only where they are typed.
+#   @example "Track a remote branch" "git checkout --track origin/<branch>" --for [--track]
+#
+# A completer can also hand part of the line to the shell's own completion by returning
+# {delegate: {from: <int>}}: "complete the line from byte offset `from` as a command line of
+# its own". `from` is relative to the `buffer` the completer was given. The answer replaces the
+# bytes the user typed, as if that part of the line had been typed alone, so a command that runs
+# another command needs no more than this:
+#   {|buffer| {delegate: {from: (($buffer | str index-of ' ' --utf-8-bytes) + 1)}}}
+# which completes `run git ch<tab>` as `git ch`. Once such a rest of the arguments has begun,
+# a word like a flag is the delegated command's, not the wrapper's: `ssh host ls -<tab>` offers
+# what `ls` takes.
+# The delegated line is completed like any other: its first word names a program on PATH (a
+# Nushell command of the same name does not take its place), and its arguments go to this same
+# completer, or to files. Optional fields of the record swap the machine the line is for:
+#   paths: closure     {|dir| ...} returns the entry names in `dir` -- directories end in `/`,
+#                      and `dir` is `.` when none is typed -- in place of the local filesystem
+#                      for the paths in the delegated line.
+#   commands: closure  {|| ...} returns command names in place of those on PATH, for the
+#                      first word of the delegated line.
+# A line for another machine is not completed by this completer, nor by the files of this one.
+# What `paths` and `commands` return is kept for about 30 seconds, by the closure (with the
+# values it captured) and what it was called with, so typing on does not ask the machine again.
+# More fields say how `from` is read:
+#   inside: string     the quote (`'`, `"` or a backtick) of the string `from` is inside of, as in
+#                      `ssh host 'cat f`, where `from` is the byte after the quote. Names are then
+#                      inserted escaped for the other machine's shell and for that string.
+#   path: bool         `from` starts one path of the other machine (`scp host:dir/f`), not a
+#                      command line. `paths` lists its directories.
+# A `from` that is negative, past the end of the line, or inside a character declines, as
+# `null` does. Delegations nest (the delegated line can delegate again) up to a fixed depth.
+# The same is built in for sudo and doas: `sudo git ch<tab>` completes `git ch` as its own line.
+# An `extern` for a program that runs another, with its options, can delegate the same way.
+# `use std/completions` provides `ssh-hosts`, an `ssh` extern that delegates its remote command
+# through ssh, and a `delegate` helper that builds the record.
 # Default: null
 $env.config.completions.external.completer = null
 
@@ -401,6 +637,9 @@ $env.config.completions.external.completer = null
 # $env.config.completions.external.completer = {|place|
 #   carapace $place.command.0 nushell ...$place.command | from json
 # }
+# An external completer that only lists files (every value, without its trailing space, is a path
+# that exists) is answered by the shell's own file completion instead, which matches fuzzily, colors
+# and previews them. One that lists anything else besides is used as it is.
 #
 # Example: branch off the resolved cursor instead of re-parsing the line, by declaring
 # only the `place` it needs:
@@ -834,6 +1073,13 @@ $env.config.abbreviations = {}
 # Menus are typically activated via keybindings.
 # See https://www.nushell.sh/book/line_editor.html#menus for details.
 #
+# The completion panel is a framed list at the word being completed, with a preview of the
+# selected item flowing out of its right edge. Tab types what the matches share, then moves a
+# highlight over the first one without touching the line; Enter takes the highlighted item, Esc
+# drops the highlight and then closes the panel. While it is open the mouse selects (a click on
+# the highlighted row takes it), the wheel moves the highlight, and a click elsewhere closes it.
+# A menu's `marker` is kept for old configs and no longer shown.
+#
 # Each menu must declare its input behavior with one of:
 #   input_mode: "diff", "cursor_prefix", or "full_buffer" -- what text the
 #     menu source receives ("diff": only text typed since the menu opened,
@@ -1048,6 +1294,23 @@ $env.config.color_config.shape_string_interpolation = "cyan_bold"
 # color_config.shape_raw_string: Style for raw string literals (r#'...'#).
 # Default: light_purple
 $env.config.color_config.shape_raw_string = "light_purple"
+
+# color_config.shape_filesize: Style for filesize literals (e.g., 10kb), number and unit alike.
+# Default: "#d7875f"
+$env.config.color_config.shape_filesize = "#d7875f"
+
+# color_config.shape_duration: Style for duration literals (e.g., 5sec), number and unit alike.
+# Default: "#5fafaf"
+$env.config.color_config.shape_duration = "#5fafaf"
+
+# color_config.shape_cell_path: Style for the members of a cell path (e.g., "name" and "0" in `$x.name.0`).
+# Default: "#87afd7"
+$env.config.color_config.shape_cell_path = "#87afd7"
+
+# color_config.shape_type: Style for types in signatures (e.g., "int" and "string" in `oneof<int, string>`).
+# The commas and angle brackets between them use shape_operator.
+# Default: "#87af87"
+$env.config.color_config.shape_type = "#87af87"
 
 # color_config.shape_record: Style for record literal braces {}.
 # Keys and values use their individual shapes.
@@ -1308,9 +1571,11 @@ $env.config.color_config.block = "default"
 $env.config.color_config.hints = "dark_gray"
 
 # color_config.status_line: Style for the REPL's status line (see
-# `status_line`). The parameter being typed is drawn in it, bold and underlined.
-# Default: the `hints` style, when not set
-$env.config.color_config.status_line = $env.config.color_config.hints
+# `status_line`). The parameter being typed is drawn in it, bold and underlined,
+# and the description of the selected completion that follows it in italics.
+# Default: a muted steel blue (256-color 67), apart from the dark gray of
+# `hints` so that the two are not taken for each other; used when not set.
+$env.config.color_config.status_line = { fg: "#5f87af" }
 
 # color_config.status_line_error: Style for an error on the REPL's status line.
 # Default: red

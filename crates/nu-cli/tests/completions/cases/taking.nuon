@@ -1,0 +1,112 @@
+# What taking a suggestion does to the line: it replaces the whole word at the cursor, a space
+# follows a finished argument, and a command that takes only a closure opens it (`⌶` marks where the
+# cursor lands when a suggestion places it). Also what is offered as what was meant.
+{
+  world: [crates/cli/src/lib.rs crates/cmd/ notes.txt src/ Cargo.toml]
+  programs: [cargo]
+  cases: [
+    # `si⌶ze`: taking `size` makes `size`, not `sizeze`.
+    {test: a_suggestion_replaces_the_whole_word_at_the_cursor, line: "[[size name]; [1 a]] | where size > 1", at: 33, taken: {size: "[[size name]; [1 a]] | where size  > 1"}}
+    # A directory takes the separator it ends with, and leaves the rest of the path.
+    {test: a_suggestion_replaces_the_whole_word_at_the_cursor, line: "ls crates/cl/src", at: 12, taken: {crates/cli/: "ls crates/cli/src"}}
+    {test: a_space_follows_a_finished_argument_but_not_a_directory_or_a_record, setup: "def branches [] { [main 'rethink/hints'] }\ndef tool [...targets: string@branches] {}", line: "tool rethink/h", taken: {rethink/hints: "tool rethink/hints "}}
+    {test: a_space_follows_a_finished_argument_but_not_a_directory_or_a_record, line: "open no", taken: {notes.txt: "open notes.txt "}}
+    {test: a_space_follows_a_finished_argument_but_not_a_directory_or_a_record, line: "open sr", taken: {src/: "open src/"}}
+    {test: a_space_follows_a_finished_argument_but_not_a_directory_or_a_record, line: "{a: {b: 1}, c: 2} | get ", taken: {a: "{a: {b: 1}, c: 2} | get a", c: "{a: {b: 1}, c: 2} | get c "}}
+    # As the completer says; a value's own space is taken off and given back.
+    {test: a_completer_says_whether_a_space_follows_and_a_trailing_space_becomes_one, setup: "def words [] { [{value: 'kept', append_whitespace: false} 'plain ' 'user@' 'key='] }\ndef tool [word: string@words] {}", line: "tool ", taken: {kept: "tool kept", plain: "tool plain ", user@: "tool user@", key=: "tool key="}}
+    {test: a_command_that_takes_only_a_closure_opens_it, line: "ls | eac", taken: {each: "ls | each { ⌶ }"}}
+    # A closure whose parameters must be named has them named as the examples do; a flag that
+    # takes a closure opens one too.
+    {test: a_command_that_takes_only_a_closure_opens_it, line: "{a: 1} | items", taken: {items: "{a: 1} | items {|key, value| ⌶ }"}}
+    {test: a_command_that_takes_only_a_closure_opens_it, line: "ls | rename --blo", taken: {--block: "ls | rename --block { ⌶ }"}}
+    # Nor when the closure is already written, nor for `where`, which takes a condition.
+    {test: a_command_that_takes_only_a_closure_opens_it, line: "ls | eac { $in }", at: 8, taken: {each: "ls | each  { $in }"}}
+    {test: a_command_that_takes_only_a_closure_opens_it, line: "ls | whe", taken: {where: "ls | where "}}
+    # A completer is handed the command as it was typed: a cluster of flags once, and words that
+    # are no flag of the command's kept.
+    {test: a_completer_is_handed_the_words_as_typed, setup: "def show [place: record] { [($place.command | to nuon)] }\nextern tool [--verbose(-v), --port(-p): int, host: string, ...rest: string@show]", line: "tool -vp 22 h ls -la x", first: "[tool, -vp, \"22\", h, ls, -la, x]"}
+    # After a command line handed on whole has begun, a word like a flag is that command's.
+    {test: a_flag_after_a_delegated_command_is_the_commands, setup: "def rest [buffer: string] { {delegate: {from: (($buffer | str index-of ' ' --utf-8-bytes) + 1)}} }\nextern wrap [--quiet, ...command: string@rest]\nextern prog [--alpha, --quick]", line: "wrap prog --q", values: [--quick]}
+    # A word that runs a command on into its argument is read with the space it forgot.
+    {test: a_forgotten_space_is_offered_back, line: "echohello", first: "echo hello"}
+    {test: a_forgotten_space_is_offered_back, setup: "def tool [] {}\ndef 'tool checkout' [target: string] {}", line: "tool checkoutmain", first: "tool checkout main"}
+    # Letters scattered through a name are not offered beside one that reads as meant; initials do.
+    {test: scattered_letters_give_way_to_a_name_that_reads_as_meant, setup: "def selector [] {}; def swift-package-collection [] {}; def git-commit-msg [] {}", line: "selec", has: [selector], lacks: [swift-package-collection]}
+    {test: scattered_letters_give_way_to_a_name_that_reads_as_meant, setup: "def selector [] {}; def swift-package-collection [] {}; def git-commit-msg [] {}", line: "gcm", has: [git-commit-msg]}
+    # A program that is no command at all is offered alone as the one meant, in its place.
+    {test: a_program_that_is_no_command_is_offered_as_the_one_meant, line: "crgo build ", values: [cargo], spans: [[0 4]], taken: "cargo build "}
+    # What an operator is still waiting for is not a file, and a value read from data is not
+    # corrected: one close to it is another value.
+    {test: an_operand_is_the_users_to_write, line: "1 > ", values: []}
+    {test: an_operand_is_the_users_to_write, line: "ls | each { $in.size > ", lacks: [notes.txt]}
+    {test: an_operand_is_the_users_to_write, line: "[[size]; [160b] [164b]] | where size == 160b", lacks: ["164b"]}
+    # An alias that only renames a command is that command, offered once.
+    {test: an_alias_that_renames_a_command_is_offered_as_the_command, setup: "def tool [] {}\ndef 'tool build' [] {}\ndef 'tool bench' [] {}\nalias 'tool b' = tool build", line: "tool b", first: "tool build", lacks: ["tool b"]}
+    # What a call has been given is not offered to it again.
+    {test: what_a_call_has_been_given_is_not_offered_again, setup: "def names [] { [one two three] }\ndef tool [--alpha(-a), --beta, ...rest: string@names] {}", line: "tool one ", values: [two three]}
+    {test: what_a_call_has_been_given_is_not_offered_again, setup: "def names [] { [one two three] }\ndef tool [--alpha(-a), --beta, ...rest: string@names] {}", line: "tool one three ", values: [two]}
+    {test: what_a_call_has_been_given_is_not_offered_again, setup: "def tool [--alpha(-a), --beta] {}", line: "tool --alpha --", has: [--beta], lacks: [--alpha]}
+    {test: what_a_call_has_been_given_is_not_offered_again, setup: "def tool [--alpha(-a), --beta] {}", line: "tool -a --", lacks: [--alpha]}
+    {test: what_a_call_has_been_given_is_not_offered_again, line: "[[name type size]; [a b 1]] | select name type ", values: [size]}
+    # A condition goes on with what can come next, however far it is chained; the second
+    # comparison's value is read from the data too.
+    {test: a_condition_is_helped_along_however_far_it_is_chained, line: "[[size name modified]; [1kb a 2020-01-01]] | where size > 1b ", values: [and or xor]}
+    {test: a_condition_is_helped_along_however_far_it_is_chained, line: "[[size name modified]; [1kb a 2020-01-01]] | where size > 1b a", values: [and]}
+    {test: a_condition_is_helped_along_however_far_it_is_chained, line: "[[size name modified]; [1kb a 2020-01-01]] | where size > 1b and name ", has: ["=="]}
+    {test: a_condition_is_helped_along_however_far_it_is_chained, line: "[[size name modified]; [1kb a 2020-01-01]] | where size > 1b and name == ", values: [a]}
+    {test: a_condition_is_helped_along_however_far_it_is_chained, line: "[[size name modified]; [1kb a 2020-01-01]] | where size > 1b or size < 2b and ", values: [size name modified]}
+    # A number takes the units the column it is compared with can have, and a date what it is
+    # usually compared with; a span of time has the units of one.
+    {test: a_value_is_completed_as_what_its_column_holds, line: "[[size name modified]; [1kb a 2020-01-01]] | where size > 1", first: "1kb"}
+    {test: a_value_is_completed_as_what_its_column_holds, line: "[[size name modified]; [1kb a 2020-01-01]] | where size > 1k", values: ["1kb" "1kib"]}
+    {test: a_value_is_completed_as_what_its_column_holds, line: "[[size name modified]; [1kb a 2020-01-01]] | where modified > ", first: "(date now) - 1hr"}
+    {test: a_value_is_completed_as_what_its_column_holds, line: "[[size name modified]; [1kb a 2020-01-01]] | where modified > (date now) - ", first: "1hr"}
+    {test: a_value_is_completed_as_what_its_column_holds, line: "[[size name modified]; [1kb a 2020-01-01]] | where modified > (date now) - 1d", values: ["1day"]}
+    {test: a_value_is_completed_as_what_its_column_holds, line: "[[size name modified]; [1kb a 2020-01-01]] | where modified older-than ", first: "1hr"}
+    # What another language says of a condition is offered alone as what nushell says, in its
+    # place; only the operator changes.
+    {test: a_word_from_another_language_is_offered_as_what_nushell_says, line: "[[size name modified]; [1kb a 2020-01-01]] | where size = 1b ", values: ["=="], taken: "[[size name modified]; [1kb a 2020-01-01]] | where size == 1b "}
+    {test: a_word_from_another_language_is_offered_as_what_nushell_says, line: "[[size name modified]; [1kb a 2020-01-01]] | where size === 1b ", values: ["=="], taken: "[[size name modified]; [1kb a 2020-01-01]] | where size == 1b "}
+    {test: a_word_from_another_language_is_offered_as_what_nushell_says, line: "[[size name modified]; [1kb a 2020-01-01]] | where size => 1b ", values: [">="], taken: "[[size name modified]; [1kb a 2020-01-01]] | where size >= 1b "}
+    {test: a_word_from_another_language_is_offered_as_what_nushell_says, line: "[[size name modified]; [1kb a 2020-01-01]] | where size <> 1b ", values: ["!="], taken: "[[size name modified]; [1kb a 2020-01-01]] | where size != 1b "}
+    {test: a_word_from_another_language_is_offered_as_what_nushell_says, line: "[[size name modified]; [1kb a 2020-01-01]] | where size && 1b ", values: [and], taken: "[[size name modified]; [1kb a 2020-01-01]] | where size and 1b "}
+    {test: a_word_from_another_language_is_offered_as_what_nushell_says, line: "[[size name modified]; [1kb a 2020-01-01]] | where size || 1b ", values: [or], taken: "[[size name modified]; [1kb a 2020-01-01]] | where size or 1b "}
+    # On its way to `==` it is offered what it can become, and corrected for nothing yet.
+    {test: a_word_from_another_language_is_offered_as_what_nushell_says, line: "[[size name modified]; [1kb a 2020-01-01]] | where name =", first: "==", has: ["=~"]}
+    {test: a_word_from_another_language_is_offered_as_what_nushell_says, line: "[[size name modified]; [1kb a 2020-01-01]] | where size > 1 kb ", first: "1kb", taken: "[[size name modified]; [1kb a 2020-01-01]] | where size > 1kb "}
+    # A record is written from what says what its keys are: the records beside it in a list, the
+    # parameter it is for, what is assigned to, the rows flowing in.
+    {test: a_record_is_helped_along_by_what_says_what_its_keys_are, line: "[{os: linux, arch: x86}, {", values: ["os: " "arch: "]}
+    {test: a_record_is_helped_along_by_what_says_what_its_keys_are, line: "[{os: linux, arch: x86}, {os: mac, ", values: ["arch: "]}
+    {test: a_record_is_helped_along_by_what_says_what_its_keys_are, line: "[{os: linux, arch: x86}, {os: mac}, {os: ", values: [linux mac]}
+    {test: a_record_is_helped_along_by_what_says_what_its_keys_are, setup: "def tool [settings: record<depth: int, name: string>] {}", line: "tool {", values: ["depth: " "name: "]}
+    {test: a_record_is_helped_along_by_what_says_what_its_keys_are, setup: "def tool [settings: record<depth: int, name: string>] {}", line: "tool {depth: 1, ", values: ["name: "]}
+    {test: a_record_is_helped_along_by_what_says_what_its_keys_are, setup: "$env.settings = {depth: 1, name: x}", line: "$env.settings = {", values: ["depth: " "name: "]}
+    {test: a_record_is_helped_along_by_what_says_what_its_keys_are, line: "[[name size]; [a 1]] | merge {", values: ["name: " "size: "]}
+    {test: a_record_is_helped_along_by_what_says_what_its_keys_are, line: "[[name size]; [a 1]] | each { {name: ", values: ["$in.name"]}
+    # A key taken leaves the cursor at its value, and a closure is left alone.
+    {test: a_record_is_helped_along_by_what_says_what_its_keys_are, line: "[{os: linux}, {o", taken: "[{os: linux}, {os: "}
+    {test: a_record_is_helped_along_by_what_says_what_its_keys_are, line: "[1] | each {|x| ", lacks: ["x: "]}
+    # A condition written with `$in` is helped along as one written with bare columns is.
+    {test: a_condition_written_with_in_is_helped_along_too, line: "[[size name modified]; [1kb a 2020-01-01]] | where $in.name ", has: ["==" "=~"], lacks: [notes.txt]}
+    {test: a_condition_written_with_in_is_helped_along_too, line: "[[size name modified]; [1kb a 2020-01-01]] | where $in.name == a or $in.size ", has: ["<"]}
+    {test: a_condition_written_with_in_is_helped_along_too, line: "[[size name modified]; [1kb a 2020-01-01]] | where $in.name == ", values: [a]}
+    {test: a_condition_written_with_in_is_helped_along_too, line: "[[size name modified]; [1kb a 2020-01-01]] | where $in.size > 1", first: "1kb"}
+    {test: a_condition_written_with_in_is_helped_along_too, line: "[[size name modified]; [1kb a 2020-01-01]] | where $in.size > 1kb ", values: [and or xor]}
+    {test: a_condition_written_with_in_is_helped_along_too, line: "[[size name modified]; [1kb a 2020-01-01]] | where $in.size > 1kb and $in.name == ", values: [a]}
+    {test: a_condition_written_with_in_is_helped_along_too, line: "[[size name modified]; [1kb a 2020-01-01]] | where $in.size > 1kb or ", values: [size name modified]}
+    # What the line can only go on with once a space is typed is opened; what could still go
+    # another way, such as a condition, an optional or any-valued argument, is left alone.
+    {test: what_can_only_come_next_is_opened, opens: "{  }", lines: ["ls | each " "try " "loop " "for x in [1 2] " "def foo [] " "match 1 " "ls | where size > 1 | each "]}
+    {test: what_can_only_come_next_is_opened, line: "{a: 1} | items ", opens: "{|key, value|  }"}
+    {test: what_can_only_come_next_is_opened, lines: ["let x " "mut x "], opens: "= "}
+    {test: what_can_only_come_next_is_opened, line: "for x ", opens: "in "}
+    {test: what_can_only_come_next_is_opened, line: "def foo ", opens: "[]"}
+    {test: what_can_only_come_next_is_opened, line: "ls | each  | get a", at: 10, opens: "{  }"}
+    {test: what_could_still_go_another_way_is_left_alone, opens: null, lines: [
+      "ls | where size > 1 && type == " "ls | where size > 1 && type == dir " "while $x " "for x in " "if true "
+      "ls | where " "ls | first " "ls | update name " "ls | each { " "ls | each { $in } " "ls | each --keep-empty" "ls"
+    ]}
+  ]
+}

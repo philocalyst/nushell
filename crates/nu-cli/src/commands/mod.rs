@@ -1,6 +1,7 @@
 mod abbr;
 mod abbr_list;
 mod commandline;
+mod debug_complete;
 mod default_context;
 mod history;
 mod keybindings;
@@ -16,6 +17,7 @@ pub use commandline::{
     Commandline, CommandlineComplete, CommandlineEdit, CommandlineGetCursor, CommandlineSetCursor,
     CommandlineSetPrompt,
 };
+pub use debug_complete::DebugComplete;
 pub use history::*;
 pub use keybindings::Keybindings;
 pub use keybindings_default::KeybindingsDefault;

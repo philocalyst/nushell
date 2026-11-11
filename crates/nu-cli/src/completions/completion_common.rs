@@ -1,20 +1,25 @@
-use super::{MatchAlgorithm, completion_options::NuMatcher};
-use crate::completions::{
-    CompletionOptions, Context, Fetched, SemanticSuggestion, to_reedline_span,
+use super::{
+    cache::Entry,
+    quote::{Quote, Spelling, quote},
+    rank::Score,
 };
-use nu_ansi_term::Style;
+use crate::completions::{
+    Candidates, Context, SemanticSuggestion,
+    delegation::{Delegation, Listed},
+    to_reedline_span,
+    usage::Used,
+};
 use nu_engine::env_to_string;
 use nu_path::dots::expand_ndots;
 use nu_path::{expand_to_real_path, home_dir};
-use nu_protocol::{
-    Span, SuggestionKind,
-    engine::{EngineState, Stack, StateWorkingSet},
-};
+use nu_protocol::{Span, SuggestionKind, engine::StateWorkingSet};
 use nu_utils::IgnoreCaseExt;
 use nu_utils::get_ls_colors;
 use reedline::Suggestion;
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::path::{Component, MAIN_SEPARATOR as SEP, Path, PathBuf, is_separator};
+use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Default)]
@@ -22,6 +27,8 @@ pub struct PathBuiltFromString {
     cwd: PathBuf,
     parts: Vec<MatchedPart>,
     isdir: bool,
+    /// How the last of `parts` ranked.
+    score: Option<Score>,
 }
 
 #[derive(Clone, Default)]
@@ -32,17 +39,18 @@ pub struct MatchedPart {
 
 /// Recursively goes through paths that match a given `partial`.
 /// * `built_paths`: State struct for a valid matching path built so far.
+/// * `ctx`: The options to match with, and the directory listings the cache holds.
 /// * `want_directory`: Whether we want only directories as completion matches.
 ///   Some commands like `cd` can only be run on directories whereas others
 ///   like `ls` can be run on regular files as well.
 /// * `isdir`: whether the current partial path has a trailing slash.
 ///   Parsing a path string into a pathbuf loses that bit of information.
-/// * `enable_exact_match`: Whether match algorithm is Prefix and all previous components
-///   of the path matched a directory exactly.
+/// * `enable_exact_match`: Whether all previous components of the path matched a directory
+///   exactly, so that one more exact match narrows to it.
 fn complete_rec(
     partial: &[&str],
     built_paths: &[PathBuiltFromString],
-    options: &CompletionOptions,
+    ctx: &Context,
     want_directory: bool,
     isdir: bool,
     enable_exact_match: bool,
@@ -68,92 +76,83 @@ fn complete_rec(
         return complete_rec(
             rest,
             &built_paths,
-            options,
+            ctx,
             want_directory,
             isdir,
             enable_exact_match,
         );
     }
 
+    let options = ctx.options;
     let prefix = partial.first().unwrap_or(&"");
-    let mut matcher = NuMatcher::new(prefix, options, true);
 
-    let mut exact_match = None;
-    // Only relevant for case insensitive matching
-    let mut multiple_exact_matches = false;
+    // What each path built so far holds, and the entries that may match, as indices into it.
+    let mut listings: Vec<(&PathBuiltFromString, Arc<[Entry]>)> = Vec::new();
+    let mut candidates = Candidates::<(usize, usize)> {
+        needle: Some((*prefix).to_owned()),
+        // Entries of one directory are ranked by when the user named them or was in them.
+        used: Some(Used::Path {
+            directories: want_directory,
+        }),
+        ..Candidates::default()
+    };
     for built in built_paths {
         let mut path = built.cwd.clone();
         for part in &built.parts {
             path.push(part.text.as_str());
         }
 
-        let Ok(result) = path.read_dir() else {
+        let Some(listing) = ctx.cache.listing(&path, ctx.trace) else {
             continue;
         };
-
-        for entry in result.filter_map(|e| e.ok()) {
-            let entry_name = entry.file_name().to_string_lossy().into_owned();
-            let entry_isdir = entry.path().is_dir();
-            if want_directory && !entry_isdir {
-                continue;
+        if let [_] = built_paths {
+            candidates.beneath = Some(path);
+        }
+        for (index, entry) in listing.iter().enumerate() {
+            if !want_directory || entry.is_dir {
+                candidates.push_as(entry.name.clone(), (listings.len(), index));
             }
-            // Match before cloning: the clone copies the whole accumulated path per entry,
-            // but only the few matches survive, and an exact match is also a prefix match.
-            if matcher.check_match(&entry_name).is_none() {
-                continue;
-            }
+        }
+        listings.push((built, listing));
+    }
+    let found = candidates.ranked(ctx);
+    let entry_of = |&(at, index): &(usize, usize)| (listings[at].0, &listings[at].1[index]);
 
-            let mut built = built.clone();
-            built.isdir = entry_isdir;
-
-            if enable_exact_match && !multiple_exact_matches && has_more {
-                let matches = if options.case_sensitive {
-                    entry_name.eq(prefix)
+    // Don't show longer completions if we have a single exact match (#13204, #14794).
+    // Only relevant for case insensitive matching: there may be more than one.
+    if enable_exact_match && has_more {
+        let mut exact = found
+            .iter()
+            .map(|found| entry_of(&found.item))
+            .filter(|(_, entry)| {
+                if options.case_sensitive {
+                    entry.name == *prefix
                 } else {
-                    entry_name.eq_ignore_case(prefix)
-                };
-                if matches {
-                    if exact_match.is_none() {
-                        let mut built_exact = built.clone();
-                        let match_indices = (0..entry_name.graphemes(true).count()).collect();
-                        built_exact.parts.push(MatchedPart {
-                            text: entry_name.clone(),
-                            match_indices,
-                        });
-                        exact_match = Some(built_exact);
-                    } else {
-                        multiple_exact_matches = true;
-                    }
+                    entry.name.eq_ignore_case(prefix)
                 }
-            }
-
-            matcher.add(entry_name.clone(), (built, entry_name));
+            });
+        if let (Some((built, entry)), None) = (exact.next(), exact.next()) {
+            let mut built = built.clone();
+            built.isdir = entry.is_dir;
+            built.parts.push(MatchedPart {
+                text: entry.name.clone(),
+                match_indices: (0..entry.name.graphemes(true).count()).collect(),
+            });
+            return complete_rec(&partial[1..], &[built], ctx, want_directory, isdir, true);
         }
     }
 
-    // Don't show longer completions if we have a single exact match (#13204, #14794)
-    if !multiple_exact_matches && let Some(built) = exact_match {
-        return complete_rec(
-            &partial[1..],
-            &[built],
-            options,
-            want_directory,
-            isdir,
-            true,
-        );
-    }
-
-    let completion_iter =
-        matcher
-            .results()
-            .into_iter()
-            .map(|((mut built, last_entry_name), last_match_indices)| {
-                built.parts.push(MatchedPart {
-                    text: last_entry_name,
-                    match_indices: last_match_indices,
-                });
-                built
-            });
+    let completion_iter = found.into_iter().map(|found| {
+        let (built, entry) = entry_of(&found.item);
+        let mut built = built.clone();
+        built.isdir = entry.is_dir;
+        built.parts.push(MatchedPart {
+            text: entry.name.clone(),
+            match_indices: found.indices,
+        });
+        built.score = found.score;
+        built
+    });
 
     if has_more {
         completion_iter
@@ -161,7 +160,7 @@ fn complete_rec(
                 complete_rec(
                     &partial[1..],
                     &[completion],
-                    options,
+                    ctx,
                     want_directory,
                     isdir,
                     false,
@@ -194,15 +193,6 @@ pub fn surround_remove(partial: &str) -> String {
     partial.to_string()
 }
 
-pub struct FileSuggestion {
-    pub span: nu_protocol::Span,
-    pub path: String,
-    pub style: Option<Style>,
-    pub is_dir: bool,
-    pub display_override: Option<String>,
-    pub match_indices: Vec<usize>,
-}
-
 /// Sort hidden entries (file names starting with `.`) after visible ones; stable, so
 /// order within each group is preserved.
 fn hidden_files_last(items: &mut [SemanticSuggestion]) {
@@ -214,66 +204,168 @@ fn hidden_files_last(items: &mut [SemanticSuggestion]) {
     });
 }
 
-/// Path completion shared by [`FileCompletion`](crate::completions::FileCompletion) and
-/// [`DirectoryCompletion`](crate::completions::DirectoryCompletion).
+/// Path completion for files, or for directories only when `directories_only`. Directories
+/// also alone when the cursor is mid-path, which readjusts the view to the directory it is in.
 ///
-/// `directories_only` restricts results to directories; file completion also restricts
-/// when the view was readjusted mid-path.
-pub(crate) fn complete_paths(ctx: &Context, directories_only: bool) -> Fetched {
+/// The candidates are ranked as they are found, one path component at a time, so they are
+/// offered as they are.
+pub(crate) fn paths(ctx: &Context, directories_only: bool) -> Candidates {
     let AdjustView {
         prefix,
         span,
         readjusted,
     } = adjust_if_intermediate(ctx.prefix_str().as_ref(), ctx.working_set, ctx.span);
+    let directories_only = directories_only || readjusted;
 
-    let cwd = ctx
-        .working_set
-        .permanent_state
-        .cwd_as_string(None)
-        .unwrap_or_default();
-    let mut items: Vec<_> = complete_item(
-        directories_only || readjusted,
-        span,
-        &prefix,
-        &[&cwd],
-        ctx.options,
-        ctx.working_set.permanent_state,
-        ctx.stack,
-    )
-    .into_iter()
-    .map(|x| SemanticSuggestion {
-        suggestion: Suggestion {
-            value: x.path,
-            style: x.style,
-            span: to_reedline_span(x.span, ctx.offset),
-            display_override: x.display_override,
-            match_indices: Some(x.match_indices),
-            ..Suggestion::default()
-        },
-        kind: Some(if x.is_dir {
-            SuggestionKind::Directory
-        } else {
-            SuggestionKind::File
-        }),
-    })
-    .collect();
+    let mut items = match ctx.delegation {
+        Some(delegation) if delegation.sources.paths.is_some() => {
+            remote_paths(ctx, delegation, &prefix, span, directories_only)
+        }
+        _ => {
+            let cwd = ctx
+                .working_set
+                .permanent_state
+                .cwd_as_string(Some(ctx.stack))
+                .unwrap_or_default();
+            complete_item(directories_only, span, &prefix, &[&cwd], ctx)
+        }
+    };
 
     hidden_files_last(&mut items);
-    Fetched::answering(items).worth_keeping()
+    let label = if directories_only {
+        "directory"
+    } else {
+        "file"
+    };
+    for item in &mut items {
+        item.source = Some(Cow::Borrowed(label));
+    }
+    Candidates::kept(items)
 }
 
+/// Path completion against the directories of another machine, which the delegating
+/// completer's `paths` closure lists: `prefix` is split at its last `/`, the directory part is
+/// what the closure is asked for, and the rest is matched against the names it returns
+/// (directories end in `/`). The directory is passed as typed, `.` when there is none.
+fn remote_paths(
+    ctx: &Context,
+    delegation: &Delegation,
+    prefix: &str,
+    span: Span,
+    directories_only: bool,
+) -> Vec<SemanticSuggestion> {
+    let cleaned = match delegation.sources.inside {
+        Some(inside) => unescape_remote(&surround_remove(prefix), inside),
+        None => surround_remove(prefix),
+    };
+    // `/` is ASCII, so splitting after it is always on a char boundary.
+    let (dir, leaf) = cleaned.split_at(cleaned.rfind('/').map_or(0, |at| at + 1));
+    let listed = if dir.is_empty() { "." } else { dir };
+    let Listed {
+        names: entries,
+        origin,
+    } = delegation
+        .directory_entries(ctx, listed)
+        .unwrap_or_default();
+
+    let mut candidates = Candidates::<(String, bool)> {
+        needle: Some(leaf.to_owned()),
+        ..Candidates::default()
+    };
+    for entry in entries.iter() {
+        let is_dir = entry.ends_with('/');
+        if directories_only && !is_dir {
+            continue;
+        }
+        // Matched without the slash that marks a directory, but offered with it.
+        let name = entry.trim_end_matches('/').to_owned();
+        candidates.push_as(name, (entry.clone(), is_dir));
+    }
+
+    let dir_width = dir.graphemes(true).count();
+    candidates
+        .ranked(ctx)
+        .into_iter()
+        .filter_map(|found| {
+            let (entry, is_dir) = found.item;
+            let path = format!("{dir}{entry}");
+            let spelled = if delegation.literal {
+                quote(
+                    &path,
+                    Spelling {
+                        home: true,
+                        ..Spelling::default()
+                    },
+                )
+                .into_owned()
+            } else {
+                remote_word(&path, delegation.sources.inside)?
+            };
+            let (value, display_override) = if spelled == path {
+                (path, None)
+            } else {
+                (spelled, Some(path))
+            };
+            Some(SemanticSuggestion {
+                suggestion: Suggestion {
+                    value,
+                    span: to_reedline_span(span, ctx.offset),
+                    display_override,
+                    match_indices: Some(
+                        found.indices.into_iter().map(|at| at + dir_width).collect(),
+                    ),
+                    // A directory goes on with what is in it.
+                    append_whitespace: !is_dir,
+                    ..Suggestion::default()
+                },
+                kind: Some(if is_dir {
+                    SuggestionKind::Directory
+                } else {
+                    SuggestionKind::File
+                }),
+                origin,
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+/// `path` spelled to be inserted in a line for another machine: quoted for the shell that reads
+/// it there, then for Nushell, which passes the inner quotes on. Inside a string already opened
+/// (`ssh host 'cat f`), the word is spelled without quotes of its own, which the string might not
+/// hold, and escaped for the string. `None` when the string cannot hold the name at all.
+fn remote_word(path: &str, inside: Option<Quote>) -> Option<String> {
+    let Some(quote_kind) = inside else {
+        let remote = posix_quote(path);
+        return Some(quote(&remote, Spelling::default()).into_owned());
+    };
+
+    let escaped = posix_escape(path)?;
+    match quote_kind {
+        // Verbatim strings that cannot hold their own delimiter.
+        Quote::Single if escaped.contains('\'') => None,
+        Quote::Backtick if escaped.contains('`') => None,
+        Quote::Double => Some(escaped.replace('\\', "\\\\").replace('"', "\\\"")),
+        Quote::Single | Quote::Backtick => Some(escaped),
+    }
+}
+
+/// The suggestions for the paths that match `partial`, ranked by their last component.
+///
 /// # Parameters
 /// * `cwds` - A list of directories in which to search. The only reason this isn't a single string
 ///   is because dotnu_completions searches in multiple directories at once
+/// * `ctx` - Where the options, the environment and the cached directory listings come from
 pub fn complete_item(
     want_directory: bool,
     span: nu_protocol::Span,
     partial: &str,
     cwds: &[impl AsRef<str>],
-    options: &CompletionOptions,
-    engine_state: &EngineState,
-    stack: &Stack,
-) -> Vec<FileSuggestion> {
+    ctx: &Context,
+) -> Vec<SemanticSuggestion> {
+    let (engine_state, stack) = (ctx.working_set.permanent_state, ctx.stack);
+    // The user may be typing inside a quote: stay in it.
+    let inside = Quote::opened_by(partial);
     let cleaned_partial = surround_remove(partial);
     let isdir = cleaned_partial.ends_with(is_separator);
     let expanded_partial = expand_ndots(Path::new(&cleaned_partial));
@@ -355,12 +447,15 @@ pub fn complete_item(
                 cwd,
                 parts: Vec::new(),
                 isdir: false,
+                score: None,
             })
             .collect::<Vec<_>>(),
-        options,
+        ctx,
         want_directory,
         isdir,
-        options.match_algorithm == MatchAlgorithm::Prefix,
+        // A directory named exactly is the one meant, however loosely the last part matches:
+        // `crates/nu-cli/src/comp` stays in `crates/nu-cli/src/`.
+        true,
     )
     .into_iter()
     .map(|mut p| {
@@ -399,50 +494,37 @@ pub fn complete_item(
                 .map(lscolors::Style::to_nu_ansi_term_style)
                 .unwrap_or_default()
         });
-        let (value, display_override) = if let Some(escaped) = escape_path(&path) {
-            (escaped, Some(path))
-        } else {
-            (path, None)
+        let spelling = Spelling {
+            glob: true,
+            inside,
+            home: matches!(original_cwd, OriginalCwd::Home),
+            ..Spelling::default()
         };
-        FileSuggestion {
-            span,
-            path: value,
-            style,
-            is_dir,
-            display_override,
-            match_indices,
+        let (value, display_override) = match quote(&path, spelling) {
+            Cow::Borrowed(_) => (path, None),
+            Cow::Owned(quoted) => (quoted, Some(path)),
+        };
+        SemanticSuggestion {
+            score: p.score,
+            suggestion: Suggestion {
+                value,
+                style,
+                span: to_reedline_span(span, ctx.offset),
+                display_override,
+                match_indices: Some(match_indices),
+                // A directory goes on with what is in it.
+                append_whitespace: !is_dir,
+                ..Suggestion::default()
+            },
+            kind: Some(if is_dir {
+                SuggestionKind::Directory
+            } else {
+                SuggestionKind::File
+            }),
+            ..Default::default()
         }
     })
     .collect()
-}
-
-/// Fix files or folders with quotes or hashes.
-/// Returns `None` if nothing had to be escaped.
-pub fn escape_path(path: &str) -> Option<String> {
-    // make glob pattern have the highest priority.
-    if nu_glob::is_glob_with_backend(path) || path.contains('`') {
-        // expand home `~` for https://github.com/nushell/nushell/issues/13905
-        let pathbuf = nu_path::expand_tilde(path);
-        let path = pathbuf.to_string_lossy();
-        if path.contains('\'') {
-            // decide to use double quotes
-            // Path as Debug will do the escaping for `"`, `\`
-            Some(format!("{path:?}"))
-        } else {
-            Some(format!("'{path}'"))
-        }
-    } else {
-        let contaminated =
-            path.contains(['\'', '"', ' ', '#', '(', ')', '{', '}', '[', ']', '|', ';']);
-        let maybe_flag = path.starts_with('-');
-        let maybe_variable = path.starts_with('$');
-        let maybe_number = path.parse::<f64>().is_ok();
-        if contaminated || maybe_flag || maybe_variable || maybe_number {
-            Some(format!("`{path}`"))
-        } else {
-            None
-        }
-    }
 }
 
 pub struct AdjustView {
@@ -494,6 +576,7 @@ fn collapse_ndots(path: PathBuiltFromString) -> PathBuiltFromString {
         parts: Vec::with_capacity(path.parts.len()),
         isdir: path.isdir,
         cwd: path.cwd,
+        score: path.score,
     };
 
     let mut dot_count = 0;
@@ -522,4 +605,93 @@ fn collapse_ndots(path: PathBuiltFromString) -> PathBuiltFromString {
     }
 
     result
+}
+
+/// `text` as one word for a POSIX shell: bare when it holds only characters no
+/// shell treats specially, else in single quotes, each `'` written `'\''`.
+fn posix_quote(text: &str) -> Cow<'_, str> {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_./~@%+=:,-".contains(c);
+    if !text.is_empty() && text.chars().all(safe) {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(format!("'{}'", text.replace('\'', "'\\''")))
+    }
+}
+
+/// The name a word typed inside a string stands for: the string reads its escapes (a double
+/// quote does), then the remote shell reads the backslashes left.
+fn unescape_remote(typed: &str, inside: Quote) -> String {
+    /// Every backslash dropped, keeping the character it escapes.
+    fn unescape(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            out.push(if c == '\\' {
+                chars.next().unwrap_or(c)
+            } else {
+                c
+            });
+        }
+        out
+    }
+    match inside {
+        Quote::Double => unescape(&unescape(typed)),
+        Quote::Single | Quote::Backtick => unescape(typed),
+    }
+}
+
+/// `text` as one word for a POSIX shell without quotes: every character it treats specially
+/// escaped by a backslash. `None` for a newline, which a backslash does not escape.
+fn posix_escape(text: &str) -> Option<String> {
+    let safe = |c: char| c.is_alphanumeric() || "_./~@%+=:,-".contains(c);
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '\n' {
+            return None;
+        }
+        if !safe(c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    Some(escaped)
+}
+
+#[cfg(test)]
+mod remote_quote_tests {
+    use super::{Quote, posix_escape, posix_quote, remote_word, unescape_remote};
+
+    #[test]
+    fn remote_words_are_quoted_for_the_shell_that_reads_them() {
+        assert_eq!(posix_quote("logs/app.log"), "logs/app.log");
+        assert_eq!(posix_quote("a;b"), "'a;b'");
+        assert_eq!(posix_quote("it's"), "'it'\\''s'");
+        assert_eq!(posix_quote("$(rm)"), "'$(rm)'");
+        assert_eq!(posix_quote(""), "''");
+    }
+
+    #[test]
+    fn a_word_inside_a_string_is_valid_for_the_string_and_the_shell() {
+        assert_eq!(posix_escape("my notes").as_deref(), Some("my\\ notes"));
+        assert_eq!(posix_escape("a\nb"), None);
+        // What was inserted reads back as the name.
+        assert_eq!(unescape_remote("my\\ no", Quote::Single), "my no");
+        assert_eq!(unescape_remote("my\\\\ no", Quote::Double), "my no");
+
+        let single = Some(Quote::Single);
+        assert_eq!(remote_word("a;b c", single).as_deref(), Some("a\\;b\\ c"));
+        // A single-quoted string cannot hold a quote, so the name cannot be written in it.
+        assert_eq!(remote_word("it's", single), None);
+
+        // A double-quoted string reads its backslashes and quotes first.
+        let double = Some(Quote::Double);
+        assert_eq!(
+            remote_word("my notes", double).as_deref(),
+            Some("my\\\\ notes")
+        );
+        assert_eq!(
+            remote_word("say\"x\"", double).as_deref(),
+            Some("say\\\\\\\"x\\\\\\\"")
+        );
+    }
 }

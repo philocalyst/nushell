@@ -1,0 +1,49 @@
+# What `use`, `overlay use` and `source-env` take: the `.nu` files and the directories of the cwd and
+# the library directories (lib-dir1 and lib-dir3 by `const NU_LIB_DIRS`, lib-dir2 and lib-dir3 by
+# `$env.NU_LIB_DIRS`), the standard library, and what a module exports. By prefix.
+{
+  fixture: dotnu_completions
+  prelude: r#'
+    $env.config.completions.algorithm = 'prefix'
+    const NU_LIB_DIRS = ['{cwd}/lib-dir1' '{cwd}/lib-dir3']
+    $env.NU_LIB_DIRS = ['{cwd}/lib-dir2' '{cwd}/lib-dir3']
+  '#
+  cases: [
+    {test: dotnu_completions, line: "overlay use --", values: [--help --prefix --reload]}
+    {test: dotnu_completions, line: "use `./dir_module/", values: [./dir_module/mod.nu "`./dir_module/sub module/`"], paths: true}
+    {test: dotnu_completions, line: "use `./dir_module/sub module/`", values: ["`./dir_module/sub module/sub.nu`"], paths: true}
+    {test: dotnu_completions, line: "source-env ", values: [asdf.nu bar.nu bat.nu baz.nu foo.nu spam.nu xyzzy.nu dir_module/ lib-dir1/ lib-dir2/ lib-dir3/], paths: true}
+    {test: dotnu_completions, lines: ["use " "overlay use "], values: [std std-rfc asdf.nu bar.nu bat.nu baz.nu foo.nu spam.nu xyzzy.nu dir_module/ lib-dir1/ lib-dir2/ lib-dir3/], paths: true}
+    # A command that is not one of those takes any file.
+    {test: dont_use_dotnu_completions, line: "go work use `./dir_module/", values: [./dir_module/mod.nu ./dir_module/plain.txt "`./dir_module/sub module/`"]}
+    # https://github.com/nushell/nushell/issues/17021
+    {test: module_name_completions, setup: "module \"🤔🐘\" {\n  # module comment\n  # another comment\n}", line: "use 🤔", values: ["🤔🐘"], descriptions: ["module comment\nanother comment"]}
+    # A library file in lib-dir3, named by both, is offered once; `./` names the cwd alone.
+    {test: dotnu_completions_const_nu_lib_dirs, line: "use xyzz", values: [xyzzy.nu]}
+    {test: dotnu_completions_const_nu_lib_dirs, line: "use asdf", values: [asdf.nu]}
+    {test: dotnu_completions_const_nu_lib_dirs, line: "use spam", values: [spam.nu]}
+    {test: dotnu_completions_const_nu_lib_dirs, line: "use ./asdf", values: [./asdf.nu], cases: [{} {paths: true, os: windows}]}
+    {std: true, setup: r#'
+      export module "🤔🐘" {
+        export const foo = "🤔🐘";
+        # meow
+        # meow
+        #
+        # woem
+        export module bar {}
+      }
+    '#, cases: [
+      # `export  use` is `export use`; a trailing `/` lists the children of a virtual directory.
+      {test: dotnu_stdlib_completions, line: "export  use std/ass", values: [std/assert]}
+      {test: dotnu_stdlib_completions, line: "use \"std", values: [std std-rfc]}
+      {test: dotnu_stdlib_completions, line: "use std/", has: [std/iter std/assert]}
+      {test: exportable_completions, line: "use std null", values: [null-device null_device]}
+      {test: exportable_completions, line: "export use std/assert eq", values: [equal]}
+      {test: exportable_completions, line: "use std/assert \"not eq", values: ["\"not equal\""]}
+      {test: exportable_completions, line: "use std/math [E, `TAU", values: [TAU]}
+      {test: exportable_completions, lines: ["use std/math " "use std/math ["], values: [E GAMMA PHI PI TAU]}
+      {test: exportable_completions, line: "use 🤔🐘 'foo", values: [foo]}
+      {test: exportable_completions, line: "use 🤔🐘 b", values: [bar], descriptions: ["meow\nmeow"]}
+    ]}
+  ]
+}

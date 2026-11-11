@@ -1,0 +1,90 @@
+# A path is offered only where one is meant: for the argument of a command that takes a path, a glob
+# or a directory, for what an external program or a command with an untyped parameter (declared by
+# the user) is given, and for the target of a redirection. Nowhere else: not for the other types,
+# not after an operator, not in a condition, not at the start of a statement. The world's file and
+# directory are named so that nothing but a path can be taken for one.
+{
+  world: [zz-file.txt zz-dir/ other.md notes/inner.txt]
+  prelude: r#'
+    def untyped [a] {}
+    def typed-any [a: any] {}
+    def typed-int [a: int] {}
+    def typed-string [a: string] {}
+    def typed-bool [a: bool] {}
+    def typed-duration [a: duration] {}
+    def typed-record [a: record] {}
+    def typed-list [a: list] {}
+    def typed-closure [a: closure] {}
+    def typed-path [a: path] {}
+    def typed-glob [a: glob] {}
+    def typed-directory [a: directory] {}
+    def typed-oneof-path [a: oneof<int, path>] {}
+    def typed-oneof-plain [a: oneof<int, string>] {}
+    def two [a: string, b: path] {}
+    def rest-path [...rest: path] {}
+    def rest-int [...rest: int] {}
+    def flag-int [--number: int] {}
+    def flag-path [--path: path] {}
+    def noargs [] {}
+    def --wrapped wrapped [...rest] {}
+    extern ext-string [a: string]
+    extern ext-untyped [a]
+    extern ext-bare []
+  '#
+  cases: [
+    {test: paths_are_offered_only_where_a_path_is_meant, as_paths: [zz-file.txt zz-dir/], lines: [
+      "ls " "ls -l " "open " "source " "cp " "cp zz " "mv " "rm " "touch " "save " "ls | save "
+      "ls | to json | save --force " "glob " "typed-path " "typed-glob " "typed-oneof-path "
+      "rest-path " "rest-path zz " "flag-path --path " "untyped " "typed-any " "ext-untyped "
+      "ext-bare " "wrapped " "wrapped --flag " "two x " "^ls " "^ls -l " "git "
+      "some-program-nobody-has " "some-program-nobody-has --flag " "ls | each { |x| ^echo " "ls > "
+      "ls out> " "ls err> " "ls out+err> " "ls o> " "ls e> " "ls >> " "echo hi out> " "echo hi > "
+      "echo hi >> " "print 1 > " "(echo hi out> " "ls | each { ls " "do { ls " "def f [] { ls "
+      "if true { ls " "try { ls " "ls; ls " "ls\nls "
+    ]}
+    {test: paths_are_offered_only_where_a_path_is_meant, as_paths: [zz-dir/], no_paths: [zz-file.txt], lines: [
+      "cd " "typed-directory " "cd zz" "ls | each { cd "
+    ]}
+    {test: paths_are_offered_only_where_a_path_is_meant, no_paths: [zz-file.txt zz-dir/], lines: [
+      "typed-int " "typed-string " "typed-bool " "typed-duration " "typed-record " "typed-list "
+      "typed-closure " "typed-oneof-plain " "two " "rest-int " "rest-int 1 " "flag-int --number "
+      "ext-string " "noargs " "typed-int 1 " "cd zz-dir " "cd zz-dir zz-dir " "date now "
+      "ls | length " "ls | first 1 " "sleep 1sec " "echo " "echo hi " "print " "print hi " "append "
+      "prepend " "default " "insert foo " "upsert foo " "update foo " "find " "compact " "drop nth "
+      "sleep " "let x = " "let x: int = " "mut x = " "const x = " "$x = " "$env.FOO = "
+      "mut x = 1; $x = " "mut x = 1; $x += " "for x in " "if " "if true { 1 } else if " "while "
+      "match 1 { " "match 1 { 1 => " "alias foo = " "1 + " "1 == " "'a' =~ " "true and " "not " "! "
+      "2 + 3 " "not true " "1 2 " "mut x = 1; $x = 2 " "[1 2] " "{a: 1} " "1..3 " "(ls | length) > "
+      "if (ls | length) > " "if 1 > " "while 1 < " "ls | where name == " "ls | where name =~ "
+      "ls | where name not-in " "ls | where size > " "ls | where size > 1kb and name == "
+      "ls | where not name == " "ls | where ($it.name == " "ls | where " "ls | where name == dir "
+      "ls | where {|r| $r.name == " "ls | where {|r| $r.size > " "ls | each {|f| $f.name == "
+      "ls | each {|f| $f.name =~ " "ls | par-each {|f| $f.name == "
+      "ls | reduce {|it, acc| $it.name == " "ls | update name {|r| $r.name == "
+      "ls | each { $in.name == " "ls | each {|f| if $f.name == "
+      "ls | each {|f| if $f.type == dir and $f.name == " "ls | each {|f| match $f.name { "
+      "ls | each {|f| match $f.name { 'a' => 1, _ if $f.name == " "ls | get name | where $it == "
+      "ls | get name | each {|n| $n == " "ls | try { $in | where name == "
+      "try { ls | where name == " "do { ls | where name == " "for x in (ls) { $x.name == "
+      "let rows = (ls); $rows | where name == " "(ls | where name == " "$\"abc (ls | where name == "
+      "\"zz" "'zz" "\"zz-file " "$\"zz" "$\"zz (ls | length) " "$\"zz (ls | length) zz" "`zz-fi"
+      "1sec" "1kb" "12" "-" "[1 2" "[zz" "{a: " "{a: zz" "{zz" "(" "$" "$z" "$env." "ls | " "(ls | "
+      "do { " "try { " "ls | each {|x| " "ls | each { " "ls | each {|x| ls | " "$\"abc ("
+      "$\"abc (ls | " "ls | where (" "ls; " "1 | "
+    ]}
+    # The start of a statement in a block offers commands, as the start of a line does.
+    {test: the_start_of_a_statement_in_a_block_is_for_a_command, has: [ls all], lines: [
+      "(" "(ls | " "do { " "try { " "ls | each {|x| " "ls | each { ls | " "if true { " "$\"abc ("
+    ]}
+    # A brace right against the cursor may open a record, not a block: no command is meant yet.
+    {test: the_start_of_a_statement_in_a_block_is_for_a_command, lacks: [ls], lines: ["do {" "ls | each {|x|" "{a: "]}
+    # A typed prefix still completes inside the argument of a command that takes paths, in any block.
+    {test: a_prefix_still_completes_a_path_where_one_is_meant, has: [zz-file.txt], lines: [
+      "ls zz-f" "open zz-f" "typed-path zz-f" "untyped zz-f" "ls | each { ls zz-f" "ls out> zz-f" "ls | save zz-f" "(ls zz-f"
+    ]}
+    # A name that matches no path poorly: the closest are not offered for what is no path.
+    {test: a_prefix_still_completes_a_path_where_one_is_meant, no_paths: [zz-file.txt zz-dir/], lines: [
+      "typed-int zz-f" "typed-string zz-f" "echo zz-f" "1 + zz-f" "let x = zz-f"
+    ]}
+  ]
+}

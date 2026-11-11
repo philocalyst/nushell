@@ -23,6 +23,8 @@ nu-cmd-lang = { workspace = true, features = ["os"] }
 nu-command = { workspace = true, features = ["os"] }
 nu-std.workspace = true
 nu-test-support = { path = "../nu-test-support", features = ["os"] }
+nuon.workspace = true
+proptest = { workspace = true }
 rstest = { workspace = true, default-features = false }
 tempfile = { workspace = true }
 
@@ -38,7 +40,9 @@ nu-protocol = { workspace = true, features = ["os"] }
 nu-config.workspace = true
 nu-utils.workspace = true
 nu-color-config.workspace = true
+nu-table.workspace = true
 nu-experimental.workspace = true
+nu-system.workspace = true
 nu-ansi-term.workspace = true
 reedline = { workspace = true, features = ["bashisms"] }
 
@@ -60,6 +64,9 @@ unicode-width = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 which = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["user"] }
 
 [features]
 plugin = ["nu-plugin-engine"]

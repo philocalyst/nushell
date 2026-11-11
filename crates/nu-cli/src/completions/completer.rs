@@ -1,112 +1,106 @@
 use crate::completions::{
-    ArgValueCompletion, AttributableCompletion, AttributeCompletion, CellPathCompletion,
-    CommandCompletion, CommandScope, Completer, CompletionOptions, DotNuCompletion,
-    EnvVarCompletion, FileCompletion, FlagCompletion, NuMatcher, OperatorCompletion,
-    VariableCompletion,
-    base::{Fetched, SemanticSuggestion},
+    ArgValueCompletion, CommandScope, CompletionOptions, Details, HelpAt, HelpFor,
+    SemanticSuggestion, Slot, Source, ask, ask_fallback,
+    base::to_reedline_span,
+    cache::{CacheEnv, CacheView, CompletionCache},
+    command_completions::{self, executable_files},
+    delegation::{self, Delegation, Sources, WRAPPERS},
+    piped::{self, Flow, Nest},
+    placeholder,
+    trace::Trace,
+    usage::{HistoryReader, UsageIndex},
 };
-use lru::LruCache;
-use nu_parser::{parse, parse_shorter_head_reading};
+use crate::syntax_highlight::{LineParseCache, NuHighlighter};
+use nu_parser::{FlatShape, parse_probed};
 use nu_protocol::{
     BlockId, BuiltinCompletion, CommandWideCompleter, Completion, Config, DeclId, Flag, Record,
-    Signature, Span, SuggestionKind, SyntaxShape, Value,
+    Signature, Span, SuggestionKind, SyntaxShape, Type, Value, VarId,
     ast::{
-        Argument, AttributeBlock, Block, Call, Expr, Expression, ExternalArgument, FlagRef,
-        FullCellPath, PipelineRedirection, RedirectionTarget, Traverse,
+        Argument, Block, Call, Comparison, Expr, Expression, FlagRef, FullCellPath, Operator,
+        PathMember, Traverse,
     },
-    engine::{ArgType, Closure, Command, EngineState, Stack, StateWorkingSet},
+    engine::{
+        ArgType, Closure, Command, CommandType, EngineState, Expect, Expected, Probe, Stack,
+        StateWorkingSet,
+    },
 };
-use nu_utils::time::Instant;
+
+use nu_utils::NuCow;
 use reedline::{
-    Completer as ReedlineCompleter, CompletionOrigin, CompletionResult, CompletionStatus,
-    Suggestions,
+    Completer as ReedlineCompleter, Completions, History, Opening, Preview, Reply, Request,
+    Suggestion,
 };
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::num::NonZeroUsize;
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
-use std::{borrow::Cow, ops::ControlFlow, path::is_separator};
 
-const DEFAULT_CACHE_SIZE: usize = 100;
+/// A shared list of suggestions, as the cache keeps it.
+pub(crate) type Suggestions = Arc<[Suggestion]>;
+use std::{borrow::Cow, ops::ControlFlow};
 
-use super::{
-    StaticCompletion,
-    custom_completions::{DeclaredInputs, UserCompletion, completer_input},
-};
+use super::custom_completions::{DeclaredInputs, UserCompletion, completer_input};
+use super::taking;
 
-fn find_pipeline_element_by_position<'a>(
-    expr: &'a Expression,
-    working_set: &'a StateWorkingSet,
-    pos: usize,
-) -> ControlFlow<Option<&'a Expression>> {
-    if !expr.span.contains(pos) && expr.span.end != pos {
-        return ControlFlow::Break(None);
+/// `found` without what the call has been given already: the columns before the cursor in
+/// `select name type ⌶`, and the flags in `ls -a -⌶` of a command that takes a flag once. A word
+/// a rest parameter could take twice is still there to type.
+fn leave_out_what_is_written(
+    found: &mut Vec<SemanticSuggestion>,
+    site: &CompletionSite,
+    call: &Call,
+    signature: &Signature,
+    working_set: &StateWorkingSet,
+    offset: usize,
+) {
+    // A completer for the whole command knows what the command's arguments can repeat, and
+    // short of the end of the call the word at the cursor may be one being changed.
+    if signature.complete.is_some() || site.span.end < call.span().end {
+        return;
     }
-
-    let recurse = |e: &'a Expression| find_pipeline_element_by_position(e, working_set, pos);
-    let found = |x| ControlFlow::Break(Some(x));
-    let or_self = |opt: Option<&'a Expression>| opt.map_or(found(expr), found);
-
-    match &expr.expr {
-        Expr::RowCondition(block_id)
-        | Expr::Subexpression(block_id)
-        | Expr::Block(block_id)
-        | Expr::Closure(block_id) => {
-            let block = working_set.get_block(*block_id);
-            check_redirection_in_block(block, pos).map_or(ControlFlow::Continue(()), found)
+    let before = |span: Span| span.end <= site.span.start;
+    let text = |span: Span| String::from_utf8_lossy(working_set.get_span_contents(span));
+    match &site.kind {
+        SiteKind::Positional { sig_positional, .. }
+            if *sig_positional
+                >= signature.required_positional.len() + signature.optional_positional.len() =>
+        {
+            let given: Vec<_> = (call.arguments.iter())
+                .filter(|argument| {
+                    matches!(argument, Argument::Positional(_) | Argument::Unknown(_))
+                })
+                .map(Argument::span)
+                .filter(|span| before(*span))
+                .map(|span| text(span).trim_matches(['\'', '"', '`']).to_owned())
+                .collect();
+            // A completer that says what it replaces has placed its answer itself.
+            let token = to_reedline_span(site.span, offset);
+            found.retain(|item| {
+                item.suggestion.span != token || !given.contains(&item.suggestion.value)
+            });
         }
-        Expr::Call(call) => or_self(
-            call.arguments
-                .iter()
-                .find_map(|arg| arg.expr().and_then(|e| e.find_map(working_set, &recurse))),
-        ),
-        Expr::ExternalCall(head, arguments) => or_self(
-            arguments
-                .iter()
-                .find_map(|arg| arg.expr().find_map(working_set, &recurse))
-                .or_else(|| {
-                    // `touches` includes the head's trailing edge (#7648).
-                    touches(head.span, pos)
-                        .then(|| head.as_ref().find_map(working_set, &recurse))
-                        .flatten()
-                }),
-        ),
-        Expr::BinaryOp(lhs, _, rhs) => or_self(
-            lhs.find_map(working_set, &recurse)
-                .or_else(|| rhs.find_map(working_set, &recurse)),
-        ),
-        Expr::FullCellPath(fcp) => {
-            // `use std/util [E, T⌶`: the import list is the enclosing call's slot.
-            if touches(fcp.head.span, pos) && matches!(fcp.head.expr, Expr::List(_)) {
-                return ControlFlow::Continue(());
-            }
-            or_self(fcp.head.find_map(working_set, &recurse))
+        SiteKind::FlagName { .. } if !signature.allows_unknown_args => {
+            let given: Vec<_> = (call.arguments.iter())
+                .filter_map(|argument| match argument {
+                    Argument::Named(named) if before(argument.span()) => {
+                        find_flag(signature, FlagRef::from_named(&named.0, named.1.as_ref()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            found.retain(|item| {
+                let value = item.suggestion.value.trim_start_matches('-');
+                !given.iter().any(|flag| {
+                    flag.long == value || flag.short.is_some_and(|short| value == short.to_string())
+                })
+            });
         }
-        Expr::Var(_) => found(expr),
-        Expr::AttributeBlock(ab) => or_self(
-            ab.attributes
-                .iter()
-                .map(|attr| &attr.expr)
-                .chain(std::iter::once(ab.item.as_ref()))
-                .find_map(|e| e.find_map(working_set, &recurse)),
-        ),
-        _ => ControlFlow::Continue(()),
+        _ => {}
     }
 }
 
-/// True if expr owns trailing gap after its span.
-fn owns_trailing_gap(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Call(_) | Expr::ExternalCall(_, _) | Expr::AttributeBlock(_)
-    )
-}
-
-/// Whether `pos` is inside `span` or at its trailing edge.
-pub(crate) fn touches(span: Span, position: usize) -> bool {
-    span.contains(position) || span.end == position
-}
+pub(crate) use nu_protocol::engine::probe::touches;
 
 /// The block a nesting expression runs.
 fn nested_block(expr: &Expression) -> Option<BlockId> {
@@ -119,22 +113,32 @@ fn nested_block(expr: &Expression) -> Option<BlockId> {
     }
 }
 
-/// The block the cursor descends into from `element`, and its span.
-fn descent_from<'a>(
+/// The nesting expression the cursor descends into from `element`.
+fn descent_expression<'a>(
     element: &'a Expression,
     working_set: &'a StateWorkingSet,
     pos: usize,
-) -> Option<(BlockId, Span)> {
+) -> Option<&'a Expression> {
     element.find_map(working_set, &|expr: &'a Expression| {
         if !touches(expr.span, pos) {
             // Skip this subtree; the caller keeps searching its siblings.
             return ControlFlow::Break(None);
         }
         match nested_block(expr) {
-            Some(block_id) => ControlFlow::Break(Some((block_id, expr.span))),
+            Some(_) => ControlFlow::Break(Some(expr)),
             None => ControlFlow::Continue(()),
         }
     })
+}
+
+/// The block the cursor descends into from `element`, and its span.
+fn descent_from<'a>(
+    element: &'a Expression,
+    working_set: &'a StateWorkingSet,
+    pos: usize,
+) -> Option<(BlockId, Span)> {
+    let expression = descent_expression(element, working_set, pos)?;
+    Some((nested_block(expression)?, expression.span))
 }
 
 /// The element the cursor is on; a trailing gap belongs to the last.
@@ -152,41 +156,54 @@ fn element_at<'a>(
         .or_else(|| trailing_gap_element(block, working_set, pos))
 }
 
+/// An element enclosing the cursor, the span of the nesting expression the cursor descends into
+/// from it, and the block that holds it.
+type Enclosing<'a> = (&'a Expression, Option<Span>, &'a Block);
+
+/// What flows into a command begun right after a pipe (`ls | ⌶`): what the last pipeline of
+/// `block` leaves flowing, when only that pipe lies between its end and the cursor.
+fn after_pipe(
+    block: &Block,
+    working_set: &StateWorkingSet,
+    cursor: usize,
+    flow: &Flow,
+) -> Option<Type> {
+    let pipeline = block.pipelines.last()?;
+    let end = pipeline.elements.last()?.expr.span.end;
+    let gap = working_set.get_span_contents(Span::new(end, cursor.max(end)));
+    (gap.trim_ascii() == b"|")
+        .then(|| flow.flowing_into(&pipeline.elements, pipeline.elements.len()))
+        .flatten()
+}
+
+/// The nests of `chain`: each element with what flows into it.
+fn nests_of<'a>(chain: &[Enclosing<'a>], flow: &Flow) -> Vec<Nest<'a>> {
+    let mut nests = Vec::with_capacity(chain.len());
+    for &(element, _, block) in chain {
+        let nest = flow.nest(element, block, &nests);
+        nests.push(nest);
+    }
+    nests
+}
+
 /// The elements enclosing the cursor, outermost first.
 fn enclosing_elements<'a>(
     block: &'a Block,
     working_set: &'a StateWorkingSet,
     pos: usize,
-) -> Vec<(&'a Expression, Option<Span>)> {
+) -> Vec<Enclosing<'a>> {
     let mut chain = Vec::new();
     let mut block = block;
 
     while let Some(element) = element_at(block, working_set, pos) {
         let descent = descent_from(element, working_set, pos);
-        chain.push((element, descent.map(|(_, span)| span)));
+        chain.push((element, descent.map(|(_, span)| span), block));
 
         let Some((block_id, _)) = descent else { break };
         block = working_set.get_block(block_id);
     }
 
     chain
-}
-
-/// The expression the cursor completes; a strictly inner chain element beats the search.
-fn innermost_expression<'a>(
-    found: Option<&'a Expression>,
-    chain: &[(&'a Expression, Option<Span>)],
-) -> Option<&'a Expression> {
-    let innermost = chain.last().map(|&(element, _)| element);
-    let (Some(outer), Some(inner)) = (found, innermost) else {
-        return found.or(innermost);
-    };
-
-    let strictly_inside = outer.span.start <= inner.span.start
-        && inner.span.end <= outer.span.end
-        && inner.span != outer.span;
-
-    Some(if strictly_inside { inner } else { outer })
 }
 
 /// The last element when the cursor trails it over whitespace.
@@ -209,17 +226,29 @@ fn trailing_gap_element<'a>(
         .then_some(expression)
 }
 
-/// The span a command-name completion replaces. A parsed file may have arguments after the
-/// cursor; those are not part of the command name. Keep the wider interactive span for an
-/// unfinished multiword command, where the parser may read its last word as an argument.
-fn command_name_span(head: Span, element: Span, cursor: usize) -> Span {
-    if cursor < head.start {
-        Span::point(cursor)
-    } else if element.end > cursor {
-        head
-    } else {
-        Span::new(head.start, head.end.max(element.end))
+/// Adds `subcommands` to `found`. Each value in `found` that names a subcommand of `parent`
+/// (`checkout`, after `git`) becomes that command, so it is tagged and previewed as one, and the
+/// same command among `subcommands`, there under its full name, is not offered twice.
+fn link_subcommands(
+    found: &mut Vec<SemanticSuggestion>,
+    mut subcommands: Vec<SemanticSuggestion>,
+    parent: &str,
+    working_set: &StateWorkingSet,
+) {
+    let mut linked = HashSet::new();
+    for item in found.iter_mut() {
+        if !matches!(item.kind, None | Some(SuggestionKind::Value(_))) {
+            continue;
+        }
+        let name = format!("{parent} {}", item.suggestion.value);
+        if let Some(decl_id) = working_set.find_decl(name.as_bytes()) {
+            let command_type = working_set.get_decl(decl_id).command_type();
+            item.kind = Some(SuggestionKind::Command(command_type, Some(decl_id)));
+            linked.insert(name);
+        }
     }
+    subcommands.retain(|subcommand| !linked.contains(&subcommand.suggestion.value));
+    found.extend(subcommands);
 }
 
 /// Whether the token starts a flag; in-progress flags parse as positionals.
@@ -227,82 +256,12 @@ pub(crate) fn is_flag_text(token: impl AsRef<[u8]>) -> bool {
     token.as_ref().starts_with(b"-")
 }
 
-/// [`is_flag_text`] for the token occupying `span`.
-fn is_flag_token(working_set: &StateWorkingSet, span: Span) -> bool {
-    is_flag_text(working_set.get_span_contents(span))
-}
-
-/// Whether `expr` can be an operator's left-hand side.
-fn is_operator_lhs(expr: &Expr) -> bool {
-    match expr {
-        Expr::Int(_)
-        | Expr::Float(_)
-        | Expr::Binary(_)
-        | Expr::Bool(_)
-        | Expr::String(_)
-        | Expr::RawString(_)
-        | Expr::StringInterpolation(_)
-        | Expr::GlobInterpolation(_, _)
-        | Expr::DateTime(_)
-        | Expr::ValueWithUnit(_)
-        | Expr::Range(_)
-        | Expr::FullCellPath(_)
-        | Expr::CellPath(_)
-        | Expr::Var(_)
-        | Expr::List(_)
-        | Expr::Record(_)
-        | Expr::Table(_)
-        | Expr::Nothing
-        | Expr::Subexpression(_)
-        | Expr::Block(_)
-        | Expr::Closure(_)
-        // `-$x` is one operand that binds tighter than every operator, like `-5`.
-        | Expr::UnaryMinus(_) => true,
-        Expr::AttributeBlock(_)
-        | Expr::VarDecl(_)
-        | Expr::Call(_)
-        | Expr::ExternalCall(_, _)
-        | Expr::Operator(_)
-        | Expr::RowCondition(_)
-        | Expr::UnaryNot(_)
-        | Expr::BinaryOp(_, _, _)
-        | Expr::Collect(_, _)
-        | Expr::MatchBlock(_)
-        | Expr::Keyword(_)
-        | Expr::Filepath(_, _)
-        | Expr::Directory(_, _)
-        | Expr::GlobPattern(_, _)
-        | Expr::ImportPattern(_)
-        | Expr::Overlay(_)
-        | Expr::Signature(_)
-        | Expr::Garbage => false,
-    }
-}
-
 /// The flag a [`FlagRef`] refers to, preserving the long/short distinction.
-fn find_flag(signature: &Signature, flag: FlagRef<'_>) -> Option<Flag> {
+pub(crate) fn find_flag(signature: &Signature, flag: FlagRef<'_>) -> Option<Flag> {
     match flag {
         FlagRef::Long(n) => signature.get_long_flag(n),
         FlagRef::Short(s) => s.chars().next().and_then(|c| signature.get_short_flag(c)),
     }
-}
-
-/// The [`FlagRef`] of a last-argument flag still awaiting its value.
-pub(crate) fn pending_flag_value<'a>(
-    call: &'a Call,
-    working_set: &StateWorkingSet,
-) -> Option<FlagRef<'a>> {
-    let Argument::Named((name, short, None)) = call.arguments.last()? else {
-        return None;
-    };
-
-    let flag_ref = FlagRef::from_named(name, short.as_ref());
-    let signature = working_set.get_decl(call.decl_id).signature();
-
-    find_flag(&signature, flag_ref)?
-        .arg
-        .is_some()
-        .then_some(flag_ref)
 }
 
 /// Positional arguments before `before_index`.
@@ -323,163 +282,498 @@ pub(crate) struct CallSite<'a> {
     pub element: &'a Expression,
 }
 
-/// A call's `Expr::RowCondition` argument. Values of this type prove the
-/// condition exists, so operator/value-gap reads share one lookup and one
-/// signature-slot rule instead of re-searching the arguments each time.
-#[derive(Debug, Clone, Copy)]
-struct RowCondition<'a> {
-    site: CallSite<'a>,
-    arg_slot: usize,
-    block_id: BlockId,
-    arg_span: Span,
-}
-
-impl<'a> RowCondition<'a> {
-    fn find(site: CallSite<'a>, want: Option<Span>) -> Option<Self> {
-        site.call
-            .arguments
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(arg_slot, arg)| match arg {
-                Argument::Positional(Expression {
-                    expr: Expr::RowCondition(block_id),
-                    span,
-                    ..
-                }) if want.is_none_or(|wanted| wanted == *span) => Some(Self {
-                    site,
-                    arg_slot,
-                    block_id: *block_id,
-                    arg_span: *span,
-                }),
-                _ => None,
-            })
-    }
-
-    /// The trailing condition of `site`, if any.
-    fn trailing(site: CallSite<'a>) -> Option<Self> {
-        Self::find(site, None)
-    }
-
-    /// The condition whose span is `descent_span` (a File leaf promoting outward), if any.
-    fn matching(site: CallSite<'a>, descent_span: Span) -> Option<Self> {
-        Self::find(site, Some(descent_span))
-    }
-
-    /// Declared slot of the condition (e.g. 0 for `where`), not raw arg position, so a
-    /// leading path arg cannot steal the condition's index.
-    fn index(&self, working_set: &StateWorkingSet) -> usize {
-        fn is_cond(shape: &SyntaxShape) -> bool {
-            matches!(shape, SyntaxShape::RowCondition)
-                || matches!(shape, SyntaxShape::OneOf(shapes) if shapes.iter().any(is_cond))
-        }
-        let signature = working_set.get_decl(self.site.call.decl_id).signature();
-        signature
-            .required_positional
-            .iter()
-            .chain(signature.optional_positional.iter())
-            .enumerate()
-            .find(|(_, p)| is_cond(&p.shape))
-            .map(|(i, _)| i)
-            .unwrap_or_else(|| count_positionals(self.site.call, self.arg_slot))
-    }
-
-    /// Positional site for this condition.
-    fn site_at(
-        &self,
-        working_set: &StateWorkingSet,
-        cursor: usize,
-        span: Span,
-    ) -> CompletionSite<'a> {
-        CompletionSite::at(
-            cursor,
-            SiteKind::Positional {
-                site: self.site,
-                sig_positional: self.index(working_set),
-                arg_slot: self.arg_slot,
-            },
-            span,
-        )
-    }
-
-    /// Last term of the condition body.
-    fn last_term(&self, working_set: &'a StateWorkingSet) -> Option<&'a Expression> {
-        Some(
-            &working_set
-                .get_block(self.block_id)
-                .pipelines
-                .last()?
-                .elements
-                .last()?
-                .expr,
-        )
-    }
-}
-
-/// A File leaf inside a row condition is really the enclosing condition positional.
-fn promote_row_condition_file<'a>(
-    site: CompletionSite<'a>,
-    chain: &[(&'a Expression, Option<Span>)],
-    working_set: &StateWorkingSet,
-    cursor: usize,
-) -> CompletionSite<'a> {
-    if !matches!(site.kind, SiteKind::File) {
-        return site;
-    }
-    for &(element, descent) in chain {
-        let Some(descent_span) = descent else {
-            continue;
-        };
-        let Expr::Call(call) = &element.expr else {
-            continue;
-        };
-        if let Some(cond) = RowCondition::matching(CallSite { call, element }, descent_span) {
-            return cond.site_at(working_set, cursor, site.span);
-        }
-    }
-    site
-}
-
-/// A redirection target the cursor touches, as a file path.
-fn check_redirection_target(target: &RedirectionTarget, pos: usize) -> Option<&Expression> {
-    let expr = target.expr();
-    expr.and_then(|expression| {
-        if let Expr::String(_) = expression.expr
-            && touches(expression.span, pos)
-        {
-            expr
+/// The first expression around `at`, outermost first, of `block` or of the probe's own readings,
+/// that `is` picks.
+fn find_expression<'a>(
+    block: &'a Block,
+    probe: &'a Probe,
+    working_set: &'a StateWorkingSet,
+    at: usize,
+    is: impl Fn(&Expression) -> bool,
+) -> Option<&'a Expression> {
+    let visit = |expression: &'a Expression| {
+        if is(expression) {
+            ControlFlow::Break(Some(expression))
+        } else if touches(expression.span, at) {
+            ControlFlow::Continue(())
         } else {
-            None
+            ControlFlow::Break(None)
         }
+    };
+    block.find_map(working_set, &visit).or_else(|| {
+        (probe.readings.iter()).find_map(|reading| reading.find_map(working_set, &visit))
     })
 }
 
-/// A redirection target the cursor touches, in any block.
-fn check_redirection_in_block(block: &Block, pos: usize) -> Option<&Expression> {
-    block
-        .pipelines
-        .iter()
-        .flat_map(|p| &p.elements)
-        .filter_map(|e| e.redirection.as_ref())
-        .find_map(|redir| match redir {
-            PipelineRedirection::Single { target, .. } => check_redirection_target(target, pos),
-            PipelineRedirection::Separate { out, err } => {
-                check_redirection_target(out, pos).or_else(|| check_redirection_target(err, pos))
-            }
+/// The narrowest argument of a call around `inner` that the probe heard, if any.
+fn argument_around<'a>(probe: &'a Probe, inner: &Expected) -> Option<&'a Expected> {
+    // A parse the parser went back on comes before the one it kept.
+    (probe.found.iter().rev())
+        .filter(|outer| {
+            matches!(
+                outer.what,
+                Expect::Positional { .. } | Expect::Flag { .. } | Expect::FlagValue { .. }
+            ) && outer.within.contains_span(inner.within)
+                && outer.within != inner.within
         })
+        .min_by_key(|outer| outer.within.len())
 }
 
-/// The text typed up to the cursor; also the worker message identity.
+/// The call an expectation `found` of the probe is an argument of, as a [`CallSite`]: the one
+/// whose head starts where it does, of its command, or of another, which a keyword such as
+/// `export` may make of the call once it is parsed.
+fn call_of<'a>(
+    found: &Expected,
+    block: &'a Block,
+    probe: &'a Probe,
+    working_set: &'a StateWorkingSet,
+) -> Option<CallSite<'a>> {
+    let (Expect::Positional { decl_id, .. }
+    | Expect::Flag { decl_id }
+    | Expect::FlagValue { decl_id, .. }
+    | Expect::Command {
+        parent: Some(decl_id),
+    }) = found.what
+    else {
+        return None;
+    };
+    let head = found.within.start;
+    let call = |decl: Option<DeclId>| {
+        find_expression(block, probe, working_set, head, move |expression| {
+            matches!(&expression.expr, Expr::Call(call)
+                if call.head.start == head && decl.is_none_or(|decl| decl == call.decl_id))
+        })
+    };
+    let element = call(Some(decl_id)).or_else(|| call(None))?;
+    match &element.expr {
+        Expr::Call(call) => Some(CallSite { call, element }),
+        _ => None,
+    }
+}
+
+/// Whether a value of `shape` is a condition on a row.
+/// Whether the parser read every part of `expression`.
+fn readable(expression: &Expression) -> bool {
+    match &expression.expr {
+        Expr::Garbage => false,
+        Expr::BinaryOp(lhs, op, rhs) => readable(lhs) && readable(op) && readable(rhs),
+        _ => true,
+    }
+}
+
+/// The keywords a parameter of `shape` starts with.
+fn keywords_of(shape: Option<&SyntaxShape>) -> Vec<String> {
+    match shape {
+        Some(SyntaxShape::Keyword(keyword, _)) => vec![String::from_utf8_lossy(keyword).into()],
+        Some(SyntaxShape::OneOf(shapes)) => {
+            shapes.iter().flat_map(|s| keywords_of(Some(s))).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn is_condition(shape: &SyntaxShape) -> bool {
+    match shape {
+        SyntaxShape::RowCondition => true,
+        SyntaxShape::OneOf(shapes) => shapes.iter().any(is_condition),
+        _ => false,
+    }
+}
+
+/// The call around `inner` whose row condition it is in, the condition's index among the call's
+/// parameters, and among its arguments.
+fn condition_around<'a>(
+    inner: &Expected,
+    probe: &'a Probe,
+    block: &'a Block,
+    working_set: &'a StateWorkingSet,
+) -> Option<(CallSite<'a>, usize, usize)> {
+    let outer = argument_around(probe, inner)?;
+    let site = call_of(outer, block, probe, working_set)?;
+    let signature = working_set.get_decl(site.call.decl_id).signature();
+    let index = (signature.required_positional.iter())
+        .chain(&signature.optional_positional)
+        .position(|parameter| is_condition(&parameter.shape))?;
+    let arg_slot = (site.call.arguments.iter()).position(|argument| {
+        matches!(
+            argument.expr().map(|e| &e.expr),
+            Some(Expr::RowCondition(_))
+        )
+    })?;
+    Some((site, index, arg_slot))
+}
+
+/// The parameter of a call whose condition or closure the cursor is in, which has help for what
+/// is written in it.
+fn help_around(
+    probe: &Probe,
+    block: &Block,
+    working_set: &StateWorkingSet,
+    cursor: usize,
+) -> Option<Arc<HelpAt>> {
+    let (_, decl_id, index) = (probe.found.iter())
+        .filter(|outer| outer.span.start < cursor && touches(outer.span, cursor))
+        .filter_map(|outer| {
+            let Expect::Positional { decl_id, index, .. } = outer.what else {
+                return None;
+            };
+            let call = call_of(outer, block, probe, working_set)?.call;
+            (call.positional_iter())
+                .any(|argument| {
+                    argument.span == outer.span
+                        && matches!(argument.expr, Expr::RowCondition(_) | Expr::Closure(_))
+                })
+                .then_some((outer.span.len(), decl_id, index))
+        })
+        .min()?;
+    let (command, slot) = (HelpFor::Decl(decl_id), Slot::Positional(index));
+    Some(Arc::new(HelpAt { command, slot }))
+}
+
+/// What the probe's expectations `found` (the innermost, of one reading of the line) make of the
+/// cursor, and what a suggestion replaces. The most specific comes first: a construct inside an
+/// argument, such as an operand, before the argument, and a positional before a flag where either
+/// may be written. One the parse holds nothing for leaves it to the next.
+fn kind_of<'a>(
+    found: &[&'a Expected],
+    probe: &'a Probe,
+    block: &'a Block,
+    working_set: &'a StateWorkingSet,
+    cursor: usize,
+) -> (SiteKind<'a>, Span) {
+    let rank = |found: &&Expected| match found.what {
+        Expect::Attributable => 0,
+        Expect::AttributeName => 1,
+        Expect::Redirection => 2,
+        Expect::MatchPattern => 3,
+        Expect::Operand { .. } | Expect::Negated => 4,
+        Expect::Operator { .. } => 5,
+        Expect::Member { .. } => 6,
+        Expect::Variable => 7,
+        Expect::FlagValue { .. } => 8,
+        Expect::Positional { .. } => 9,
+        Expect::Flag { .. } => 10,
+        Expect::Command { parent: Some(_) } => 11,
+        Expect::Command { parent: None } => 12,
+        Expect::ExternalArg { .. } => 13,
+        Expect::RecordKey { .. } => 14,
+    };
+    // A parse the parser went back on comes before the one it kept.
+    let mut found: Vec<&Expected> = found.iter().rev().copied().collect();
+    found.sort_by_key(rank);
+    (found.into_iter())
+        .find_map(|found| read(found, probe, block, working_set, cursor))
+        .unwrap_or((SiteKind::Literal, Span::point(cursor)))
+}
+
+/// What one expectation of the probe makes of the cursor, if the parse holds what it is about.
+fn read<'a>(
+    found: &'a Expected,
+    probe: &'a Probe,
+    block: &'a Block,
+    working_set: &'a StateWorkingSet,
+    cursor: usize,
+) -> Option<(SiteKind<'a>, Span)> {
+    let span = found.span;
+    // An expression the probe holds, as the parse kept it: an attempt the parser went back on
+    // has variables of its own.
+    let kept = |expression: &'a Expression| {
+        let kind = std::mem::discriminant(&expression.expr);
+        find_expression(block, probe, working_set, expression.span.start, |kept| {
+            kept.span == expression.span && std::mem::discriminant(&kept.expr) == kind
+        })
+        .unwrap_or(expression)
+    };
+    // A new operand of a row condition, after `and` or `not`, may be any of its columns.
+    let term = || {
+        let (site, sig_positional, arg_slot) = condition_around(found, probe, block, working_set)?;
+        Some(SiteKind::Positional {
+            site,
+            sig_positional,
+            arg_slot,
+        })
+    };
+    // What a cell path of a variable is compared with is among the values it holds.
+    let compared = |subject: &'a Expression, comparison| match &subject.expr {
+        Expr::FullCellPath(path) if let Expr::Var(head) = path.head.expr => SiteKind::Operand {
+            head,
+            members: path.tail.clone(),
+            comparison,
+        },
+        _ => SiteKind::Literal,
+    };
+    let kind = match &found.what {
+        // A record's keys are what `records::help` offers.
+        Expect::RecordKey { .. } => return None,
+        Expect::Attributable => SiteKind::AttributableItem,
+        Expect::AttributeName => SiteKind::AttributeName,
+        Expect::Redirection => SiteKind::File,
+        Expect::Variable => SiteKind::Variable,
+        // An operand with words the parser could not read takes no operator: it was read by an
+        // attempt the parser went back on, as `if true { ls } else` once read as a condition.
+        Expect::Operator { lhs } if readable(lhs) => {
+            let lhs = kept(lhs);
+            // An operator typed after a comparison's value goes on with the whole comparison.
+            let compared = find_expression(block, probe, working_set, lhs.span.start, |whole| {
+                matches!(&whole.expr, Expr::BinaryOp(_, op, rhs)
+                    if rhs.span == lhs.span && matches!(op.expr, Expr::Operator(Operator::Comparison(_))))
+            });
+            SiteKind::Operator {
+                lhs: compared.unwrap_or(lhs),
+            }
+        }
+        Expect::Operator { .. } => return None,
+        Expect::Member { .. } => {
+            let path = find_expression(block, probe, working_set, cursor, |expression| {
+                expression.span == found.within && matches!(expression.expr, Expr::FullCellPath(_))
+            })?;
+            let Expr::FullCellPath(full) = &path.expr else {
+                return None;
+            };
+            return Some((SiteKind::CellPath { path: full }, path.span));
+        }
+        Expect::Operand {
+            lhs,
+            operator: Operator::Comparison(comparison),
+        } => match compared(kept(lhs), *comparison) {
+            SiteKind::Literal => SiteKind::Variable,
+            kind => kind,
+        },
+        Expect::Operand {
+            operator: Operator::Boolean(_),
+            ..
+        }
+        | Expect::Negated => term().unwrap_or(SiteKind::Variable),
+        Expect::Operand { .. } => SiteKind::Variable,
+        // A pattern is compared with what is matched.
+        Expect::MatchPattern => {
+            let outer = argument_around(probe, found)?;
+            let site = call_of(outer, block, probe, working_set)?;
+            match site.call.positional_iter().next() {
+                Some(subject) => compared(subject, Comparison::Equal),
+                None => SiteKind::Literal,
+            }
+        }
+        Expect::ExternalArg { index } => SiteKind::ExternalArg {
+            call: find_expression(
+                block,
+                probe,
+                working_set,
+                cursor,
+                |expression| matches!(&expression.expr, Expr::ExternalCall(head, _) if head.span.start == found.within.start),
+            )?,
+            index: *index,
+        },
+        Expect::Command { parent: None } => SiteKind::Command {
+            node: find_expression(block, probe, working_set, span.start, |expression| {
+                match &expression.expr {
+                    Expr::Call(call) => call.head.start == span.start,
+                    Expr::ExternalCall(head, _) => head.span.start == span.start,
+                    Expr::Garbage => expression.span.start == span.start,
+                    _ => false,
+                }
+            }),
+            parent: None,
+        },
+        Expect::Command { parent } if call_of(found, block, probe, working_set).is_none() => {
+            SiteKind::Command {
+                node: None,
+                parent: *parent,
+            }
+        }
+        Expect::FlagValue { .. }
+        | Expect::Positional { .. }
+        | Expect::Flag { .. }
+        | Expect::Command { .. } => {
+            let site = call_of(found, block, probe, working_set)?;
+            let arguments = &site.call.arguments;
+            let before = (arguments.iter())
+                .take_while(|argument| argument.span().end <= cursor)
+                .count();
+            let at = (arguments.iter()).position(|argument| touches(argument.span(), cursor));
+            let arg_slot = at.filter(|_| !span.is_empty()).unwrap_or(before);
+            match &found.what {
+                Expect::FlagValue { long, .. } => SiteKind::FlagValue {
+                    site,
+                    flag: (site.call.named_iter())
+                        .rev()
+                        .find(|(name, ..)| name.item == *long)
+                        .map(|(name, short, _)| FlagRef::from_named(name, short.as_ref()))?,
+                    arg_slot,
+                },
+                Expect::Positional { index, .. } => SiteKind::Positional {
+                    site,
+                    sig_positional: *index,
+                    arg_slot,
+                },
+                Expect::Flag { .. } if !span.is_empty() => SiteKind::FlagName {
+                    site,
+                    sig_positional: count_positionals(site.call, arg_slot),
+                    arg_slot,
+                },
+                // A gap where no positional is declared, or a word after a command that may name
+                // a subcommand, is the next positional all the same.
+                _ => {
+                    let span = at.map_or(span, |at| arguments[at].span());
+                    return Some((
+                        SiteKind::Positional {
+                            site,
+                            sig_positional: count_positionals(site.call, arg_slot),
+                            arg_slot,
+                        },
+                        span,
+                    ));
+                }
+            }
+        }
+    };
+    Some((kind, span))
+}
+
+/// What is under the cursor at `pos` in `line`, as the one suggestion it would be, for its
+/// preview: a command, a flag or an argument of the call it is in, a variable, or a path that
+/// is there. `None` for anything with nothing to show.
+fn hovered(engine_state: &EngineState, line: &str, pos: usize) -> Option<Completions> {
+    let mut working_set = StateWorkingSet::new(engine_state);
+    let offset = working_set.next_span_start();
+    let at = line.floor_char_boundary(pos.min(line.len()));
+    let (block, probe) = parse_probed(&mut working_set, None, line.as_bytes(), at);
+    let at = offset + at;
+    let shapes = nu_parser::flatten_block(&working_set, &block);
+    let (span, shape) = shapes
+        .into_iter()
+        .find(|(span, _)| span.start <= at && at <= span.end)?;
+    let text = String::from_utf8_lossy(working_set.get_span_contents(span)).into_owned();
+    // What the line declares itself is not the engine's yet.
+    let known = |decl_id: DeclId| decl_id.get() < engine_state.num_decls();
+    // The call the cursor is in an argument of.
+    let call = probe
+        .narrowest(false)
+        .filter(|found| found.decl_id().is_some_and(known));
+    let in_call = |slot: Slot| {
+        let command = HelpFor::Decl(call?.decl_id()?);
+        Some(Arc::new(HelpAt { command, slot }))
+    };
+    let (value, kind, help_at) = match shape {
+        FlatShape::InternalCall(decl_id) if known(decl_id) => {
+            let command_type = engine_state.get_decl(decl_id).command_type();
+            let name = engine_state.get_decl(decl_id).name().to_owned();
+            (
+                name,
+                SuggestionKind::Command(command_type, Some(decl_id)),
+                None,
+            )
+        }
+        FlatShape::External(_) => (
+            text,
+            SuggestionKind::Command(CommandType::External, None),
+            None,
+        ),
+        FlatShape::Flag => (text, SuggestionKind::Flag, in_call(Slot::Flag)),
+        FlatShape::Variable(_) => (text, SuggestionKind::Variable, None),
+        _ => {
+            let unquoted = text.trim_matches(|c| matches!(c, '\'' | '"' | '`'));
+            let path = engine_state
+                .cwd(None)
+                .ok()
+                .map(|cwd| nu_path::expand_path_with(unquoted, cwd, true));
+            match path {
+                Some(path) if path.is_dir() => {
+                    (unquoted.to_owned(), SuggestionKind::Directory, None)
+                }
+                Some(path) if path.exists() => (unquoted.to_owned(), SuggestionKind::File, None),
+                _ => {
+                    let Expect::Positional { index, .. } = call?.what else {
+                        return None;
+                    };
+                    let help_at = in_call(Slot::Positional(index));
+                    (text, SuggestionKind::Value(Type::Any), help_at)
+                }
+            }
+        }
+    };
+    let found = SemanticSuggestion {
+        suggestion: Suggestion {
+            value,
+            span: reedline::Span::new(span.start - offset, span.end - offset),
+            ..Suggestion::default()
+        },
+        kind: Some(kind),
+        help_at,
+        ..SemanticSuggestion::default()
+    };
+    let details = Details::of(std::slice::from_ref(&found))?;
+    Some(Completions::new(vec![found.suggestion]).with_data(details))
+}
+
+/// Whether `call` already has a value for `signature`'s rest parameter before `cursor`.
+fn rest_has_begun(call: &Call, signature: &Signature, cursor: usize) -> bool {
+    let named = signature.required_positional.len() + signature.optional_positional.len();
+    let given = (call.arguments.iter())
+        .filter(|arg| !matches!(arg, Argument::Named(..)))
+        .filter(|arg| arg.span().end < cursor)
+        .count();
+    given > named
+}
+
+/// Whether `item` was found by completing part of the line as a command line of its own.
+fn is_delegated(item: &SemanticSuggestion) -> bool {
+    item.source
+        .as_deref()
+        .is_some_and(|source| source.starts_with("delegated"))
+}
+
+/// The text typed up to the cursor: what the worker is asked to complete.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CompletionQuery {
     typed: Arc<str>,
+    /// What follows the cursor on its line: the rest of the word at the cursor, which a
+    /// suggestion replaces too, and what comes after it.
+    after: Arc<str>,
+    /// Nothing follows the cursor, so `typed` is the whole line and the highlighter's parse of
+    /// the line is a parse of it.
+    at_end: bool,
+    /// The placeholder (`<branch>`) the cursor is in, when it is in one: `typed` ends where it
+    /// starts, so that it is an empty token of the argument it stands for.
+    placeholder: Option<Placeholder>,
+    /// Whether the user asked, as Tab does, rather than the suggestions following the typing.
+    asked: bool,
+}
+
+/// A placeholder that is completed whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Placeholder {
+    /// Where it ends, in the line.
+    end: usize,
+    /// How far past `end` the next placeholder of the line ends, if there is one.
+    next_end: Option<usize>,
 }
 
 impl CompletionQuery {
     fn new(line: &str, cursor: usize) -> Self {
         let floored = line.floor_char_boundary(cursor.min(line.len()));
+        if let Some(found) = placeholder::at(line, floored) {
+            let next_end = placeholder::find(&line[found.end..])
+                .first()
+                .map(|next| next.end);
+            return Self {
+                typed: Arc::from(&line[..found.start]),
+                after: Arc::from(""),
+                at_end: false,
+                placeholder: Some(Placeholder {
+                    end: found.end,
+                    next_end,
+                }),
+                asked: true,
+            };
+        }
+        let rest = &line[floored..];
         Self {
             typed: Arc::from(&line[..floored]),
+            after: Arc::from(rest.split('\n').next().unwrap_or_default()),
+            at_end: floored == line.len(),
+            placeholder: None,
+            asked: true,
         }
     }
 
@@ -491,231 +785,104 @@ impl CompletionQuery {
         self.typed.len()
     }
 
-    /// Whether `self` extends `base` within one token.
-    fn narrows(&self, base: &CompletionQuery, token: reedline::Span) -> bool {
-        let Some(appended) = self.typed().strip_prefix(base.typed()) else {
-            return false;
-        };
-
-        if appended.is_empty() || appended.contains(is_completion_boundary) {
-            return false;
+    /// `found` without the files that cannot be where the cursor is: in `src/li⌶/mod.rs` the
+    /// word goes on with a separator, so only a directory fits.
+    fn fit_what_follows(&self, found: &mut Vec<SemanticSuggestion>) {
+        if !self.after.starts_with(std::path::is_separator) {
+            return;
         }
-
-        let (Some(base_token), Some(narrowed_token)) = (
-            base.typed().get(token.start..),
-            self.typed().get(token.start..),
-        ) else {
-            return false;
-        };
-
-        is_flag_text(base_token) == is_flag_text(narrowed_token)
+        let cursor = self.cursor();
+        found.retain(|item| {
+            item.suggestion.span.end != cursor || item.kind != Some(SuggestionKind::File)
+        });
     }
-}
 
-fn is_completion_boundary(c: char) -> bool {
-    c.is_whitespace()
-        || is_separator(c)
-        || matches!(
-            c,
-            '|' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '=' | ','
-        )
-}
-
-/// The environment a cached completion was computed against.
-///
-/// Results depend on cwd, `PATH`, known declarations, and `$env.config`, which
-/// change between prompts while the query text does not — so the query alone is
-/// not a sound cache key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CacheEnv(u64);
-
-impl CacheEnv {
-    /// Fingerprint the completion-relevant parts of `engine_state`/`stack`, once per
-    /// completer.
-    fn of(engine_state: &EngineState, stack: &Stack) -> Self {
-        let mut hasher = DefaultHasher::new();
-
-        engine_state.num_decls().hash(&mut hasher);
-        stack
-            .get_env_var(engine_state, "PATH")
-            .map(|path| path.to_expanded_string(":", &stack.get_config(engine_state)))
-            .hash(&mut hasher);
-
-        let cwd = engine_state.cwd(Some(stack)).ok();
-        // The cwd mtime, so adding/removing files invalidates stale file completions.
-        cwd.as_ref()
-            .and_then(|cwd| std::fs::metadata(cwd).ok()?.modified().ok())
-            .hash(&mut hasher);
-        cwd.hash(&mut hasher);
-
-        engine_state.config_epoch().hash(&mut hasher);
-        // Stack-local config changes do not bump the engine epoch.
-        stack.config.is_some().hash(&mut hasher);
-        if let Some(config) = &stack.config {
-            format!("{config:?}").hash(&mut hasher);
+    /// `found` made to replace the whole word at the cursor rather than only what is typed of
+    /// it before the cursor: the rest of a name or a path's component, or a whole placeholder.
+    fn widen(&self, found: &mut [SemanticSuggestion]) {
+        if self.placeholder.is_some() {
+            return self.fill_placeholder(found);
         }
-
-        Self(hasher.finish())
-    }
-}
-
-/// One generation of cached completions. Entries are only valid for the
-/// environment they were computed in, so the whole map carries a single env:
-/// a mismatch clears it in O(1) instead of purging entry by entry.
-struct CacheState {
-    /// `None` disables the cache; the map is then never consulted.
-    capacity: Option<NonZeroUsize>,
-    /// The generation `entries` were computed in.
-    env: Option<CacheEnv>,
-    entries: LruCache<CompletionQuery, Suggestions>,
-}
-
-impl CacheState {
-    /// The live map for `env`, clearing a stale generation; `None` when disabled.
-    fn live(
-        state: &mut Self,
-        env: CacheEnv,
-    ) -> Option<&mut LruCache<CompletionQuery, Suggestions>> {
-        state.capacity?;
-        if state.env != Some(env) {
-            state.env = Some(env);
-            state.entries.clear();
-        }
-        Some(&mut state.entries)
-    }
-}
-
-/// Cross-prompt completion cache, LRU by entry count; capacity `0` disables it.
-#[derive(Clone)]
-pub(crate) struct NarrowingCache {
-    state: Arc<Mutex<CacheState>>,
-}
-
-impl Default for NarrowingCache {
-    fn default() -> Self {
-        Self::new(DEFAULT_CACHE_SIZE)
-    }
-}
-
-impl NarrowingCache {
-    /// `0` isn't a valid `LruCache` capacity; it means the cache is disabled.
-    pub(crate) fn new(capacity: usize) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(CacheState {
-                capacity: NonZeroUsize::new(capacity),
-                env: None,
-                // Never consulted while disabled; resized on enable.
-                entries: LruCache::new(NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN)),
-            })),
-        }
-    }
-
-    /// Resize in place; `0` disables the cache. Reapplied each prompt.
-    pub(crate) fn set_capacity(&self, capacity: usize) {
-        if let Ok(mut state) = self.state.lock() {
-            state.capacity = NonZeroUsize::new(capacity);
-            match state.capacity {
-                Some(capacity) => state.entries.resize(capacity),
-                None => {
-                    state.entries.clear();
-                    state.env = None;
-                }
+        let cursor = self.cursor();
+        for item in found {
+            let span = item.suggestion.span;
+            let Some(replaced) = self.typed.get(span.start..cursor) else {
+                continue;
+            };
+            if span.end == cursor {
+                item.suggestion.span.end += taking::rest_of_word(&self.after, replaced, item);
             }
         }
     }
 
-    pub(crate) fn fresh(
-        &self,
-        query: &CompletionQuery,
-        environment: CacheEnv,
-    ) -> Option<Suggestions> {
-        let mut state = self.state.lock().ok()?;
-        CacheState::live(&mut state, environment)?
-            .get(query)
-            .cloned()
-    }
-
-    pub(crate) fn store(
-        &self,
-        query: CompletionQuery,
-        environment: CacheEnv,
-        suggestions: Suggestions,
-    ) {
-        if let Ok(mut state) = self.state.lock()
-            && let Some(cache) = CacheState::live(&mut state, environment)
-        {
-            cache.put(query, suggestions);
+    /// The word at the cursor is not offered back to itself while the suggestions follow the
+    /// typing: a suggestion that is what is typed changes nothing. Only that one goes: the
+    /// longer names the word starts (`Cargo.toml.bak` beside `Cargo.toml`) stay, and what
+    /// merely resembles the word still ranks below them. Asked for, by Tab, everything is offered.
+    fn settle_on_a_whole_word(&self, found: &mut Vec<SemanticSuggestion>) {
+        if self.asked {
+            return;
+        }
+        let cursor = self.cursor();
+        let whole = |item: &SemanticSuggestion| {
+            item.fixes.is_none()
+                && self.typed.get(item.suggestion.span.start..cursor)
+                    == Some(item.suggestion.value.as_str())
+        };
+        if found.iter().any(whole) {
+            // Only continuations of the whole word are worth showing beside it.
+            let typed_word = |item: &SemanticSuggestion| {
+                self.typed
+                    .get(item.suggestion.span.start..cursor)
+                    .is_some_and(|word| item.suggestion.value.starts_with(word))
+            };
+            found.retain(|item| !whole(item) && typed_word(item));
         }
     }
 
-    pub(crate) fn narrowed_fallback(
-        &self,
-        query: &CompletionQuery,
-        environment: CacheEnv,
-        options: &CompletionOptions,
-    ) -> Suggestions {
-        let Some((base_suggestions, ref_span, search_token)) =
-            self.state.lock().ok().and_then(|mut state| {
-                let cache = CacheState::live(&mut state, environment)?;
-                let (_, suggestions, span) = cache
-                    .iter()
-                    .filter_map(|(base, suggestions)| {
-                        // The span the last suggestion replaces; the one the cursor extends.
-                        let span = suggestions.last().map(|suggestion| suggestion.span)?;
-                        query
-                            .narrows(base, span)
-                            .then_some((base.cursor(), suggestions, span))
-                    })
-                    .max_by_key(|&(cursor, ..)| cursor)?;
-
-                // Files replace `r` while subcommands replace `foo r`. Narrowing one span's
-                // token would drop the other group, and Tab would insert a prefix of what is
-                // left. So a mixed answer gives no fallback, and every keystroke in this token
-                // is pending until the fresh answer arrives. Tab inserts nothing meanwhile,
-                // and an open menu keeps showing its last answer.
-                if suggestions.iter().any(|suggestion| suggestion.span != span) {
-                    return None;
-                }
-
-                let token = query.typed().get(span.start..)?;
-                Some((Arc::clone(suggestions), span, token))
-            })
-        else {
-            return Suggestions::default();
-        };
-
-        // Keep the producer's ranking: re-sorting a stale list makes the menu flip between keystrokes.
-        let mut matcher = NuMatcher::new(search_token, options, false);
-
-        base_suggestions.iter().enumerate().for_each(|(i, s)| {
-            matcher.add(s.display_value(), i);
-        });
-
-        let updated_span = reedline::Span::new(ref_span.start, query.cursor());
-
-        matcher
-            .results()
-            .into_iter()
-            .map(|(index, match_indices)| {
-                let mut suggestion = base_suggestions[index].clone();
-                suggestion.span = updated_span;
-                suggestion.match_indices = Some(match_indices);
-                suggestion
-            })
-            .collect()
+    /// `found` made to open the closure a command or flag that takes only one needs, once taken:
+    /// `each` puts `each { ⌶ }` in the line, the cursor in its body.
+    fn open_closures(&self, found: &mut [SemanticSuggestion], engine_state: &EngineState) {
+        let cursor = self.cursor();
+        for item in found {
+            let suggestion = &item.suggestion;
+            let Some(follows) = suggestion
+                .span
+                .end
+                .checked_sub(cursor)
+                .and_then(|past| self.after.get(past..))
+            else {
+                continue;
+            };
+            let Some((opening, at)) = taking::closure_opening(item, engine_state, follows) else {
+                continue;
+            };
+            let suggestion = &mut item.suggestion;
+            let name = std::mem::take(&mut suggestion.value);
+            suggestion.cursor = Some(suggestion.span.start + name.len() + at);
+            suggestion.value = format!("{name}{opening}");
+            suggestion.display_override.get_or_insert(name);
+        }
     }
-}
 
-struct Completed {
-    query: CompletionQuery,
-    suggestions: Suggestions,
-    cacheable: bool,
-}
-
-struct CompletionWorker {
-    request_tx: mpsc::Sender<CompletionQuery>,
-    result_rx: mpsc::Receiver<Completed>,
-    pending: Option<CompletionQuery>,
+    /// `found` made to complete the placeholder the query is at, if it is at one: each
+    /// suggestion for the empty token replaces the whole placeholder, and the cursor then goes
+    /// to the end of the next one.
+    fn fill_placeholder(&self, found: &mut [SemanticSuggestion]) {
+        let Some(placeholder) = self.placeholder else {
+            return;
+        };
+        for item in found {
+            let suggestion = &mut item.suggestion;
+            if suggestion.span.end != self.cursor() {
+                continue;
+            }
+            suggestion.span.end = placeholder.end;
+            suggestion.cursor = placeholder
+                .next_end
+                .map(|next_end| suggestion.span.start + suggestion.value.len() + next_end);
+        }
+    }
 }
 
 /// The completion behaviour configured in `$env.config.completions`.
@@ -740,61 +907,22 @@ fn isolated_stack(parent: Arc<Stack>, suppress_stdin: bool) -> Arc<Stack> {
     })
 }
 
-/// The user completer that would run first at `site`, mirroring dispatch order. `None` when
-/// no user completer runs there.
-fn site_completer(site: &CompletionSite, working_set: &StateWorkingSet) -> Option<SiteCompleter> {
-    let call = match &site.kind {
-        SiteKind::ExternalArg { .. } => return Some(SiteCompleter::External),
-        kind => kind.call_site()?.call,
-    };
-    let signature = working_set.get_decl(call.decl_id).signature();
-
-    // An argument's own completer runs before the command-wide one.
-    let argument_completer = match &site.kind {
-        SiteKind::FlagValue { flag, .. } => {
-            find_flag(&signature, *flag).and_then(|flag| flag.completion)
-        }
-        SiteKind::Positional { sig_positional, .. } => signature
-            .get_positional(*sig_positional)
-            .and_then(|positional| positional.completion.clone()),
-        // Dispatch also runs the positional completer here for `def --wrapped`.
-        SiteKind::FlagName { sig_positional, .. } if signature.allows_unknown_args => signature
-            .get_positional(*sig_positional)
-            .and_then(|positional| positional.completion.clone()),
-        _ => None,
-    };
-    if let Some(Completion::Command(decl_id)) = argument_completer {
-        return Some(SiteCompleter::Decl(decl_id));
-    }
-
-    match signature.complete {
-        Some(CommandWideCompleter::Command(decl_id)) => Some(SiteCompleter::Decl(decl_id)),
-        Some(CommandWideCompleter::External) => Some(SiteCompleter::External),
-        None => None,
-    }
+/// Whether `command` carries the marker attribute `@marker`, seeing through aliases as execution
+/// does.
+pub(crate) fn has_marker(command: &dyn Command, marker: &str) -> bool {
+    command
+        .attributes()
+        .iter()
+        .any(|(name, value)| name == marker && value.as_bool().unwrap_or(false))
+        || command
+            .as_alias()
+            .and_then(|alias| alias.command.as_deref())
+            .is_some_and(|wrapped| has_marker(wrapped, marker))
 }
 
-/// The user completer a site would run.
-enum SiteCompleter {
-    /// A named declaration carrying `@interactive` directly.
-    Decl(DeclId),
-    /// The configured external closure; interactivity is read from the command it dispatches to.
-    External,
-}
-
-/// Whether `decl` names an `@interactive` command, seeing through aliases as execution does.
+/// Whether `decl` names an `@interactive` command.
 pub(crate) fn decl_is_interactive(working_set: &StateWorkingSet, decl_id: DeclId) -> bool {
-    fn command_is_interactive(command: &dyn Command) -> bool {
-        command
-            .attributes()
-            .iter()
-            .any(|(name, value)| name == "interactive" && value.as_bool().unwrap_or(false))
-            || command
-                .as_alias()
-                .and_then(|alias| alias.command.as_deref())
-                .is_some_and(command_is_interactive)
-    }
-    command_is_interactive(working_set.get_decl(decl_id))
+    has_marker(working_set.get_decl(decl_id), "interactive")
 }
 
 /// Whether the configured external completer closure runs an `@interactive` command. A closure
@@ -813,10 +941,14 @@ pub(crate) fn closure_is_interactive(working_set: &StateWorkingSet, closure: &Cl
 }
 
 /// What the cursor is completing; each variant carries exactly the AST it needs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) enum SiteKind<'a> {
-    /// A command head; `node` is the whole call (for `^`/`%` sigils).
-    Command { node: Option<&'a Expression> },
+    /// A command name. `node` is the call it heads, if the parse has one, and `parent` the
+    /// command whose subcommands it names, where it is no call yet (`export d⌶`).
+    Command {
+        node: Option<&'a Expression>,
+        parent: Option<DeclId>,
+    },
     /// A flag name being typed (`--`, `-x`). `sig_positional` and `arg_slot` are the
     /// positional the token binds to instead when the command is `def --wrapped`.
     FlagName {
@@ -838,6 +970,14 @@ pub(crate) enum SiteKind<'a> {
     },
     /// A binary-operator position trailing `lhs`.
     Operator { lhs: &'a Expression },
+    /// The value after a comparison, `$row.name == ⌶`: what the column `members` of the rows the
+    /// variable `head` names holds may be offered. To a user completer it is a variable
+    /// position, as any expression awaiting an operand is.
+    Operand {
+        head: VarId,
+        members: Vec<PathMember>,
+        comparison: Comparison,
+    },
     /// A cell path into `path`.
     CellPath { path: &'a FullCellPath },
     /// A `$var` name.
@@ -848,18 +988,17 @@ pub(crate) enum SiteKind<'a> {
     AttributableItem,
     /// An argument of a bare external call.
     ExternalArg { call: &'a Expression, index: usize },
-    /// A file path (the fallback).
+    /// A file path: a redirection's target.
     File,
+    /// A literal, a block or the like being written: nothing completes it, and no path is meant.
+    /// To a user completer it is a file position, as it always was.
+    #[default]
+    Literal,
 }
 
 impl<'a> SiteKind<'a> {
-    /// A command head backed by its whole call (for sigil detection).
-    fn command(node: &'a Expression) -> Self {
-        Self::Command { node: Some(node) }
-    }
-
     /// The [`ResolvedCursor`] a user completer sees.
-    fn resolved(&self) -> ResolvedCursor<'a> {
+    pub(crate) fn resolved(&self) -> ResolvedCursor<'a> {
         match *self {
             Self::Command { .. } => ResolvedCursor::Command,
             Self::FlagName { .. } => ResolvedCursor::FlagName,
@@ -869,18 +1008,18 @@ impl<'a> SiteKind<'a> {
             },
             Self::Operator { .. } => ResolvedCursor::Operator,
             Self::CellPath { .. } => ResolvedCursor::CellPath,
-            Self::Variable => ResolvedCursor::Variable,
+            Self::Variable | Self::Operand { .. } => ResolvedCursor::Variable,
             Self::AttributeName => ResolvedCursor::AttributeName,
             Self::AttributableItem => ResolvedCursor::AttributableItem,
             Self::ExternalArg { index, .. } => ResolvedCursor::ExternalArg { index },
-            Self::File => ResolvedCursor::File,
+            Self::File | Self::Literal => ResolvedCursor::File,
         }
     }
 
     /// The element this kind is backed by, if any.
     fn element(&self) -> Option<&'a Expression> {
         match *self {
-            Self::Command { node } => node,
+            Self::Command { node, .. } => node,
             Self::FlagName { site, .. }
             | Self::FlagValue { site, .. }
             | Self::Positional { site, .. } => Some(site.element),
@@ -890,7 +1029,7 @@ impl<'a> SiteKind<'a> {
     }
 
     /// The call this kind completes arguments for, if any.
-    fn call_site(&self) -> Option<CallSite<'a>> {
+    pub(crate) fn call_site(&self) -> Option<CallSite<'a>> {
         match *self {
             Self::FlagName { site, .. }
             | Self::FlagValue { site, .. }
@@ -901,7 +1040,7 @@ impl<'a> SiteKind<'a> {
 }
 
 /// What the cursor completes, as a user completer sees it in `cursor.kind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ResolvedCursor<'a> {
     /// A command head.
     Command,
@@ -924,12 +1063,13 @@ pub(crate) enum ResolvedCursor<'a> {
     /// An argument of a bare external call; externals have no signature, so flags count.
     ExternalArg { index: usize },
     /// A file path.
+    #[default]
     File,
 }
 
 impl ResolvedCursor<'_> {
     /// The `cursor.kind` discriminant.
-    fn kind(&self) -> &'static str {
+    pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Command => "command",
             Self::FlagName => "flag-name",
@@ -962,55 +1102,92 @@ impl ResolvedCursor<'_> {
     }
 }
 
-/// One nesting level the cursor lives in, as a completer sees it.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CompletionContext<'a> {
-    /// What the cursor completes at this level.
+/// What the cursor is at, as a completer sees it: what it completes and the element it is in.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Level<'a> {
+    /// What the cursor completes.
     pub cursor: ResolvedCursor<'a>,
-    /// The element this level is; the source of its tokens.
+    /// The element the cursor is in; the source of its tokens.
     pub element: Option<&'a Expression>,
-    /// The nesting expression the cursor descends into (all but the last level).
-    pub descent: Option<Span>,
 }
 
-/// A resolved completion site: kind, span, typed prefix, cursor, and enclosing contexts.
-#[derive(Debug, Clone)]
+/// A resolved completion site: kind, span, typed prefix, cursor, and what flows into it.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct CompletionSite<'a> {
     pub kind: SiteKind<'a>,
     pub span: Span,
     pub typed_prefix: Cow<'a, str>,
     /// The cursor, in absolute working-set (span) coordinates.
     pub cursor: usize,
-    /// Enclosing contexts, outermost first; empty until resolved.
-    pub contexts: Vec<CompletionContext<'a>>,
+    /// What a completer is told the cursor is at.
+    pub level: Level<'a>,
+    /// The parameter of a call around whose condition or closure the cursor is in.
+    pub around: Option<Arc<HelpAt>>,
+    /// The pipeline elements the cursor is nested in, outermost first, with what flows into
+    /// each: see [`piped`].
+    pub nests: Vec<Nest<'a>>,
+    /// What flows into the element the cursor is in, when anything does.
+    pub piped: Option<Type>,
+    /// The span of the pipeline elements before the one the cursor is in, which can be run to
+    /// read the data that flows into it: see [`data`](super::data).
+    pub prior: Option<Span>,
+    /// The pipeline that `$in` at the start of [`Self::prior`] stands for.
+    pub feed: Option<Span>,
+    /// What the variable heading the cell path under the cursor stands for, where it names the
+    /// rows piped in: `$in`, a closure's row, a condition's `$it`.
+    pub rows: Option<Type>,
+    /// The `let` and `const` statements the pipeline at [`Self::prior`] may read the variables of.
+    pub prelude: Vec<Span>,
 }
 
 impl<'a> CompletionSite<'a> {
     /// Site whose replacement span contains the cursor.
     fn at(cursor: usize, kind: SiteKind<'a>, span: Span) -> Self {
-        debug_assert!(
-            touches(span, cursor),
-            "a {} site spans {}..{}, which the cursor at {cursor} is not on",
-            kind.resolved().kind(),
-            span.start,
-            span.end,
-        );
+        debug_assert!(touches(span, cursor), "{kind:?} at {span:?}, off {cursor}");
         Self {
+            level: Level {
+                cursor: kind.resolved(),
+                element: kind.element(),
+            },
             kind,
             span,
-            typed_prefix: Cow::Borrowed(""),
-            cursor: 0,
-            contexts: Vec::new(),
+            ..Self::default()
         }
     }
+}
 
-    /// This site as its own single context.
-    fn own_context(&self) -> CompletionContext<'a> {
-        CompletionContext {
-            cursor: self.kind.resolved(),
-            element: self.kind.element(),
-            descent: None,
-        }
+/// What a source said of a request: a custom completer's `message`, or why one failed, a
+/// delegated source included. Clones share the text.
+#[derive(Clone, Default)]
+pub(crate) struct Notice(Rc<RefCell<Said>>);
+
+#[derive(Default)]
+struct Said {
+    message: Option<String>,
+    failure: Option<String>,
+}
+
+impl Notice {
+    /// Records `message`, which a completer chose to say; the last one said stands.
+    pub(crate) fn say(&self, message: impl Into<String>) {
+        self.0.borrow_mut().message = Some(message.into());
+    }
+
+    /// Records why a source failed; the last failure stands.
+    pub(crate) fn fail(&self, failure: impl Into<String>) {
+        self.0.borrow_mut().failure = Some(failure.into());
+    }
+
+    /// What was said since the last take, forgotten: a message, or else a failure.
+    pub(crate) fn take(&self) -> Option<String> {
+        self.take_beside(false)
+    }
+
+    /// [`Self::take`] for an answer that `offers` something or not: a failure says why there is
+    /// nothing, and beside what other sources offered it is noise.
+    pub(crate) fn take_beside(&self, offers: bool) -> Option<String> {
+        let said = std::mem::take(&mut *self.0.borrow_mut());
+        said.message.or(said.failure.filter(|_| !offers))
     }
 }
 
@@ -1020,47 +1197,69 @@ pub struct CompletionEngine<'a> {
     /// An isolated child of the caller's stack.
     stack: Arc<Stack>,
     options: CompletionOptions,
+    /// Set while completing a line delegated from another; see [`delegation`].
+    delegation: Option<Arc<Delegation>>,
+    /// How much the user has used each command and argument, when the history is known.
+    usage: Option<Arc<UsageIndex>>,
+    /// What earlier requests found out: the executables on `PATH`, the entries of directories,
+    /// what custom completers returned.
+    cache: CacheView,
+    /// The highlighter's parse of the line being edited, shared when the cursor is at its end.
+    parse_cache: Option<LineParseCache>,
+    /// What is found out while completing, when it is wanted: see [`Self::traced`].
+    trace: Option<Trace>,
+    /// Why there is nothing to suggest, when a source said so.
+    notice: Notice,
 }
 
-/// The commandline facts constant for one dispatch.
-#[derive(Clone, Copy)]
-pub(crate) struct Buffer<'a> {
-    /// The commandline (or file) up to the cursor.
-    pub text: &'a str,
-    /// Start of `text` in working-set coordinates; `span - offset` indexes `text`.
-    pub offset: usize,
-}
-
-impl Buffer<'_> {
-    /// The cursor as a byte offset into [`Self::text`].
-    fn cursor(&self) -> usize {
-        self.text.len()
-    }
-
-    /// The cursor in working-set (span) coordinates.
-    fn absolute_cursor(&self) -> usize {
-        self.offset + self.text.len()
-    }
-
-    /// A working-set offset as a byte index into [`Self::text`], saturating so
-    /// spans before the buffer can't underflow.
-    fn relative(&self, absolute: usize) -> usize {
-        absolute.saturating_sub(self.offset)
-    }
-}
-
+/// What one dispatch completes: the engine's state, the commandline up to the cursor, and
+/// once a site is resolved (see [`Context::at_site`]) the token the cursor is in.
 #[derive(Clone, Copy)]
 pub(crate) struct Context<'a> {
     pub working_set: &'a StateWorkingSet<'a>,
     pub stack: &'a Stack,
     pub options: &'a CompletionOptions,
+    /// What the answer replaces, in working-set coordinates.
     pub span: Span,
+    /// The text of the token up to the cursor, which the candidates are matched against.
     pub prefix: &'a [u8],
+    /// Start of [`Self::buffer`] in working-set coordinates; `span - offset` indexes it.
     pub offset: usize,
-    /// The commandline up to the cursor. See [`Buffer`].
+    /// The commandline (or file) up to the cursor.
     pub buffer: &'a str,
-    /// The nesting levels the cursor lives in, read by a completer declaring `contexts`.
-    pub contexts: &'a [CompletionContext<'a>],
+    /// What the cursor is at, as a completer is told.
+    pub level: Option<Level<'a>>,
+    /// Set while the line is one delegated from another: where it is from, and what stands
+    /// in for the local machine's paths and commands.
+    pub delegation: Option<&'a Delegation>,
+    /// What the history says about the commands and arguments the user runs, to break
+    /// near-ties between candidates.
+    pub usage: Option<&'a Arc<UsageIndex>>,
+    /// What earlier requests found out; see [`CacheView`].
+    pub cache: &'a CacheView,
+    /// The rows whose columns the token may name: what is piped into a command that takes
+    /// columns, or what the variable heading the token's cell path stands for.
+    pub rows: Option<&'a Type>,
+    /// What is piped into the command the token is in, which a completer reads as `place.input`
+    /// and the commands that take it rank by.
+    pub piped: Option<&'a Type>,
+    /// The span of the pipeline before the element the token is in, when the token may name the
+    /// columns or keys of its data (`get ⌶`) or a value in it, so that it is worth reading: see
+    /// [`data`](super::data).
+    pub prior: Option<Span>,
+    /// The `let` and `const` statements before the cursor, in the blocks that enclose it,
+    /// outermost first: the variables the pipeline at [`Self::prior`] may read, which
+    /// [`data`](super::data) declares first when it runs it.
+    pub prelude: &'a [Span],
+    /// The pipeline that `$in` at the start of [`Self::prior`] stands for, when it is one.
+    pub feed: Option<Span>,
+    /// Set when the completion is being traced; see [`Trace`].
+    pub trace: Option<&'a Trace>,
+    /// Where a source says why it has nothing to suggest.
+    pub notice: &'a Notice,
+    /// The variables in scope at the cursor, as the parser saw them while their blocks were
+    /// open; empty when the probe recorded none.
+    pub scope: &'a [(Vec<u8>, VarId)],
 }
 
 impl<'a> Context<'a> {
@@ -1068,10 +1267,55 @@ impl<'a> Context<'a> {
         String::from_utf8_lossy(self.prefix)
     }
 
-    /// Attach a resolved site, read by a completer declaring a `contexts` parameter.
-    fn at_site(mut self, site: &'a CompletionSite<'a>) -> Self {
-        self.contexts = &site.contexts;
-        self
+    /// The cursor in working-set (span) coordinates.
+    fn absolute_cursor(&self) -> usize {
+        self.offset + self.buffer.len()
+    }
+
+    /// A working-set offset as a byte index into [`Self::buffer`], saturating so
+    /// spans before the buffer can't underflow.
+    fn relative(&self, absolute: usize) -> usize {
+        absolute.saturating_sub(self.offset)
+    }
+
+    /// The command the token is an argument of: the call the cursor is innermost in, by the name
+    /// the history knows it by (`git checkout`, or `cargo` for an external).
+    pub(crate) fn command_head(&self) -> Option<String> {
+        let call = self.level?.element?;
+        match &call.expr {
+            Expr::Call(call) => Some(self.working_set.get_decl(call.decl_id).name().to_owned()),
+            Expr::ExternalCall(head, _) => {
+                let name = String::from_utf8_lossy(self.working_set.get_span_contents(head.span));
+                Some(name.trim_start_matches(['^', '%']).to_owned())
+            }
+            _ => None,
+        }
+    }
+
+    /// Attach a resolved site: its token, what flows into it, and what a completer is told
+    /// the cursor is at.
+    pub(crate) fn at_site(self, site: &'a CompletionSite<'a>) -> Self {
+        Self {
+            span: site.span,
+            prefix: site.typed_prefix.as_bytes(),
+            level: Some(site.level),
+            piped: site.piped.as_ref(),
+            prior: site.prior,
+            prelude: &site.prelude,
+            feed: site.feed,
+            ..self
+        }
+    }
+
+    /// Replace the whole token at `span`, including an untyped suffix in a parsed file, but
+    /// match only the text before the cursor.
+    pub(crate) fn token(self, span: Span) -> Self {
+        let typed = Span::new(span.start, span.end.min(self.absolute_cursor()));
+        Self {
+            span,
+            prefix: self.working_set.get_span_contents(typed),
+            ..self
+        }
     }
 }
 
@@ -1093,25 +1337,249 @@ impl<'engine> CompletionEngine<'engine> {
             engine_state,
             stack,
             options,
+            delegation: None,
+            usage: None,
+            cache: CacheView::disabled(),
+            parse_cache: None,
+            trace: None,
+            notice: Notice::default(),
         }
     }
 
-    /// Answer one request, returning suggestions and whether the result is cacheable.
-    fn suggestions_for(&self, query: &CompletionQuery) -> (Suggestions, bool) {
-        let dispatched = self.dispatch_completions_at(query.typed(), query.cursor());
-        let reusable = dispatched.is_reusable();
-        let suggestions = dispatched
-            .into_suggestions()
+    /// The same engine, recording how it answers in `trace`. A traced engine never runs an
+    /// `@interactive` completer, which needs the terminal the line editor holds.
+    #[must_use]
+    pub(crate) fn traced(mut self, trace: Trace) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
+    /// The same engine, ranking candidates by how much `usage` says the user has used them.
+    #[must_use]
+    pub(crate) fn with_usage(mut self, usage: Option<Arc<UsageIndex>>) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    /// The same engine, sharing `parse_cache` for a line with nothing after the cursor.
+    #[must_use]
+    fn with_parse_cache(mut self, parse_cache: Option<LineParseCache>) -> Self {
+        self.parse_cache = parse_cache;
+        self
+    }
+
+    /// The same engine, remembering what it finds out in `cache`.
+    #[must_use]
+    fn with_cache(mut self, cache: CacheView) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// The same engine, remembering what it finds out in `cache`, which is sized as the
+    /// configuration says and valid for the environment the engine runs in: how the line editor
+    /// keeps its own.
+    #[must_use]
+    pub(crate) fn caching_in(self, cache: &CompletionCache) -> Self {
+        let size = self
+            .stack
+            .get_config(self.engine_state)
+            .completions
+            .cache_size;
+        cache.set_capacity(size.try_into().unwrap_or(0));
+        let env = CacheEnv::of(self.engine_state, &self.stack);
+        self.with_cache(CacheView::new(cache.clone(), env))
+    }
+
+    /// An engine for a line delegated from the one `ctx` completes. The stack is `ctx`'s own,
+    /// which is already isolated, with stdin suppressed where the original's was.
+    pub(crate) fn delegated(ctx: &Context<'engine>, delegation: Delegation) -> Self {
+        Self {
+            engine_state: ctx.working_set.permanent_state,
+            stack: Arc::new(ctx.stack.clone()),
+            options: ctx.options.clone(),
+            delegation: Some(Arc::new(delegation)),
+            usage: ctx.usage.cloned(),
+            cache: ctx.cache.clone(),
+            parse_cache: None,
+            trace: ctx.trace.cloned(),
+            notice: ctx.notice.clone(),
+        }
+    }
+
+    /// Complete `line`, which began at byte `from` of the line it was cut from, as a command
+    /// line of its own naming a program: `sudo l` is not `let` and `sudo ls` is not Nushell's
+    /// `ls`. `untyped` is the rest of the word the cursor is in, which a parsed file has past
+    /// the cursor. What comes back is placed on the original line.
+    pub(crate) fn complete_program_line(
+        &self,
+        line: &str,
+        untyped: &str,
+        from: usize,
+    ) -> Vec<SemanticSuggestion> {
+        let mut working_set = StateWorkingSet::new(self.engine_state);
+
+        // A leading `^` makes the head an external command: only programs complete, and
+        // Nushell's own commands of the same name do not take the call. It is not on the
+        // original line, so the spans are moved back by its width.
+        let remote = self
+            .delegation
+            .as_deref()
+            .is_some_and(Delegation::is_remote);
+        let force_program = !line.starts_with(['^', '%'])
+            && (remote
+                || line
+                    .split_once(char::is_whitespace)
+                    .is_none_or(|(head, _)| delegation::names_builtin(&working_set, head)));
+        let program = if force_program { "^" } else { "" };
+
+        let text = format!("{program}{line}{untyped}");
+        let cursor = program.len() + line.len();
+        let offset = working_set.next_span_start();
+        let (block, probe) =
+            parse_probed(&mut working_set, Some("completer"), text.as_bytes(), cursor);
+
+        let mut found = self.fetch_completions_by_block(
+            &block,
+            &probe,
+            self.context(&working_set, &text[..cursor], offset),
+            &text,
+        );
+        // A span that started `n` bytes in now starts at `n - program + from`. Spans that began
+        // inside the program land on `from`.
+        let remap = |at: usize| at.saturating_sub(program.len()).saturating_add(from);
+        for item in &mut found {
+            let span = &mut item.suggestion.span;
+            *span = reedline::Span::new(remap(span.start), remap(span.end));
+        }
+        found
+    }
+
+    /// Answer one request.
+    fn answer(&self, query: &CompletionQuery) -> Completions {
+        let found = self.finished(query);
+        let line = format!("{}{}", query.typed(), query.after);
+        let details = Details::of(&found).map(|details| self.with_usages(details, &found, &line));
+        let suggestions: Suggestions = found
             .into_iter()
             .map(|semantic_suggestion| semantic_suggestion.suggestion)
             .collect();
 
-        (suggestions, reusable)
+        // What a source said of the line, a reason when there is nothing or a word beside what
+        // there is (a host misspelt), goes on the hint line while nothing is selected.
+        let message = self.notice.take_beside(!suggestions.is_empty());
+        let completions = Completions::new(suggestions);
+        let completions = match details {
+            Some(details) => completions.with_data(details),
+            None => completions,
+        };
+        match message {
+            Some(message) => completions.with_message(message),
+            None => completions,
+        }
+    }
+
+    /// `details` with the usage of each command among `found`, for the hint line while it is
+    /// selected. A command declared on the line itself is not the engine's yet, and has none, and
+    /// one already written out on `line` has its usage on the status line already.
+    fn with_usages(
+        &self,
+        mut details: Details,
+        found: &[SemanticSuggestion],
+        line: &str,
+    ) -> Details {
+        for (detail, item) in details.0.iter_mut().zip(found) {
+            let span = item.suggestion.span;
+            let written = line.get(span.start..span.end) == Some(item.suggestion.value.as_str());
+            if let Some(SuggestionKind::Command(_, Some(decl_id))) = detail.kind
+                && decl_id.get() < self.engine_state.num_decls()
+                && !written
+            {
+                // What it takes: its name is on the row and its flags are a `-` away.
+                let signature = self.engine_state.get_decl(decl_id).signature();
+                let label = signature.usage();
+                detail.usage = label
+                    .positional_part(0)
+                    .map(|first| label.parts[first..].join(" "));
+            }
+        }
+        details
+    }
+
+    /// [`Self::dispatch_query`], each suggestion replacing the whole word at the cursor.
+    fn complete_query(&self, query: &CompletionQuery) -> Vec<SemanticSuggestion> {
+        self.notice.take();
+        let mut found = self.dispatch_query(query);
+        query.fit_what_follows(&mut found);
+        query.widen(&mut found);
+        found
+    }
+
+    /// Completes `query`, from the parse the highlighter already made of the line when the
+    /// cursor is at its end, which is how a line is nearly always completed. The highlighter
+    /// parses without loading modules, so a line it could not parse in full is parsed again here.
+    fn dispatch_query(&self, query: &CompletionQuery) -> Vec<SemanticSuggestion> {
+        if query.at_end
+            && let Some(parse_cache) = &self.parse_cache
+        {
+            let parsed = parse_cache.parsed(self.engine_state, query.typed());
+            if !parsed.skipped_module_load {
+                let working_set = parsed.working_set(self.engine_state);
+                return self.fetch_completions_by_block(
+                    &parsed.block,
+                    &parsed.probe,
+                    self.context(&working_set, query.typed(), parsed.global_span_offset),
+                    query.typed(),
+                );
+            }
+        }
+        self.probed(query.typed(), query.cursor(), |block, probe, context| {
+            self.fetch_completions_by_block(block, probe, context, context.buffer)
+        })
+    }
+
+    /// `then` given the parse of `line` up to the cursor at `position`, with the probe at its
+    /// end, and a context over it.
+    fn probed<T>(
+        &self,
+        line: &str,
+        position: usize,
+        then: impl FnOnce(&Block, &Probe, Context) -> T,
+    ) -> T {
+        let line = &line[..line.floor_char_boundary(position.min(line.len()))];
+        let mut working_set = StateWorkingSet::new(self.engine_state);
+        let offset = working_set.next_span_start();
+        let (block, probe) = parse_probed(
+            &mut working_set,
+            Some("completer"),
+            line.as_bytes(),
+            line.len(),
+        );
+        then(&block, &probe, self.context(&working_set, line, offset))
     }
 
     pub fn fetch_completions_at(&self, line: &str, position: usize) -> Vec<SemanticSuggestion> {
-        self.dispatch_completions_at(line, position)
-            .into_suggestions()
+        self.complete_query(&CompletionQuery::new(line, position))
+    }
+
+    /// [`Self::fetch_completions_at`] as the line editor is answered: a command that takes only
+    /// a closure opens it once taken. Editors with snippets of their own, as through the
+    /// language server, are not given these.
+    pub(crate) fn fetch_completions_for_editor(
+        &self,
+        line: &str,
+        position: usize,
+    ) -> Vec<SemanticSuggestion> {
+        self.finished(&CompletionQuery::new(line, position))
+    }
+
+    /// The suggestions for `query` as they are offered: an alias folded into the command it
+    /// renames, and a command that takes only a closure opening it.
+    fn finished(&self, query: &CompletionQuery) -> Vec<SemanticSuggestion> {
+        let mut found = self.complete_query(query);
+        command_completions::fold_renames(&mut found, &StateWorkingSet::new(self.engine_state));
+        query.settle_on_a_whole_word(&mut found);
+        query.open_closures(&mut found, self.engine_state);
+        found
     }
 
     /// Input record for a completer, menu source, or `commandline complete --input`.
@@ -1122,110 +1590,60 @@ impl<'engine> CompletionEngine<'engine> {
     }
 
     fn input_at(&self, line: &str, position: usize, wanted: DeclaredInputs) -> Value {
-        let cursor = line.floor_char_boundary(position.min(line.len()));
-        let sliced_line = &line[..cursor];
-
-        let mut working_set = StateWorkingSet::new(self.engine_state);
-        let offset = working_set.next_span_start();
-        let block = parse(
-            &mut working_set,
-            Some("completer"),
-            sliced_line.as_bytes(),
-            false,
-        );
-
-        let buffer = Buffer {
-            text: sliced_line,
-            offset,
-        };
-        let site = Self::resolve_completion_site(&block, &working_set, buffer, sliced_line);
-
-        completer_input(
-            &self
-                .context(
-                    &working_set,
-                    buffer,
-                    site.span,
-                    site.typed_prefix.as_bytes(),
-                )
-                .at_site(&site),
-            wanted,
-        )
+        self.probed(line, position, |block, probe, context| {
+            let (site, _) = Self::resolve_completion_site(block, probe, &context, context.buffer);
+            completer_input(&context.at_site(&site), wanted)
+        })
     }
 
     /// Whether the completer that would run at `position` must run inline (`@interactive`)
     /// rather than on the background worker. Parses and resolves the site; runs no completer.
     pub(crate) fn interactive_completer_at(&self, line: &str, position: usize) -> bool {
-        let safe_position = line.floor_char_boundary(position);
-        let sliced_line = &line[..safe_position];
-
-        let mut working_set = StateWorkingSet::new(self.engine_state);
-        let offset = working_set.next_span_start();
-        let block = parse(
-            &mut working_set,
-            Some("completer"),
-            sliced_line.as_bytes(),
-            false,
-        );
-
-        let buffer = Buffer {
-            text: sliced_line,
-            offset,
-        };
-        let site = Self::resolve_completion_site(&block, &working_set, buffer, sliced_line);
-
-        self.site_is_interactive(&site, &working_set)
-            || self
-                .with_shorter_head_reading(
-                    &site,
-                    &working_set,
-                    buffer,
-                    sliced_line,
-                    |engine, shorter, shorter_ws| engine.site_is_interactive(shorter, shorter_ws),
-                )
-                .unwrap_or(false)
+        self.probed(line, position, |block, probe, context| {
+            let (site, shorter) =
+                Self::resolve_completion_site(block, probe, &context, context.buffer);
+            [Some(site), shorter]
+                .iter()
+                .flatten()
+                .any(|site| self.site_is_interactive(site, context.working_set))
+        })
     }
 
-    /// Whether the completer that would run first at `site` is interactive.
+    /// Whether the user completer that would run first at `site`, mirroring dispatch order, is
+    /// `@interactive`: an argument's own completer runs before the command-wide one.
     fn site_is_interactive(&self, site: &CompletionSite, working_set: &StateWorkingSet) -> bool {
-        match site_completer(site, working_set) {
-            Some(SiteCompleter::Decl(decl_id)) => decl_is_interactive(working_set, decl_id),
-            Some(SiteCompleter::External) => self
-                .stack
-                .get_config(self.engine_state)
-                .completions
-                .external
-                .completer
-                .as_ref()
-                .is_some_and(|closure| closure_is_interactive(working_set, closure)),
-            None => false,
+        // The configured external closure is read through to the command it dispatches to.
+        let external = || {
+            (self.external_completer())
+                .is_some_and(|closure| closure_is_interactive(working_set, &closure))
+        };
+        let call = match (&site.kind, site.kind.call_site()) {
+            (SiteKind::ExternalArg { .. }, _) => return external(),
+            (_, Some(call_site)) => call_site.call,
+            (_, None) => return false,
+        };
+        let signature = working_set.get_decl(call.decl_id).signature();
+        let argument_completer = match &site.kind {
+            SiteKind::FlagValue { flag, .. } => {
+                find_flag(&signature, *flag).and_then(|flag| flag.completion)
+            }
+            SiteKind::Positional { sig_positional, .. } => signature
+                .get_positional(*sig_positional)
+                .and_then(|positional| positional.completion.clone()),
+            // Dispatch also runs the positional completer here for `def --wrapped`.
+            SiteKind::FlagName { sig_positional, .. } if signature.allows_unknown_args => signature
+                .get_positional(*sig_positional)
+                .and_then(|positional| positional.completion.clone()),
+            _ => None,
+        };
+        match (argument_completer, signature.complete) {
+            (Some(Completion::Command(decl_id)), _)
+            | (_, Some(CommandWideCompleter::Command(decl_id))) => {
+                decl_is_interactive(working_set, decl_id)
+            }
+            (_, Some(CommandWideCompleter::External)) => external(),
+            (_, None) => false,
         }
-    }
-
-    fn dispatch_completions_at(&self, line: &str, position: usize) -> Fetched {
-        let safe_position = line.floor_char_boundary(position);
-        // Parse only up to the cursor.
-        let sliced_line = &line[..safe_position];
-
-        let mut working_set = StateWorkingSet::new(self.engine_state);
-        let span_offset = working_set.next_span_start();
-
-        let block = parse(
-            &mut working_set,
-            Some("completer"),
-            sliced_line.as_bytes(),
-            false,
-        );
-
-        self.fetch_completions_by_block(
-            block,
-            &working_set,
-            Buffer {
-                text: sliced_line,
-                offset: span_offset,
-            },
-            sliced_line,
-        )
     }
 
     pub fn fetch_completions_within_file(
@@ -1236,125 +1654,187 @@ impl<'engine> CompletionEngine<'engine> {
     ) -> Vec<SemanticSuggestion> {
         let mut working_set = StateWorkingSet::new(self.engine_state);
 
-        // `parse` must run first: it registers the file and its spans in `working_set`.
-        let block = parse(&mut working_set, Some(filename), contents.as_bytes(), false);
+        let cursor = contents.floor_char_boundary(position.min(contents.len()));
+        // The parse must run first: it registers the file and its spans in `working_set`.
+        let (block, mut probe) = parse_probed(
+            &mut working_set,
+            Some(filename),
+            contents.as_bytes(),
+            cursor,
+        );
+        // In an editor what follows the cursor is not being written: after a space the cursor
+        // inserts before the next word, and in a `$` word what follows it is left as it is.
+        let before = &contents[..cursor];
+        let gap = before.chars().next_back().is_none_or(char::is_whitespace);
+        let variable = (before.rsplit(|c: char| c.is_whitespace() || "|(){}[]<>,:;".contains(c)))
+            .next()
+            .is_some_and(|word| word.starts_with('$'));
+        let at = probe.at;
+        for found in &mut probe.found {
+            if gap && found.span.start == at {
+                found.span = Span::new(at, at);
+            } else if variable {
+                found.span.end = found.span.end.clamp(found.span.start, at);
+            }
+        }
 
         let Some(file_span) = working_set.get_span_for_filename(filename) else {
             return Vec::new();
         };
 
-        let cursor = contents.floor_char_boundary(position.min(contents.len()));
         self.fetch_completions_by_block(
-            block,
-            &working_set,
-            Buffer {
-                text: &contents[..cursor],
-                offset: file_span.start,
-            },
+            &block,
+            &probe,
+            self.context(&working_set, &contents[..cursor], file_span.start),
             contents,
         )
-        .into_suggestions()
     }
 
-    /// `buffer` is the commandline; `contents` is the text the block was parsed from.
+    /// `context` holds the commandline; `contents` is the text the block was parsed from, with
+    /// `probe` at the cursor.
     fn fetch_completions_by_block(
         &self,
-        block: Arc<Block>,
-        working_set: &StateWorkingSet,
-        buffer: Buffer,
+        block: &Block,
+        probe: &Probe,
+        context: Context,
         contents: &str,
-    ) -> Fetched {
-        let site = Self::resolve_completion_site(&block, working_set, buffer, contents);
-        let mut dispatched = self.dispatch_completion_site(&site, working_set, buffer);
-
-        // A multi-word head is ambiguous: offer the shorter command's argument reading too.
-        dispatched.prepend_from(self.complete_multiword_head_as_argument(
-            &site,
-            working_set,
-            buffer,
-            contents,
-        ));
-        dispatched
-    }
-
-    /// `baz --test bar` can also read as the value of `baz --test`'s flag.
-    fn complete_multiword_head_as_argument(
-        &self,
-        site: &CompletionSite,
-        working_set: &StateWorkingSet,
-        buffer: Buffer,
-        contents: &str,
-    ) -> Fetched {
-        self.with_shorter_head_reading(
-            site,
-            working_set,
-            buffer,
-            contents,
-            |engine, shorter, shorter_ws| {
-                let mut dispatched = engine.dispatch_completion_site(shorter, shorter_ws, buffer);
-                // Keep only the argument value; drop command-kind results.
-                dispatched.retain(|candidate| {
-                    !matches!(candidate.kind, Some(SuggestionKind::Command(..)))
-                });
-                dispatched
-            },
-        )
-        .unwrap_or_default()
-    }
-
-    /// Run `f` on the shorter command's reading of an ambiguous multi-word head (`foo bar`
-    /// also reading as `foo`'s argument). One re-parse shared by dispatch and interactive
-    /// routing so they cannot drift. `None` when there is no distinct argument site.
-    fn with_shorter_head_reading<T>(
-        &self,
-        site: &CompletionSite,
-        working_set: &StateWorkingSet,
-        buffer: Buffer,
-        contents: &str,
-        f: impl FnOnce(&Self, &CompletionSite, &StateWorkingSet) -> T,
-    ) -> Option<T> {
-        if !matches!(site.kind, SiteKind::Command { .. })
-            || !working_set
-                .get_span_contents(site.span)
-                .iter()
-                .any(u8::is_ascii_whitespace)
+    ) -> Vec<SemanticSuggestion> {
+        let context = Context {
+            scope: &probe.scope,
+            ..context
+        };
+        let (site, shorter) = Self::resolve_completion_site(block, probe, &context, contents);
+        if let Some(helped) =
+            Self::help_from_parse(probe, &site, context).filter(|found| !found.is_empty())
         {
-            return None;
+            return helped;
         }
-
-        // Owns the spans the resolved site borrows.
-        let mut shorter_ws = StateWorkingSet::new(self.engine_state);
-        let _ = shorter_ws.add_file("completer", contents.as_bytes());
-        let shorter = parse_shorter_head_reading(&mut shorter_ws, site.span, None)?;
-
-        let mut shorter_site = Self::finalize_site(
-            Self::resolve_expression_site(&shorter, site.cursor, &shorter_ws),
-            buffer,
-            contents,
-        );
-        // A command-head result means no distinct argument; leave it to the primary dispatch.
-        if matches!(shorter_site.kind, SiteKind::Command { .. }) {
-            return None;
+        let flowing =
+            (site.piped.clone()).or_else(|| piped::block_input(context.working_set, &site.nests));
+        // In a file, what comes after the cursor is no part of what is open at it.
+        let before = contents.get(..context.relative(site.cursor));
+        if let Some(helped) = before.and_then(|typed| {
+            super::records::help(
+                block,
+                probe,
+                typed,
+                flowing.as_ref(),
+                &context.at_site(&site),
+            )
+        }) {
+            return helped;
         }
-        // A single-expression re-parse has no enclosing chain.
-        shorter_site.contexts = vec![shorter_site.own_context()];
-
-        Some(f(self, &shorter_site, &shorter_ws))
+        let dispatched = self.dispatch_completion_site(&site, context);
+        // A name of several words is also a shorter command and its arguments: the argument it
+        // reads as is offered too, ahead of the commands.
+        let mut found = shorter.map_or_else(Vec::new, |shorter| {
+            let mut found = self.dispatch_completion_site(&shorter, context);
+            found.retain(|candidate| {
+                let command = matches!(candidate.kind, Some(SuggestionKind::Command(..)));
+                if let (true, Some(trace)) = (command, context.trace) {
+                    trace.dropped(
+                        candidate.source.as_deref(),
+                        candidate.suggestion.value.clone(),
+                        "a command: the shorter reading of the head completes an argument",
+                    );
+                }
+                !command
+            });
+            found
+        });
+        found.extend(dispatched);
+        found
     }
 
-    /// Dispatch the site to the appropriate specialized completer.
+    /// What the parse says the cursor calls for beyond its site: the parser's fix for a word
+    /// written as another language writes it, before the cursor in the construct the cursor is
+    /// in, offered alone until it is put right (`where size = 1b ⌶` offers `==` for the `=`); and
+    /// the spans of time a date is moved by (`(date now) - ⌶`).
+    fn help_from_parse(
+        probe: &Probe,
+        site: &CompletionSite,
+        context: Context,
+    ) -> Option<Vec<SemanticSuggestion>> {
+        let working_set = context.working_set;
+        let in_construct =
+            |span: Span| (probe.found.iter()).any(|found| found.within.contains_span(span));
+        let fix = (working_set.parse_errors.iter())
+            .filter_map(nu_protocol::ParseError::fix)
+            .find(|fix| fix.span.end < site.cursor && in_construct(fix.span));
+        if let Some((fix, meant)) =
+            fix.and_then(|fix| Some((fix.clone(), *fix.replacements.first()?)))
+        {
+            let written = String::from_utf8_lossy(working_set.get_span_contents(fix.span));
+            let grows = meant.len() as isize - written.len() as isize;
+            return Some(vec![SemanticSuggestion {
+                suggestion: Suggestion {
+                    value: meant.to_owned(),
+                    span: to_reedline_span(fix.span, context.offset),
+                    cursor: context.relative(site.cursor).checked_add_signed(grows),
+                    ..Suggestion::default()
+                },
+                kind: Some(SuggestionKind::Operator),
+                source: Some(Cow::Borrowed("what is meant")),
+                fixes: Some(written.into_owned()),
+                ..SemanticSuggestion::default()
+            }]);
+        }
+        // A number and its unit written apart (`1 kb`) are one value, as the parser reads it.
+        let apart = (working_set.parse_errors.iter()).find_map(|error| {
+            let unit = error.span();
+            if !(in_construct(unit) && unit.end < site.cursor && unit.start > probe.source.start) {
+                return None;
+            }
+            let before = working_set.get_span_contents(Span::new(probe.source.start, unit.start));
+            let digits = before.strip_suffix(b" ")?;
+            let digits = digits
+                .iter()
+                .rev()
+                .take_while(|c| c.is_ascii_digit())
+                .count();
+            (digits > 0).then(|| Span::new(unit.start - 1 - digits, unit.end))
+        });
+        if let Some(span) = apart {
+            let joined: String = String::from_utf8_lossy(working_set.get_span_contents(span))
+                .split_whitespace()
+                .collect();
+            let mut parse = StateWorkingSet::new(working_set.permanent_state);
+            let block = nu_parser::parse(&mut parse, None, joined.as_bytes(), false);
+            let is_unit_value = (block.pipelines.first())
+                .and_then(|pipeline| pipeline.elements.first())
+                .is_some_and(|element| matches!(element.expr.expr, Expr::ValueWithUnit(_)));
+            if is_unit_value && parse.parse_errors.is_empty() {
+                return Some(vec![SemanticSuggestion {
+                    suggestion: Suggestion {
+                        value: joined,
+                        span: to_reedline_span(span, context.offset),
+                        cursor: context.relative(site.cursor).checked_sub(1),
+                        ..Suggestion::default()
+                    },
+                    source: Some(Cow::Borrowed("what is meant")),
+                    ..SemanticSuggestion::default()
+                }]);
+            }
+        }
+        let moves_a_date = probe.innermost().any(|found| {
+            matches!(&found.what, Expect::Operand { lhs, operator: Operator::Math(nu_protocol::ast::Math::Add | nu_protocol::ast::Math::Subtract) } if lhs.ty == Type::Date)
+        });
+        moves_a_date.then(|| ask([Source::Durations], &context.at_site(site).token(site.span)))
+    }
+
+    /// The suggestions at `site`.
     fn dispatch_completion_site<'a>(
         &'a self,
         site: &'a CompletionSite<'a>,
-        working_set: &'a StateWorkingSet,
-        buffer: Buffer<'a>,
-    ) -> Fetched {
-        let completion_context = self
-            .context(working_set, buffer, site.span, site.typed_prefix.as_bytes())
-            .at_site(site);
+        context: Context<'a>,
+    ) -> Vec<SemanticSuggestion> {
+        let context = context.at_site(site);
+        if let Some(trace) = context.trace {
+            trace.reading(site, &context);
+        }
 
         match &site.kind {
-            SiteKind::Command { node } => {
+            SiteKind::Command { node, parent } => {
                 // A cursor before a leading `^`/`%` is outside the command name.
                 // Inserting a name there would put it in front of the sigil.
                 if node.is_some_and(|node| match &node.expr {
@@ -1362,162 +1842,334 @@ impl<'engine> CompletionEngine<'engine> {
                     Expr::ExternalCall(head, _) => site.cursor < head.span.start,
                     _ => false,
                 }) {
-                    return Fetched::default();
+                    return Vec::new();
                 }
-                let completions = self.command_completion_helper(
-                    working_set,
-                    buffer,
-                    site.span,
-                    self.command_completion_for_head(*node, site.span, working_set),
+                let mut found = ask(
+                    [Source::Commands {
+                        scope: self.command_scope_for_head(*node, site.span, context.working_set),
+                        quoted: false,
+                        parent: parent.map(|parent| context.working_set.get_decl(parent).name()),
+                    }],
+                    &context.token(site.span),
                 );
+                // What is piped in, for a preview of each command at work on it.
+                if let Some(prior) = site.prior {
+                    let input: Arc<str> =
+                        String::from_utf8_lossy(context.working_set.get_span_contents(prior))
+                            .trim()
+                            .into();
+                    for item in &mut found {
+                        item.input = Some(Arc::clone(&input));
+                    }
+                }
 
-                if completions.is_empty() {
-                    self.suggestions_at(&mut FileCompletion, &completion_context)
+                // A command group (`export zzz`) has no files to fall back on, and a word that is
+                // no path is no program to run from one: only `./run`, `~/bin/run` and `/bin/ls`
+                // are, as the shell runs them.
+                let group =
+                    parent.is_some() || node.is_some_and(|node| matches!(node.expr, Expr::Garbage));
+                let typed = String::from_utf8_lossy(context.prefix);
+                let path_like = typed
+                    .trim_start_matches(['"', '\'', '`', '^'])
+                    .starts_with(['.', '~'])
+                    || typed.contains(std::path::is_separator);
+                if found.is_empty() && !group && path_like {
+                    ask_fallback([Source::Paths { directories: false }], &context)
                 } else {
-                    completions
+                    found
                 }
             }
 
             SiteKind::FlagName { .. }
             | SiteKind::FlagValue { .. }
-            | SiteKind::Positional { .. } => {
-                self.dispatch_call_completion_site(site, working_set, buffer, &completion_context)
+            | SiteKind::Positional { .. } => self.dispatch_call_completion_site(site, &context),
+
+            SiteKind::Operator { lhs } => ask(
+                [Source::Operators(lhs)],
+                &Context {
+                    rows: site.rows.as_ref(),
+                    ..context
+                },
+            ),
+
+            SiteKind::Operand {
+                members,
+                comparison,
+                ..
+            } => ask(
+                [Source::Operand {
+                    members: members.clone(),
+                    operator: *comparison,
+                }],
+                &context,
+            ),
+
+            SiteKind::CellPath { path } => {
+                let mut found = ask(
+                    [Source::CellPath {
+                        path,
+                        cursor: site.cursor,
+                    }],
+                    &Context {
+                        rows: site.rows.as_ref(),
+                        ..context
+                    },
+                );
+                // A column named in a condition or closure of a call (`where size`) has the
+                // call's help for that parameter.
+                if let Some(at) = &site.around {
+                    for item in &mut found {
+                        item.help_at.get_or_insert_with(|| Arc::clone(at));
+                    }
+                }
+                found
             }
 
-            SiteKind::Operator { lhs } => OperatorCompletion {
-                left_hand_side: lhs,
+            SiteKind::Variable if context.prefix.starts_with(b"$") => {
+                ask([Source::Variables], &context)
             }
-            .fetch(&completion_context),
+            SiteKind::Variable => Vec::new(),
 
-            SiteKind::CellPath { path } => CellPathCompletion {
-                full_cell_path: path,
-                cursor: site.cursor,
+            SiteKind::AttributeName => ask([Source::Attributes], &context),
+
+            SiteKind::AttributableItem => ask([Source::Attributables], &context),
+
+            SiteKind::ExternalArg { call, .. } => {
+                // A program that is no command at all is most likely a slip: the command meant is
+                // the answer, in its place, wherever the cursor is on its line. What its
+                // arguments would complete to is for a line that runs.
+                let meant = match &call.expr {
+                    Expr::ExternalCall(head, _) => self.command_meant(head, &context),
+                    _ => None,
+                };
+                match meant {
+                    Some(meant) => vec![meant],
+                    None => self.dispatch_external_arg(site, &context),
+                }
             }
-            .fetch(&completion_context),
 
-            SiteKind::Variable => self.variable_names_completion_helper(&completion_context),
+            SiteKind::File => ask([Source::Paths { directories: false }], &context),
 
-            SiteKind::AttributeName => AttributeCompletion.fetch(&completion_context),
-
-            SiteKind::AttributableItem => AttributableCompletion.fetch(&completion_context),
-
-            SiteKind::ExternalArg { .. } => {
-                self.dispatch_external_arg(site, working_set, buffer, &completion_context)
-            }
-
-            SiteKind::File => self.suggestions_at(&mut FileCompletion, &completion_context),
+            SiteKind::Literal => Vec::new(),
         }
     }
 
-    /// Complete an external call argument.
+    /// Complete an external call argument: its wrapped command line, or else the configured
+    /// external completer, then files unless that answers or subcommands extend the call.
+    /// The command meant by the head `head` of an external call, when it names no command,
+    /// internal or on `PATH`, nor a path: the best match for it, put in its place.
+    fn command_meant(&self, head: &Expression, context: &Context) -> Option<SemanticSuggestion> {
+        let program = String::from_utf8_lossy(context.working_set.get_span_contents(head.span));
+        let program = program.trim_start_matches('^');
+        // A line for another machine knows its commands only by asking it.
+        let known = context.delegation.is_some()
+            || program.contains(std::path::is_separator)
+            || program.is_empty()
+            || WRAPPERS.contains(&program)
+            || context.working_set.find_decl(program.as_bytes()).is_some()
+            || (executable_files(context).iter()).any(|(name, _)| name == program);
+        if known || head.span.start >= head.span.end {
+            return None;
+        }
+        let found = ask(
+            [Source::Commands {
+                scope: CommandScope::All,
+                quoted: false,
+                parent: None,
+            }],
+            &context.token(head.span),
+        );
+        // A slip is close to what was meant: two edits at most, a swap counting as one, case
+        // aside.
+        let letters = |text: &str| -> Vec<String> {
+            use unicode_segmentation::UnicodeSegmentation;
+            text.to_lowercase()
+                .graphemes(true)
+                .map(str::to_owned)
+                .collect()
+        };
+        let typed = letters(program);
+        let mut meant = found.into_iter().find(|item| {
+            let value = &item.suggestion.value;
+            value != program
+                && !value.contains(' ')
+                && super::rank::damerau_levenshtein(&typed, &letters(value)) <= 2
+        })?;
+        // The arguments after it are kept as they are, and the cursor stays where it is on them.
+        meant.suggestion.append_whitespace = false;
+        let grows = meant.suggestion.value.len() as isize - program.len() as isize;
+        meant.suggestion.cursor = context
+            .relative(context.absolute_cursor())
+            .checked_add_signed(grows);
+        meant.source = Some(Cow::Borrowed("the command meant"));
+        meant.fixes = Some(program.to_owned());
+        Some(meant)
+    }
+
     fn dispatch_external_arg(
         &self,
         site: &CompletionSite,
-        working_set: &StateWorkingSet,
-        buffer: Buffer,
-        completion_context: &Context,
-    ) -> Fetched {
+        context: &Context,
+    ) -> Vec<SemanticSuggestion> {
         let SiteKind::ExternalArg {
             call: external_call,
             index,
         } = &site.kind
         else {
-            return Fetched::default();
+            return Vec::new();
         };
-        let external_call = *external_call;
-        let Expr::ExternalCall(head, _) = &external_call.expr else {
-            return Fetched::default();
+        let Expr::ExternalCall(head, arguments) = &external_call.expr else {
+            return Vec::new();
         };
+        let working_set = context.working_set;
 
-        // The first argument of `sudo`/`doas` is a command run under the wrapper.
-        if *index == 0 {
-            let head_command = working_set.get_span_contents(head.span);
-            if head_command == b"sudo" || head_command == b"doas" {
-                let commands = self.command_completion_helper(
-                    working_set,
-                    buffer,
-                    site.span,
-                    CommandCompletion::new(CommandScope::All),
-                );
-                if !commands.is_empty() {
-                    return commands;
-                }
-            }
+        // What `sudo` runs completes as a line of its own, from the first argument unless that
+        // is one of its options.
+        let program = String::from_utf8_lossy(working_set.get_span_contents(head.span));
+        let first = match index {
+            0 => site.span,
+            _ => arguments
+                .first()
+                .map_or(site.span, |argument| argument.expr().span),
+        };
+        if WRAPPERS.contains(&program.trim_start_matches('^'))
+            && !working_set.get_span_contents(first).starts_with(b"-")
+            && let Some(wrapped) = delegation::complete(
+                context,
+                first.start.saturating_sub(context.offset),
+                Sources::default(),
+            )
+        {
+            return wrapped;
         }
-
-        // Neutral seed: answered until a source declines, unreusable until one keeps.
-        let mut dispatched = Fetched::default();
-
-        // The user's configured external completer.
-        let external_answered = self
-            .stack
-            .get_config(self.engine_state)
-            .completions
-            .external
-            .completer
-            .as_ref()
-            .is_some_and(|completer| {
-                dispatched.absorb(
-                    UserCompletion::closure(working_set, completer).fetch(completion_context),
-                )
-            });
 
         // Subcommands extending this call suppress the file fallback.
         let subcommands =
-            self.subcommand_suggestions(working_set, buffer, external_call.span.start, site.cursor);
+            self.subcommand_suggestions(context, external_call.span.start, site.cursor, None);
 
-        // Add file completion when the source leaves the slot open.
-        let wants_file = subcommands.is_empty()
-            && (!dispatched.answered() || (!external_answered && dispatched.is_empty()));
-        if wants_file {
-            dispatched.merge(self.suggestions_at(&mut FileCompletion, completion_context));
+        let mut sources = Vec::new();
+        // The user's configured external completer, which answers for this machine.
+        if let Some(completer) = self
+            .external_completer()
+            .filter(|_| !context.delegation.is_some_and(Delegation::is_remote))
+        {
+            sources.push(Source::Custom(UserCompletion::closure(
+                working_set,
+                &completer,
+            )));
+        }
+        // Files, when the source leaves the slot open.
+        if subcommands.is_empty() {
+            sources.push(Source::Paths { directories: false });
         }
 
-        dispatched.merge(subcommands);
-        dispatched
+        let mut found = ask(sources, context);
+        // What a completer lists after the program's name may name its subcommands.
+        match index {
+            0 => link_subcommands(
+                &mut found,
+                subcommands,
+                program.trim_start_matches('^'),
+                working_set,
+            ),
+            _ => found.extend(subcommands),
+        }
+        let at = Arc::new(HelpAt {
+            command: HelpFor::External(program.trim_start_matches('^').to_owned()),
+            slot: Slot::Argument,
+        });
+        for item in &mut found {
+            if !matches!(item.kind, Some(SuggestionKind::Command(..))) {
+                item.help_at.get_or_insert_with(|| Arc::clone(&at));
+            }
+        }
+        found
     }
 
     /// Dispatch completions for call-bound sites.
     fn dispatch_call_completion_site(
         &self,
         site: &CompletionSite,
-        working_set: &StateWorkingSet,
-        buffer: Buffer,
-        completion_context: &Context,
-    ) -> Fetched {
+        context: &Context,
+    ) -> Vec<SemanticSuggestion> {
         // Only call-bound kinds carry a call; anything else is an error here.
         let call = match &site.kind {
             SiteKind::FlagName { site, .. }
             | SiteKind::FlagValue { site, .. }
             | SiteKind::Positional { site, .. } => site.call,
-            _ => return Fetched::default(),
+            _ => return Vec::new(),
         };
 
-        let signature = working_set.get_decl(call.decl_id).signature();
+        let declaration = context.working_set.get_decl(call.decl_id);
+        // An argument that names columns names those of what is piped into the call.
+        let context = &Context {
+            rows: (site.piped.as_ref()).filter(|ty| !piped::is_unknown(ty)),
+            ..*context
+        };
 
-        // Subcommands are always offered and suppress the file-path fallback.
-        let subcommands =
-            self.subcommand_suggestions(working_set, buffer, call.head.start, site.cursor);
+        let signature = declaration.signature();
+
+        // Subcommands are offered and suppress the file-path fallback, but not in a gap the
+        // command's own argument is still needed for: `each ⌶` takes a closure, though
+        // `each while` begins the same way.
+        let given = (call.positional_iter())
+            .filter(|arg| arg.span.end <= site.cursor)
+            .count();
+        let needs_argument = site.span.is_empty() && given < signature.required_positional.len();
+        let subcommands = match needs_argument {
+            true => Vec::new(),
+            false => self.subcommand_suggestions(
+                context,
+                call.head.start,
+                site.cursor,
+                Some(declaration.name()),
+            ),
+        };
 
         // Value kinds share one shape; only the `ArgType`, completer lookup, and the
         // `declared_shape` used for the empty-slot fallback differ.
-        let argument_value = |engine: &Self, arg_type, custom, arg_slot, declared_shape| {
-            engine.complete_argument_value(
-                custom,
-                ArgValueCompletion {
-                    call,
-                    arg_type,
-                    need_fallback: subcommands.is_empty(),
-                    arg_idx: arg_slot,
-                    declared_shape,
-                    cursor: site.cursor,
-                },
-                completion_context,
-                &signature,
+        let argument_value = |arg_type, custom, arg_idx, declared_shape| {
+            ask(
+                self.value_sources(
+                    custom,
+                    ArgValueCompletion {
+                        call,
+                        arg_type,
+                        arg_idx,
+                        declared_shape,
+                        cursor: site.cursor,
+                    },
+                    context,
+                    &signature,
+                    subcommands.is_empty(),
+                ),
+                context,
             )
         };
 
-        let mut results = match &site.kind {
+        let mut found = match &site.kind {
+            // A word like a flag that comes after the rest of the arguments has begun belongs to
+            // what they are, when the rest is a command line of its own: `ssh host ls -l`. The
+            // rest's completer says so by delegating it.
+            SiteKind::FlagName {
+                sig_positional,
+                arg_slot,
+                ..
+            } if let Some(rest) = signature
+                .rest_positional
+                .as_ref()
+                .filter(|rest| rest.completion.is_some())
+                .filter(|_| rest_has_begun(call, &signature, site.cursor))
+                && let Some(delegated) = Some(argument_value(
+                    ArgType::Positional(*sig_positional),
+                    rest.completion.clone(),
+                    *arg_slot,
+                    Some(rest.shape.clone()),
+                ))
+                .filter(|answered| answered.iter().any(is_delegated)) =>
+            {
+                delegated
+            }
             SiteKind::FlagName {
                 sig_positional,
                 arg_slot,
@@ -1531,12 +2183,8 @@ impl<'engine> CompletionEngine<'engine> {
                 // completer answers next to the flags (#19097); it already falls back to
                 // the command-wide one. An undeclared one would only list files.
                 Some(positional) => {
-                    let mut flags = FlagCompletion {
-                        decl_id: call.decl_id,
-                    }
-                    .fetch(completion_context);
-                    flags.merge(argument_value(
-                        self,
+                    let mut flags = ask([Source::Flags(call.decl_id)], context);
+                    flags.extend(argument_value(
                         ArgType::Positional(*sig_positional),
                         positional.completion.clone(),
                         *arg_slot,
@@ -1544,12 +2192,11 @@ impl<'engine> CompletionEngine<'engine> {
                     ));
                     flags
                 }
-                None => self.complete_flag_names(call.decl_id, completion_context, &signature),
+                None => self.complete_flag_names(call.decl_id, context, &signature),
             },
             SiteKind::FlagValue { flag, arg_slot, .. } => {
                 let resolved = find_flag(&signature, *flag);
                 argument_value(
-                    self,
                     ArgType::Flag(Cow::Borrowed(flag.name())),
                     resolved.as_ref().and_then(|flag| flag.completion.clone()),
                     *arg_slot,
@@ -1563,885 +2210,864 @@ impl<'engine> CompletionEngine<'engine> {
             } => {
                 let positional = signature.get_positional(*sig_positional);
                 argument_value(
-                    self,
                     ArgType::Positional(*sig_positional),
                     positional.and_then(|positional| positional.completion.clone()),
                     *arg_slot,
                     positional.map(|positional| positional.shape.clone()),
                 )
             }
-            _ => Fetched::default(),
+            _ => Vec::new(),
         };
 
-        results.merge(subcommands);
-        results
+        leave_out_what_is_written(
+            &mut found,
+            site,
+            call,
+            &signature,
+            context.working_set,
+            context.offset,
+        );
+        link_subcommands(
+            &mut found,
+            subcommands,
+            declaration.name(),
+            context.working_set,
+        );
+        // Whatever is offered here sits in a flag or a parameter of the call, which its
+        // preview has help for. (A subcommand is a command, with help of its own.)
+        let slot = match &site.kind {
+            SiteKind::FlagName { .. } => Some(Slot::Flag),
+            SiteKind::FlagValue { flag, .. } => Some(Slot::FlagValue(flag.name().to_owned())),
+            SiteKind::Positional { sig_positional, .. } => Some(Slot::Positional(*sig_positional)),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            let at = Arc::new(HelpAt {
+                command: HelpFor::Decl(call.decl_id),
+                slot,
+            });
+            for item in &mut found {
+                if !matches!(item.kind, Some(SuggestionKind::Command(_, Some(_)))) {
+                    item.help_at.get_or_insert_with(|| Arc::clone(&at));
+                }
+            }
+        }
+        found
     }
 
-    /// Resolve the contextual state and constraints at the cursor's location.
+    /// The site the cursor is at, as the parser's probe of the line reads it, with what flows
+    /// into the element it is in; and the shorter reading of a name of several words, as an
+    /// argument of a shorter command, if the name has one.
     pub(crate) fn resolve_completion_site<'a>(
         block: &'a Block,
-        working_set: &'a StateWorkingSet,
-        buffer: Buffer,
+        probe: &'a Probe,
+        context: &Context<'a>,
         contents: &'a str,
-    ) -> CompletionSite<'a> {
-        let absolute_position = buffer.absolute_cursor();
+    ) -> (CompletionSite<'a>, Option<CompletionSite<'a>>) {
+        let working_set = context.working_set;
+        let cursor = context.absolute_cursor();
+        let (shorter, found): (Vec<_>, Vec<_>) = probe.innermost().partition(|found| {
+            !probe.readings.is_empty() && !matches!(found.what, Expect::Command { .. })
+        });
+
+        let (kind, span) = kind_of(&found, probe, block, working_set, cursor);
+        let mut site = CompletionSite::at(cursor, kind, span);
+        if let SiteKind::CellPath { .. } = site.kind {
+            site.around = help_around(probe, block, working_set, cursor);
+        }
+        // To a completer, a comparison in a row condition is the condition the call takes.
+        if let SiteKind::Operand { .. } = site.kind
+            && let Some((call, index, _)) =
+                (found.first()).and_then(|inner| condition_around(inner, probe, block, working_set))
+        {
+            site.level = Level {
+                cursor: ResolvedCursor::Positional { index },
+                element: Some(call.element),
+            };
+        }
 
         // The closures and subexpressions the cursor is nested in, outermost first.
-        let chain = enclosing_elements(block, working_set, absolute_position);
-
-        // The token whose span the cursor is inside of, or at the trailing edge of.
-        let touched_expression = block
-            .find_map(working_set, &|expression: &Expression| {
-                find_pipeline_element_by_position(expression, working_set, absolute_position)
+        let chain = enclosing_elements(block, working_set, cursor);
+        let flow = Flow::new(working_set, context.stack);
+        site.nests = nests_of(&chain, &flow);
+        let own = site.kind.element().and_then(|element| {
+            // An element that uses `$in` is collected, and its nest is the collect around it.
+            (site.nests.iter()).position(|nest| {
+                std::ptr::eq(nest.element, element)
+                    || matches!(&nest.element.expr, Expr::Collect(_, inner) if std::ptr::eq(inner.as_ref(), element))
             })
-            .or_else(|| check_redirection_in_block(block, absolute_position));
-
-        let mut site = match innermost_expression(touched_expression, &chain) {
-            Some(expression) => {
-                Self::resolve_expression_site(expression, absolute_position, working_set)
+        });
+        if let Some(at) = own {
+            let nest = &site.nests[at];
+            // What flows into the first element of a block is what flows into the call that
+            // runs it.
+            site.piped =
+                (nest.input.clone()).or_else(|| piped::block_input(working_set, &site.nests[..at]));
+            (site.prior, site.feed) = (nest.prior.or(nest.feed), nest.feed);
+        }
+        site.rows = Self::head_rows(&site, working_set);
+        // The row a cell path starts with is read from the data its condition or closure is run on.
+        if let Some(source) = Self::head_prior(&site) {
+            site.prior = Some(source.span);
+            site.feed = source.feed;
+        }
+        site.prelude = Self::prelude_of(&chain, working_set);
+        if let SiteKind::Command { node: None, .. } = site.kind {
+            // A command begun in a closure, a block or a subexpression is the first element
+            // of the block, or one after a pipe in it.
+            let nested = chain.last().and_then(|&(element, ..)| {
+                let nested = descent_expression(element, working_set, cursor)?;
+                match nested.expr {
+                    Expr::Closure(id) | Expr::Block(id) | Expr::Subexpression(id) => {
+                        Some(working_set.get_block(id).as_ref())
+                    }
+                    _ => None,
+                }
+            });
+            let flow = flow.within_nests(&site.nests);
+            site.piped = after_pipe(nested.unwrap_or(block), working_set, cursor, &flow);
+            // Nothing before the cursor in a block: what flows into the block flows into it.
+            if nested.is_some() && site.piped.is_none() {
+                site.piped = piped::block_input(working_set, &site.nests);
             }
-            None => Self::resolve_fallback_site(block, working_set, absolute_position),
-        };
-
-        site = promote_row_condition_file(site, &chain, working_set, absolute_position);
-
-        site.contexts = Self::contexts_of(&chain, working_set, absolute_position, &site);
-        Self::finalize_site(site, buffer, contents)
+        }
+        let shorter = (!shorter.is_empty())
+            .then(|| kind_of(&shorter, probe, block, working_set, cursor))
+            .filter(|(kind, _)| !matches!(kind, SiteKind::Command { .. } | SiteKind::Literal))
+            .map(|(kind, span)| {
+                let mut shorter = CompletionSite::at(cursor, kind, span);
+                shorter.piped = site.piped.clone();
+                Self::finalize_site(shorter, context, contents)
+            });
+        (Self::finalize_site(site, context, contents), shorter)
     }
 
-    /// The chain of contexts the cursor lives in, outermost first. `site` supplies the
-    /// innermost one, so it stays the resolution the dispatcher itself acts on rather than
-    /// a second, possibly disagreeing, reading of the same position.
-    fn contexts_of<'a>(
-        chain: &[(&'a Expression, Option<Span>)],
-        working_set: &'a StateWorkingSet,
-        absolute_position: usize,
-        site: &CompletionSite<'a>,
-    ) -> Vec<CompletionContext<'a>> {
-        let target_element = site.kind.element();
+    /// The variable heading the cell path of `site`.
+    fn head_var(site: &CompletionSite) -> Option<VarId> {
+        let path = match &site.kind {
+            SiteKind::Operand { head, .. } => return Some(*head),
+            SiteKind::CellPath { path } => path,
+            SiteKind::Operator { lhs } => match &lhs.expr {
+                Expr::FullCellPath(path) => path.as_ref(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        match path.head.expr {
+            Expr::Var(var_id) => Some(var_id),
+            _ => None,
+        }
+    }
 
-        // Locate the target element's index or default to the final index safely.
-        let innermost_index = target_element
-            .and_then(|target| {
-                chain
-                    .iter()
-                    .position(|(candidate, _)| std::ptr::eq(*candidate, target))
-            })
-            .unwrap_or_else(|| chain.len().saturating_sub(1));
+    /// What the variable heading the cell path of `site` stands for, if it names the rows piped in.
+    fn head_rows(site: &CompletionSite, working_set: &StateWorkingSet) -> Option<Type> {
+        let var_id = Self::head_var(site)?;
+        let rows = piped::rows_named(working_set, &site.nests, var_id)
+            .filter(|rows| !piped::is_unknown(rows))?;
+        // `$in` in the condition of `where` is a row of what is piped in, as a parameter is.
+        let of_a_condition = site.nests.iter().any(|nest| {
+            matches!(&nest.element.expr, Expr::Collect(id, inner)
+                if (*id == var_id || var_id == nu_protocol::IN_VARIABLE_ID)
+                    && matches!(&inner.expr, Expr::Call(call)
+                        if working_set.get_decl(call.decl_id).name() == "where"))
+        });
+        Some(if of_a_condition {
+            piped::row_of(&rows)
+        } else {
+            rows
+        })
+    }
 
-        chain[..innermost_index]
-            .iter()
-            .map(|&(expression, descent)| CompletionContext {
-                cursor: Self::resolve_expression_site(expression, absolute_position, working_set)
-                    .kind
-                    .resolved(),
-                element: Some(expression),
-                descent,
-            })
-            .chain(std::iter::once(CompletionContext {
-                element: target_element.or_else(|| {
-                    chain
-                        .get(innermost_index)
-                        .map(|&(expression, _)| expression)
-                }),
-                ..site.own_context()
-            }))
-            .collect()
+    /// The pipeline whose rows the variable heading the cell path of `site` stands for, when the
+    /// condition or closure it is a parameter of is run on each of them.
+    fn head_prior(site: &CompletionSite) -> Option<piped::Source> {
+        piped::rows_source(&site.nests, Self::head_var(site)?)
+    }
+
+    /// The `let` and `const` statements that come before the elements of `chain`, each in its own
+    /// block, outermost first: the variables the pipelines the cursor is nested in may read.
+    fn prelude_of(chain: &[Enclosing], working_set: &StateWorkingSet) -> Vec<Span> {
+        /// How many statements are kept, the nearest ones.
+        const KEPT: usize = 16;
+        let mut statements = Vec::new();
+        for &(element, _, block) in chain {
+            for pipeline in &block.pipelines {
+                if (pipeline.elements.iter())
+                    .any(|candidate| std::ptr::eq(&candidate.expr, element))
+                {
+                    break;
+                }
+                if let [only] = pipeline.elements.as_slice()
+                    && only.redirection.is_none()
+                    && let Expr::Call(call) = &only.expr.expr
+                    && piped::is_binding(working_set, call)
+                {
+                    statements.push(only.expr.span);
+                }
+            }
+        }
+        statements.split_off(statements.len().saturating_sub(KEPT))
     }
 
     /// Fill `typed_prefix`/`cursor` from the final span so they never disagree.
     fn finalize_site<'a>(
         mut site: CompletionSite<'a>,
-        buffer: Buffer,
+        context: &Context,
         contents: &'a str,
     ) -> CompletionSite<'a> {
-        let token_start = buffer.relative(site.span.start);
+        let token_start = context.relative(site.span.start);
         site.typed_prefix = contents
-            .get(token_start..buffer.cursor())
+            .get(token_start..context.buffer.len())
             .map(Cow::Borrowed)
             .unwrap_or(Cow::Borrowed(""));
-        site.cursor = buffer.absolute_cursor();
+        site.cursor = context.absolute_cursor();
         site
     }
 
-    fn resolve_expression_site<'a>(
-        expression: &'a Expression,
-        absolute_position: usize,
-        working_set: &'a StateWorkingSet,
-    ) -> CompletionSite<'a> {
-        // Cursor past expression: only calls/attribute blocks own trailing gap.
-        if absolute_position > expression.span.end && !owns_trailing_gap(&expression.expr) {
-            let kind = if is_operator_lhs(&expression.expr) {
-                SiteKind::Operator { lhs: expression }
-            } else {
-                SiteKind::File
-            };
-            return CompletionSite::at(absolute_position, kind, Span::point(absolute_position));
-        }
-
-        // Default to file completion; overridden below where the expression warrants it.
-        match &expression.expr {
-            Expr::Call(call) => Self::resolve_call_site(
-                CallSite {
-                    call,
-                    element: expression,
-                },
-                absolute_position,
-                working_set,
-            ),
-            Expr::ExternalCall(head, arguments) => {
-                Self::resolve_external_call_site(expression, head, arguments, absolute_position)
-            }
-            Expr::AttributeBlock(attribute_block) => {
-                Self::resolve_attribute_site(attribute_block, absolute_position)
-            }
-            Expr::Var(_) => {
-                CompletionSite::at(absolute_position, SiteKind::Variable, expression.span)
-            }
-            // `$foo` alone is the variable; `$foo.bar` or `$foo.` is a cell path.
-            Expr::FullCellPath(full_cell_path) => {
-                let has_dot = working_set
-                    .get_span_contents(expression.span)
-                    .ends_with(b".");
-
-                let kind = if full_cell_path.tail.is_empty() && !has_dot {
-                    SiteKind::Variable
-                } else {
-                    SiteKind::CellPath {
-                        path: full_cell_path,
-                    }
-                };
-
-                CompletionSite::at(absolute_position, kind, expression.span)
-            }
-            // Operator site only on its token; otherwise resolve value side.
-            Expr::BinaryOp(left_hand_side, operator, right_hand_side) => {
-                let value_side = match absolute_position {
-                    before if before < operator.span.start => Some(left_hand_side),
-                    after if after > operator.span.end => Some(right_hand_side),
-                    _ => None,
-                };
-
-                match value_side {
-                    Some(side) => {
-                        Self::resolve_expression_site(side, absolute_position, working_set)
-                    }
-                    None => CompletionSite::at(
-                        absolute_position,
-                        SiteKind::Operator {
-                            lhs: left_hand_side.as_ref(),
-                        },
-                        operator.span,
-                    ),
-                }
-            }
-            _ => CompletionSite::at(absolute_position, SiteKind::File, expression.span),
-        }
-    }
-
-    /// Resolve a bare external call; the head completes as a command, else
-    /// [`SiteKind::ExternalArg`].
-    fn resolve_external_call_site<'a>(
-        expression: &'a Expression,
-        head: &'a Expression,
-        arguments: &'a [ExternalArgument],
-        absolute_position: usize,
-    ) -> CompletionSite<'a> {
-        if absolute_position <= head.span.end {
-            return CompletionSite::at(
-                absolute_position,
-                SiteKind::command(expression),
-                command_name_span(head.span, expression.span, absolute_position),
-            );
-        }
-
-        // An existing argument the cursor touches, or else the trailing empty slot.
-        let (index, span) = arguments
-            .iter()
-            .enumerate()
-            .find_map(|(index, argument)| {
-                touches(argument.expr().span, absolute_position)
-                    .then_some((index, argument.expr().span))
-            })
-            .unwrap_or((arguments.len(), Span::point(absolute_position)));
-
-        CompletionSite::at(
-            absolute_position,
-            SiteKind::ExternalArg {
-                call: expression,
-                index,
-            },
-            span,
-        )
-    }
-
-    /// Classify the cursor in a call, most specific first: head, existing argument,
-    /// row-condition operator/value gaps, then the trailing slot.
-    fn resolve_call_site<'a>(
-        site: CallSite<'a>,
-        absolute_position: usize,
-        working_set: &'a StateWorkingSet,
-    ) -> CompletionSite<'a> {
-        if absolute_position <= site.call.head.end {
-            return CompletionSite::at(
-                absolute_position,
-                SiteKind::command(site.element),
-                command_name_span(site.call.head, site.element.span, absolute_position),
-            );
-        }
-        Self::argument_touching(site, absolute_position, working_set)
-            .or_else(|| Self::row_condition_operator(site, working_set, absolute_position))
-            .or_else(|| Self::row_condition_value_gap(site, working_set, absolute_position))
-            .unwrap_or_else(|| Self::trailing_slot(site, working_set, absolute_position))
-    }
-
-    /// The existing argument the cursor touches, if any.
-    fn argument_touching<'a>(
-        site: CallSite<'a>,
-        absolute_position: usize,
-        working_set: &StateWorkingSet,
-    ) -> Option<CompletionSite<'a>> {
-        let (argument_index, argument) = site
-            .call
-            .arguments
-            .iter()
-            .enumerate()
-            .find(|(_, argument)| touches(argument.span(), absolute_position))?;
-        Some(Self::resolve_argument_site(
-            site,
-            argument,
-            argument_index,
-            absolute_position,
-            working_set,
-        ))
-    }
-
-    /// Classify the trailing slot (flag value, flag name, or positional) by the
-    /// trailing non-whitespace token.
-    fn trailing_slot<'a>(
-        site: CallSite<'a>,
-        working_set: &StateWorkingSet,
-        absolute_position: usize,
-    ) -> CompletionSite<'a> {
-        let CallSite { call, .. } = site;
-        let gap_start = call
-            .arguments
-            .last()
-            .map_or(call.head.end, |argument| argument.span().end);
-
-        let gap = working_set.get_span_contents(Span::new(gap_start, absolute_position));
-
-        // Start just past the last whitespace in the gap.
-        let token_start = gap
-            .iter()
-            .rposition(u8::is_ascii_whitespace)
-            .map_or(gap_start, |index| gap_start + index + 1);
-
-        let trailing_token = Span::new(token_start, absolute_position);
-        let token_is_flag = is_flag_token(working_set, trailing_token);
-
-        let point = Span::point(absolute_position);
-
-        if let Some(flag_ref) = pending_flag_value(call, working_set) {
-            // `arg_slot` past the last argument: no node exists yet; `ArgValueCompletion` reads `None`.
-            CompletionSite::at(
-                absolute_position,
-                SiteKind::FlagValue {
-                    site,
-                    flag: flag_ref,
-                    arg_slot: call.arguments.len(),
-                },
-                point,
-            )
-        } else {
-            let sig_positional = count_positionals(call, call.arguments.len());
-            let arg_slot = call.arguments.len();
-            if token_is_flag {
-                CompletionSite::at(
-                    absolute_position,
-                    SiteKind::FlagName {
-                        site,
-                        sig_positional,
-                        arg_slot,
-                    },
-                    trailing_token,
-                )
-            } else {
-                CompletionSite::at(
-                    absolute_position,
-                    SiteKind::Positional {
-                        site,
-                        sig_positional,
-                        arg_slot,
-                    },
-                    point,
-                )
-            }
-        }
-    }
-
-    /// Trailing `where name ⌶` is an operator position.
-    fn row_condition_operator<'a>(
-        site: CallSite<'a>,
-        working_set: &'a StateWorkingSet,
-        absolute_position: usize,
-    ) -> Option<CompletionSite<'a>> {
-        let last_term = RowCondition::trailing(site)?.last_term(working_set)?;
-        (absolute_position > last_term.span.end
-            && is_operator_lhs(&last_term.expr)
-            && working_set
-                .get_span_contents(Span::new(last_term.span.end, absolute_position))
-                .iter()
-                .all(u8::is_ascii_whitespace))
-        .then(|| {
-            CompletionSite::at(
-                absolute_position,
-                SiteKind::Operator { lhs: last_term },
-                Span::point(absolute_position),
-            )
-        })
-    }
-
-    /// `where size > ⌶` / `where size > 1 ⌶` is still the condition, not a new positional.
-    fn row_condition_value_gap<'a>(
-        site: CallSite<'a>,
-        working_set: &'a StateWorkingSet,
-        absolute_position: usize,
-    ) -> Option<CompletionSite<'a>> {
-        let cond = RowCondition::trailing(site)?;
-        let last_term = cond.last_term(working_set)?;
-        let Expr::BinaryOp(_, operator, _) = &last_term.expr else {
-            return None;
-        };
-        (absolute_position >= cond.arg_span.end
-            && absolute_position > operator.span.end
-            && working_set
-                .get_span_contents(Span::new(cond.arg_span.end, absolute_position))
-                .iter()
-                .all(u8::is_ascii_whitespace))
-        .then(|| {
-            cond.site_at(
-                working_set,
-                absolute_position,
-                Span::point(absolute_position),
-            )
-        })
-    }
-
-    fn resolve_argument_site<'a>(
-        site: CallSite<'a>,
-        argument: &'a Argument,
-        argument_index: usize,
-        absolute_position: usize,
-        working_set: &StateWorkingSet,
-    ) -> CompletionSite<'a> {
-        let sig_positional = count_positionals(site.call, argument_index);
-        let flag_name = SiteKind::FlagName {
-            site,
-            sig_positional,
-            arg_slot: argument_index,
-        };
-
-        let (kind, span) = match argument {
-            Argument::Named((name, short, optional_value)) => {
-                if let Some(value_expression) = optional_value
-                    .as_ref()
-                    .filter(|value| touches(value.span, absolute_position))
-                {
-                    (
-                        SiteKind::FlagValue {
-                            site,
-                            flag: FlagRef::from_named(name, short.as_ref()),
-                            arg_slot: argument_index,
-                        },
-                        value_expression.span,
-                    )
-                } else {
-                    // Only the name is completed; `Argument::span` would cover the value after it.
-                    (flag_name, name.span)
-                }
-            }
-            // A positional/unknown token starting with `-` is a flag name being typed.
-            Argument::Positional(_) | Argument::Unknown(_) => {
-                let kind = if is_flag_token(working_set, argument.span()) {
-                    flag_name
-                } else {
-                    SiteKind::Positional {
-                        site,
-                        sig_positional,
-                        arg_slot: argument_index,
-                    }
-                };
-                (kind, argument.span())
-            }
-            Argument::Spread(_) => (SiteKind::File, argument.span()),
-        };
-
-        CompletionSite::at(absolute_position, kind, span)
-    }
-
-    fn resolve_attribute_site<'a>(
-        attribute_block: &'a AttributeBlock,
-        absolute_position: usize,
-    ) -> CompletionSite<'a> {
-        if let Some(attribute) = attribute_block
-            .attributes
-            .iter()
-            .find(|attribute| touches(attribute.expr.span, absolute_position))
-        {
-            return CompletionSite::at(
-                absolute_position,
-                SiteKind::AttributeName,
-                attribute.expr.span,
-            );
-        }
-
-        if touches(attribute_block.item.span, absolute_position) {
-            return CompletionSite::at(
-                absolute_position,
-                SiteKind::AttributableItem,
-                attribute_block.item.span,
-            );
-        }
-
-        // Past the last attribute is the item's slot; earlier gaps type another attribute.
-        let kind = match attribute_block.attributes.last() {
-            Some(last) if absolute_position >= last.expr.span.end => SiteKind::AttributableItem,
-            _ => SiteKind::AttributeName,
-        };
-
-        CompletionSite::at(absolute_position, kind, Span::point(absolute_position))
-    }
-
-    fn resolve_fallback_site<'a>(
-        block: &'a Block,
-        working_set: &'a StateWorkingSet,
-        absolute_position: usize,
-    ) -> CompletionSite<'a> {
-        let last_element = block
-            .pipelines
-            .last()
-            .and_then(|pipeline| pipeline.elements.last())
-            .map(|element| &element.expr);
-
-        // A bare `@` opens an attribute name; trailing an attribute block completes its item.
-        let kind = if last_element
-            .map(|element| working_set.get_span_contents(element.span))
-            .is_some_and(|bytes| bytes.ends_with(b"@"))
-        {
-            SiteKind::AttributeName
-        } else if matches!(last_element.map(|e| &e.expr), Some(Expr::AttributeBlock(_))) {
-            SiteKind::AttributableItem
-        } else {
-            SiteKind::Command { node: None }
-        };
-
-        CompletionSite::at(absolute_position, kind, Span::point(absolute_position))
-    }
-    fn complete_argument_value(
+    /// The sources that complete the value in `slot`, in the order they are asked: the completer
+    /// the argument declares, the command-wide one, a plugin's, and the files its type calls for.
+    /// `need_fallback` allows files for an untyped argument, see [`ArgValueCompletion::path_source`].
+    fn value_sources<'a>(
         &self,
         custom: Option<Completion>,
-        mut arg_value: ArgValueCompletion,
-        context: &Context,
+        slot: ArgValueCompletion<'a>,
+        context: &Context<'a>,
         signature: &Signature,
-    ) -> Fetched {
-        // Neutral seed: answered until a source declines, unreusable until one keeps.
-        let mut results = Fetched::default();
+        need_fallback: bool,
+    ) -> Vec<Source<'a>> {
+        let working_set = context.working_set;
+        let mut sources = Vec::new();
 
-        if let Some(custom) = custom {
-            let attempt = match custom {
-                // A command declared an engine-provided completion for this argument.
-                Completion::Builtin(kind) => self.complete_builtin(kind, &arg_value, context),
-                // A user-defined completer, called with the unified input record.
-                Completion::Command(decl_id) => {
-                    match UserCompletion::parameter(context.working_set, decl_id) {
-                        Some(mut completer) => completer.fetch(context),
-                        None => {
-                            // A builtin/plugin runs no block; empty beats dumping the directory.
-                            log::error!(
-                                "`{}` cannot be used as a completer: it runs no block",
-                                context.working_set.get_decl(decl_id).name()
-                            );
-                            Fetched::answering(vec![]).worth_keeping()
-                        }
-                    }
-                }
-                Completion::List(list) => StaticCompletion::new(list).fetch(context),
-            };
-            if results.absorb(attempt) {
-                return results;
+        match custom {
+            Some(Completion::Builtin(kind)) => {
+                self.builtin_sources(kind, &slot, context, &mut sources)
             }
+            // A user-defined completer, called with the unified input record.
+            Some(Completion::Command(decl_id)) => {
+                sources.push(match UserCompletion::parameter(working_set, decl_id) {
+                    Some(completer) => Source::Custom(completer),
+                    None => {
+                        // A builtin/plugin runs no block; empty beats dumping the directory.
+                        log::error!(
+                            "`{}` cannot be used as a completer: it runs no block",
+                            working_set.get_decl(decl_id).name()
+                        );
+                        Source::Nothing
+                    }
+                });
+            }
+            Some(Completion::List(list)) => sources.push(Source::List(list)),
+            None => {}
         }
 
-        if results.absorb(self.command_wide_completion_helper(signature, context)) {
-            return results;
-        }
+        sources.extend(
+            self.command_wide(signature, working_set)
+                .map(Source::CommandWide),
+        );
 
-        // A fallthrough result keeps type-based completion enabled.
-        arg_value.need_fallback &= results.is_empty() || !results.answered();
-        results.merge(arg_value.fetch(context));
-        results
+        // Command-specific completions come from the argument's `BuiltinCompletion` above;
+        // here are the generic argument-value fallbacks.
+        // An untyped slot of a command the user declared may hold a path (a builtin's `any` is a
+        // value: `echo`, `append`, `http post`'s body); past the signature only a command that
+        // takes unknown arguments has one. A column is never a path.
+        let columns = slot.names_columns();
+        let declared_by_user = matches!(
+            working_set.get_decl(slot.call.decl_id).command_type(),
+            CommandType::Custom | CommandType::External | CommandType::Alias
+        );
+        let files = slot.path_source(
+            need_fallback
+                && declared_by_user
+                && (slot.declared_shape.is_some() || signature.allows_unknown_args),
+        );
+        // A call goes on with the keyword its next parameter starts with: `try`'s `catch` and
+        // `finally`, `if`'s `else`.
+        let given = (slot.call.positional_iter())
+            .filter(|arg| arg.span.end < slot.cursor && !matches!(arg.expr, Expr::Garbage))
+            .count();
+        let keywords = keywords_of(signature.get_positional(given).map(|arg| &arg.shape));
+        if !keywords.is_empty() {
+            sources.push(Source::List(NuCow::Owned(keywords)));
+        }
+        sources.push(Source::Dynamic(slot));
+        if columns {
+            sources.push(Source::Columns);
+        } else {
+            sources.extend(files);
+        }
+        sources
     }
 
-    /// Dispatch a [`BuiltinCompletion`] a command declared for its argument.
-    fn complete_builtin(
+    /// The sources of a [`BuiltinCompletion`] a command declared for its argument.
+    fn builtin_sources<'a>(
         &self,
         kind: BuiltinCompletion,
-        arg_value: &ArgValueCompletion,
-        context: &Context,
-    ) -> Fetched {
+        slot: &ArgValueCompletion<'a>,
+        context: &Context<'a>,
+        sources: &mut Vec<Source<'a>>,
+    ) {
         match kind {
             BuiltinCompletion::NuFile {
                 std_virtual_path, ..
-            } => DotNuCompletion { std_virtual_path }.fetch(context),
+            } => sources.extend([
+                Source::Modules { std_virtual_path },
+                Source::ModuleFiles { std_virtual_path },
+            ]),
             BuiltinCompletion::ModuleExports => {
-                arg_value.complete_module_exports(context, context.working_set)
+                sources.push(slot.module_exports(context));
             }
-            BuiltinCompletion::EnvVar => EnvVarCompletion.fetch(context),
-            BuiltinCompletion::Command { internal_only } => {
-                let scope = if internal_only {
+            BuiltinCompletion::EnvVar => sources.push(Source::EnvVars),
+            BuiltinCompletion::Column => sources.push(Source::Columns),
+            BuiltinCompletion::Process => sources.push(Source::Processes),
+            BuiltinCompletion::Command { internal_only } => sources.push(Source::Commands {
+                scope: if internal_only {
                     CommandScope::InternalsOnly
                 } else {
                     CommandScope::All
-                };
-                CommandCompletion::quoted(scope).fetch(context)
+                },
+                quoted: true,
+                parent: None,
+            }),
+            BuiltinCompletion::Path { dirs, .. } => {
+                sources.push(Source::Paths { directories: dirs })
             }
-            // These only describe the argument for hints and the new completer; here the
-            // argument's shape decides what is offered.
-            BuiltinCompletion::Column
-            | BuiltinCompletion::Process
-            | BuiltinCompletion::Path { .. } => Fetched::absent(),
         }
     }
 
+    /// The flags of the command, then what its command-wide completer, such as an external one,
+    /// adds: it often lists the declared flags too.
     fn complete_flag_names(
         &self,
         decl_id: DeclId,
         context: &Context,
         signature: &Signature,
-    ) -> Fetched {
-        let mut results = FlagCompletion { decl_id }.fetch(context);
-        // A command-wide completer, such as an external one, often lists the declared flags too.
-        results.merge_new(self.command_wide_completion_helper(signature, context));
-        results
-    }
-
-    fn suggestions_at<C: Completer>(&self, completer: &mut C, context: &Context) -> Fetched {
-        completer.fetch(context)
-    }
-
-    fn variable_names_completion_helper(&self, context: &Context) -> Fetched {
-        if !context.prefix.starts_with(b"$") {
-            return Fetched::default();
+    ) -> Vec<SemanticSuggestion> {
+        let mut found = ask([Source::Flags(decl_id)], context);
+        let flags = found.len();
+        let wide = self.command_wide(signature, context.working_set);
+        for new in ask(wide.map(Source::CommandWide), context) {
+            let value = &new.suggestion.value;
+            if !found[..flags]
+                .iter()
+                .any(|flag| flag.suggestion.value == *value)
+            {
+                found.push(new);
+            } else if let Some(trace) = context.trace {
+                trace.dropped(new.source.as_deref(), value.clone(), "duplicate");
+            }
         }
-        VariableCompletion.fetch(context)
-    }
-
-    fn command_completion_helper(
-        &self,
-        working_set: &StateWorkingSet,
-        buffer: Buffer,
-        span: Span,
-        mut command_completion: CommandCompletion,
-    ) -> Fetched {
-        // Replace the whole token, including an untyped suffix in a parsed file,
-        // but match only the text before the cursor (also for sudo/doas arguments).
-        let prefix_span = Span::new(span.start, span.end.min(buffer.absolute_cursor()));
-        let prefix = working_set.get_span_contents(prefix_span);
-        let ctx = self.context(working_set, buffer, span, prefix);
-        command_completion.fetch(&ctx)
+        found
     }
 
     /// Command scope for a head, honouring a leading sigil: `^` → externals only, `%` →
     /// builtins only, otherwise everything. The sigil is the byte between the call's own
     /// span and its head span.
-    fn command_completion_for_head(
+    fn command_scope_for_head(
         &self,
         node: Option<&Expression>,
         span: Span,
         working_set: &StateWorkingSet,
-    ) -> CommandCompletion {
+    ) -> CommandScope {
         let sigil = node
             .filter(|node| node.span.start < span.start)
             .and_then(|node| working_set.get_span_contents(node.span).first().copied());
 
-        CommandCompletion::new(match sigil {
+        match sigil {
             Some(b'^') => CommandScope::ExternalsOnly,
             Some(b'%') => CommandScope::BuiltinsOnly,
             _ => CommandScope::All,
-        })
+        }
     }
 
     /// Internal commands whose name extends the line so far (`foo test⌶` also offers
     /// `foo test bar`); externals are excluded, since a multi-word line names only
-    /// internal subcommands.
+    /// internal subcommands. When the line already names the command `parent`, only its
+    /// subcommands are offered.
     fn subcommand_suggestions(
         &self,
-        working_set: &StateWorkingSet,
-        buffer: Buffer,
+        context: &Context,
         command_start: usize,
         cursor: usize,
-    ) -> Fetched {
+        parent: Option<&str>,
+    ) -> Vec<SemanticSuggestion> {
         if cursor <= command_start {
-            return Fetched::default();
+            return Vec::new();
         }
-        self.command_completion_helper(
-            working_set,
-            buffer,
-            Span::new(command_start, cursor),
-            CommandCompletion::new(CommandScope::InternalsOnly),
+        ask(
+            [Source::Commands {
+                scope: CommandScope::InternalsOnly,
+                quoted: false,
+                parent,
+            }],
+            &context.token(Span::new(command_start, cursor)),
         )
     }
 
-    fn command_wide_completion_helper(&self, signature: &Signature, context: &Context) -> Fetched {
-        let completion = match signature.complete {
+    /// The command-wide completer of `signature`, which answers for the whole call.
+    fn command_wide(
+        &self,
+        signature: &Signature,
+        working_set: &StateWorkingSet,
+    ) -> Option<UserCompletion> {
+        match signature.complete {
             Some(CommandWideCompleter::Command(decl_id)) => {
-                UserCompletion::command(context.working_set, decl_id)
+                UserCompletion::command(working_set, decl_id)
             }
-            Some(CommandWideCompleter::External) => self
-                .stack
-                .get_config(self.engine_state)
-                .completions
-                .external
-                .completer
-                .as_ref()
-                .map(|closure| UserCompletion::closure(context.working_set, closure)),
+            Some(CommandWideCompleter::External) => (self.external_completer())
+                .map(|closure| UserCompletion::closure(working_set, &closure)),
             None => None,
-        };
-
-        match completion {
-            // Answers for the whole call, never narrowed against the token prefix.
-            Some(mut completion) => completion.fetch(&Context {
-                prefix: b"",
-                ..*context
-            }),
-            None => Fetched::absent(),
         }
     }
 
+    /// The external completer the configuration names, if it names one.
+    fn external_completer(&self) -> Option<Closure> {
+        let config = self.stack.get_config(self.engine_state);
+        config.completions.external.completer.clone()
+    }
+
+    /// A context over `text`, the commandline up to the cursor, which starts at `offset` in the
+    /// working set. It has no token until [`Context::at_site`] gives it one.
     pub(crate) fn context<'a>(
         &'a self,
         working_set: &'a StateWorkingSet,
-        buffer: Buffer<'a>,
-        span: Span,
-        prefix: &'a [u8],
+        text: &'a str,
+        offset: usize,
     ) -> Context<'a> {
         Context {
             working_set,
             stack: self.stack.as_ref(),
             options: &self.options,
-            span,
-            prefix,
-            offset: buffer.offset,
-            buffer: buffer.text,
-            // No site resolved yet; `Context::at_site` fills the chain in.
-            contexts: &[],
+            span: Span::unknown(),
+            prefix: &[],
+            offset,
+            buffer: text,
+            level: None,
+            delegation: self.delegation.as_deref(),
+            usage: self.usage.as_ref(),
+            cache: &self.cache,
+            rows: None,
+            piped: None,
+            prior: None,
+            prelude: &[],
+            feed: None,
+            trace: self.trace.as_ref(),
+            notice: &self.notice,
+            scope: &[],
+        }
+    }
+
+    /// Why the last completion offered nothing, when a source said so.
+    pub fn message(&self) -> Option<String> {
+        self.notice.take()
+    }
+}
+
+/// What the completer answered last, which the history hint checks the next word of a history
+/// line against instead of running a completer itself.
+#[derive(Clone, Default)]
+pub struct LatestAnswer(Arc<Mutex<Option<Arc<Latest>>>>);
+
+/// One answer, as the history hint reads it.
+pub(crate) struct Latest {
+    /// The line up to the cursor the answer was for.
+    pub(crate) line: String,
+    /// Where the word the answer completes starts.
+    pub(crate) start: usize,
+    /// The values offered, when they are a closed set the word must be among: values of a
+    /// completer, all for one word. `None` for paths, commands or a mix, which say nothing.
+    pub(crate) values: Option<Vec<String>>,
+    /// The parameter the word binds, as the parser reads the line: another word of a history line
+    /// that binds it too must be among the same values.
+    pub(crate) slot: Option<(DeclId, usize)>,
+}
+
+/// The positional parameter the word at byte `at` of `line` binds, as the parser's probe reads
+/// it: the call and the index of the parameter. Modules named in the line are not loaded.
+pub(crate) fn positional_at(
+    engine_state: &EngineState,
+    line: &str,
+    at: usize,
+) -> Option<(DeclId, usize)> {
+    let mut working_set = StateWorkingSet::new(engine_state);
+    working_set.skip_module_load = true;
+    let (_, probe) = nu_parser::parse_probed(&mut working_set, None, line.as_bytes(), at);
+    probe.innermost().find_map(|found| match found.what {
+        nu_protocol::engine::Expect::Positional { decl_id, index, .. } => Some((decl_id, index)),
+        _ => None,
+    })
+}
+
+impl LatestAnswer {
+    pub(crate) fn get(&self) -> Option<Arc<Latest>> {
+        self.0.lock().ok()?.clone()
+    }
+
+    fn remember(&self, engine_state: &EngineState, line: &str, answer: &Completions) {
+        let start = answer
+            .items
+            .first()
+            .map_or(line.len(), |item| item.span.start);
+        let one_word = answer.items.iter().all(|item| item.span.start == start);
+        let values_only = answer.data::<Details>().is_some_and(|details| {
+            details
+                .0
+                .iter()
+                .all(|detail| matches!(detail.kind, None | Some(SuggestionKind::Value(_))))
+        });
+        let values = (!answer.items.is_empty() && one_word && values_only)
+            .then(|| answer.items.iter().map(|item| item.value.clone()).collect());
+        if let Ok(mut latest) = self.0.lock() {
+            let slot = values
+                .as_ref()
+                .and_then(|_| positional_at(engine_state, line, line.len()));
+            *latest = Some(Arc::new(Latest {
+                line: line.to_owned(),
+                start,
+                values,
+                slot,
+            }));
         }
     }
 }
 
+/// Work done off the line editor's thread for a preview or a hover: one thread runs them, the
+/// newest first, and drops those whose answer is no longer wanted. A thread for each would leave
+/// a pile of them running for every cursor move over a slow pipeline.
+type PreviewJob = Box<dyn FnOnce() -> bool + Send>;
+
+/// A thread that runs the newest of the preview jobs sent to it. A job returns whether it was
+/// still wanted; the stale ones are dropped without running.
+fn spawn_previewer() -> mpsc::Sender<PreviewJob> {
+    let (jobs, queue) = mpsc::channel::<PreviewJob>();
+    thread::spawn(move || {
+        while let Ok(mut job) = queue.recv() {
+            while let Ok(newer) = queue.try_recv() {
+                job = newer;
+            }
+            let _ = job();
+        }
+    });
+    jobs
+}
+
 pub struct NuCompleter {
+    /// The latest answer, shared with the history hint.
+    latest: LatestAnswer,
+    /// The thread previews and hovers run on, started on the first.
+    previewer: Option<mpsc::Sender<PreviewJob>>,
     engine_state: Arc<EngineState>,
     stack: Arc<Stack>,
-    options: CompletionOptions,
-    cache: NarrowingCache,
-    cache_env: CacheEnv,
-    worker: Option<CompletionWorker>,
-    /// Latest answer and its query.
-    latest: Option<Completed>,
+    /// What completion remembers, shared with the completers of the next prompts.
+    cache: CompletionCache,
+    /// `cache`, for the environment this completer runs in.
+    view: CacheView,
+    /// Opens the history for reading off the editor's thread, when it can be opened again.
+    history: Option<HistoryReader>,
+    /// Whether the history was checked for new lines: once per completer, at the first request
+    /// that has it.
+    learned: bool,
+    /// The highlighter's parse of the line being edited, if it is shared; see
+    /// [`Self::share_parse_of`].
+    parse_cache: Option<LineParseCache>,
+    /// The background worker's queue, started on the first request it needs.
+    worker: Option<mpsc::Sender<Job>>,
+    /// The line and the cursor of the last request, which a click on an example in a preview
+    /// takes the example over.
+    last_request: Option<(String, usize)>,
+    /// The width the last preview was asked for, to lay it out the same for a click.
+    preview_width: u16,
+}
+
+/// A request the background worker answers.
+struct Job {
+    query: CompletionQuery,
+    reply: Reply<Completions>,
+    /// What the history said when the request was made.
+    usage: Option<Arc<UsageIndex>>,
 }
 
 impl NuCompleter {
     pub fn new(engine_state: Arc<EngineState>, stack: Arc<Stack>) -> Self {
-        Self::with_cache(engine_state, stack, NarrowingCache::default())
+        Self::with_cache(engine_state, stack, CompletionCache::default())
     }
 
     pub(crate) fn with_cache(
         engine_state: Arc<EngineState>,
         stack: Arc<Stack>,
-        cache: NarrowingCache,
+        cache: CompletionCache,
     ) -> Self {
-        let cache_env = CacheEnv::of(&engine_state, &stack);
+        let env = CacheEnv::of(&engine_state, &stack);
         // Read fresh each prompt so `cache_size` config changes take effect.
-        let config = stack.get_config(&engine_state);
-        let cache_size = config.completions.cache_size;
+        let cache_size = stack.get_config(&engine_state).completions.cache_size;
         cache.set_capacity(cache_size.try_into().unwrap_or(0));
         Self {
-            options: configured_options(&config),
+            latest: LatestAnswer::default(),
+            previewer: None,
+            history: None,
             engine_state,
             stack,
+            view: CacheView::new(cache.clone(), env),
             cache,
-            cache_env,
+            learned: false,
+            parse_cache: None,
             worker: None,
-            latest: None,
+            last_request: None,
+            preview_width: 0,
         }
     }
 
-    fn fresh_for(&self, query: &CompletionQuery) -> Option<Suggestions> {
-        if let Some(latest) = &self.latest
-            && &latest.query == query
-        {
-            return Some(latest.suggestions.clone());
+    /// Completes from the parse that `highlighter` makes of the line being edited when the
+    /// cursor is at its end, so a keystroke parses the line once for painting and completing.
+    /// Completes with its own parse otherwise.
+    #[must_use]
+    pub fn share_parse_of(self, highlighter: &NuHighlighter) -> Self {
+        self.with_parse_cache(highlighter.parse_cache())
+    }
+
+    /// Runs `job` on the preview thread, starting it the first time. A thread that died (a
+    /// previewer closure panicked past its guard) is started again.
+    fn preview_off_the_editor(&mut self, job: PreviewJob) {
+        let previewer = self.previewer.get_or_insert_with(spawn_previewer);
+        if let Err(mpsc::SendError(job)) = previewer.send(job) {
+            let previewer = spawn_previewer();
+            let _ = previewer.send(job);
+            self.previewer = Some(previewer);
         }
-        self.cache.fresh(query, self.cache_env)
     }
 
-    fn settle_pending(&mut self, query: &CompletionQuery) {
-        if let Some(worker) = self.worker.as_mut()
-            && worker.pending.as_ref() == Some(query)
-        {
-            worker.pending = None;
+    /// Shares the latest answer through `latest`, which the history hint reads.
+    #[must_use]
+    pub fn with_latest(mut self, latest: LatestAnswer) -> Self {
+        self.latest = latest;
+        self
+    }
+
+    /// Reads the history for [`Self::learn_usage`] with `reader`, on a thread of its own: the
+    /// line editor's history belongs to its thread.
+    #[must_use]
+    pub(crate) fn with_history_reader(mut self, reader: Option<HistoryReader>) -> Self {
+        self.history = reader;
+        self
+    }
+
+    /// [`Self::share_parse_of`], for the cache itself.
+    #[must_use]
+    pub(crate) fn with_parse_cache(mut self, parse_cache: LineParseCache) -> Self {
+        self.parse_cache = Some(parse_cache);
+        self
+    }
+
+    /// Ranks candidates the user runs often and lately higher, from the `history`. The index is
+    /// shared with the next prompt's completer, and read again only when the history has grown,
+    /// off the calling thread where the history can be opened again. It is checked once per
+    /// completer; later calls change nothing.
+    pub fn learn_usage(&mut self, history: &dyn History) {
+        if !self.learned {
+            self.learned = true;
+            let engine_state = Arc::clone(&self.engine_state);
+            self.cache
+                .learn_usage(history, self.history.as_ref(), move |name| {
+                    engine_state.find_decl(name.as_bytes(), &[]).is_some()
+                });
         }
     }
 
-    fn stale_fallback(&self, query: &CompletionQuery) -> Suggestions {
-        self.cache
-            .narrowed_fallback(query, self.cache_env, &self.options)
+    /// An engine over this completer's state, on an isolated stack with stdin suppressed
+    /// where `suppress_stdin`.
+    fn engine(&self, suppress_stdin: bool) -> CompletionEngine<'_> {
+        CompletionEngine::isolated(&self.engine_state, Arc::clone(&self.stack), suppress_stdin)
+            .with_usage(self.cache.usage())
+            .with_cache(self.view.clone())
+            .with_parse_cache(self.parse_cache.clone())
     }
 
-    fn spawn_worker(engine_state: Arc<EngineState>, stack: Arc<Stack>) -> CompletionWorker {
-        let (request_tx, request_rx) = mpsc::channel::<CompletionQuery>();
-        let (result_tx, result_rx) = mpsc::channel::<Completed>();
-
+    /// A worker that answers the newest of the requests sent to it and drops the rest.
+    fn spawn_worker(
+        engine_state: Arc<EngineState>,
+        stack: Arc<Stack>,
+        view: CacheView,
+        parse_cache: Option<LineParseCache>,
+        latest: LatestAnswer,
+    ) -> mpsc::Sender<Job> {
+        let (jobs, queue) = mpsc::channel::<Job>();
         thread::spawn(move || {
             // The thread owns the state; nothing is cloned per query.
-            let engine = CompletionEngine::isolated(&engine_state, stack, true);
-
-            while let Ok(mut query) = request_rx.recv() {
-                while let Ok(newer) = request_rx.try_recv() {
-                    query = newer;
+            let mut engine = CompletionEngine::isolated(&engine_state, stack, true)
+                .with_cache(view)
+                .with_parse_cache(parse_cache);
+            while let Ok(mut job) = queue.recv() {
+                while let Ok(newer) = queue.try_recv() {
+                    job = newer;
                 }
-
-                let (suggestions, cacheable) = engine.suggestions_for(&query);
-                let done = Completed {
-                    query,
-                    suggestions,
-                    cacheable,
-                };
-                if result_tx.send(done).is_err() {
-                    return;
+                if !job.reply.is_current() {
+                    continue;
                 }
+                engine.usage = job.usage.take();
+                let answer = engine.answer(&job.query);
+                latest.remember(&engine_state, job.query.typed(), &answer);
+                job.reply.send(answer);
             }
         });
-
-        CompletionWorker {
-            request_tx,
-            result_rx,
-            pending: None,
-        }
+        jobs
     }
 
-    fn fold_completed(&mut self, done: Completed) -> bool {
-        let settled = self
-            .worker
-            .as_mut()
-            .is_some_and(|worker| worker.pending.as_ref() == Some(&done.query));
-
-        if done.cacheable {
-            self.cache
-                .store(done.query.clone(), self.cache_env, done.suggestions.clone());
-        }
-        self.latest = Some(done);
-        settled
+    /// Whether the completer that would run at `pos` is `@interactive`, so
+    /// [`Completer::complete`] answers it on the calling thread, and only when asked,
+    /// rather than on the background worker.
+    pub fn is_interactive_at(&self, line: &str, pos: usize) -> bool {
+        CompletionEngine::isolated(&self.engine_state, Arc::clone(&self.stack), false)
+            .interactive_completer_at(line, pos)
     }
 
-    fn try_recv_completed(&self) -> Option<Completed> {
-        self.worker.as_ref()?.result_rx.try_recv().ok()
-    }
-
-    fn recv_completed(&self, timeout: Duration) -> Option<Completed> {
-        self.worker.as_ref()?.result_rx.recv_timeout(timeout).ok()
-    }
-
-    fn drain_completed(&mut self) -> bool {
-        let mut settled = false;
-        while let Some(done) = self.try_recv_completed() {
-            settled |= self.fold_completed(done);
-        }
-        settled
-    }
-
+    /// Completes `line` at `pos` on this thread, for tests and callers that
+    /// cannot wait on a reply. Like [`Completer::complete`], it runs an
+    /// `@interactive` completer every time: a cancelled picker must run again.
     pub fn complete_blocking(&mut self, line: &str, pos: usize) -> Suggestions {
-        const BLOCKING_TIMEOUT: Duration = Duration::from_secs(30);
+        self.complete_blocking_with_message(line, pos).0
+    }
 
-        let fallback = match self.complete(line, pos) {
-            CompletionResult::Fresh { suggestions, .. } => return suggestions,
-            in_flight => in_flight.into_shared().unwrap_or_default(),
-        };
-
-        let deadline = Instant::now() + BLOCKING_TIMEOUT;
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            let Some(done) = self.recv_completed(remaining) else {
-                break;
-            };
-            if self.fold_completed(done) {
-                return self.complete(line, pos).into_shared().unwrap_or_default();
-            }
-        }
-
-        fallback
+    /// [`Self::complete_blocking`], and why there is nothing to suggest when a source said so.
+    pub fn complete_blocking_with_message(
+        &mut self,
+        line: &str,
+        pos: usize,
+    ) -> (Suggestions, Option<String>) {
+        let query = CompletionQuery::new(line, pos);
+        let interactive = self.is_interactive_at(query.typed(), query.cursor());
+        let answer = self.engine(!interactive).answer(&query);
+        self.latest
+            .remember(&self.engine_state, query.typed(), &answer);
+        (answer.items, answer.message)
     }
 }
 
-// No `with_partial` on the results: reedline derives Tab's shared prefix itself, lining
-// up suggestions that replace different spans.
 impl ReedlineCompleter for NuCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
-        let query = CompletionQuery::new(line, pos);
-        self.drain_completed();
-
-        if let Some(suggestions) = self.fresh_for(&query) {
-            self.settle_pending(&query);
-            return CompletionResult::fresh(suggestions);
-        }
-
-        // Interactive completers run on UI thread to own terminal.
-        let engine = CompletionEngine::isolated(&self.engine_state, Arc::clone(&self.stack), false);
-        if engine.interactive_completer_at(line, pos) {
-            let (suggestions, _cacheable) = engine.suggestions_for(&query);
-            // An empty answer is a cancelled picker. Kept, it would answer the next
-            // Tab on this line instead of relaunching the picker; the menu abandons
-            // on it at once, so nothing asks again within this activation.
-            self.latest = (!suggestions.is_empty()).then(|| Completed {
-                query,
-                suggestions: suggestions.clone(),
-                cacheable: false,
-            });
-            return CompletionResult::fresh(suggestions);
-        }
-
-        let fallback = self.stale_fallback(&query);
-
-        let worker = self.worker.get_or_insert_with(|| {
-            Self::spawn_worker(Arc::clone(&self.engine_state), Arc::clone(&self.stack))
-        });
-
-        if worker.pending.as_ref() != Some(&query) {
-            if worker.request_tx.send(query.clone()).is_ok() {
-                worker.pending = Some(query);
-            } else {
-                // Worker died (a user completer closure panicked); drop it so the next
-                // request spawns a replacement.
-                self.worker = None;
+    fn hover(&mut self, line: &str, pos: usize, width: u16, reply: Reply<Preview>) {
+        let engine_state = Arc::clone(&self.engine_state);
+        let stack = Arc::clone(&self.stack);
+        let line = line.to_owned();
+        // A slow disk, or a pipeline run for a preview, must not hold up the key that moved.
+        self.preview_off_the_editor(Box::new(move || {
+            if !reply.is_current() {
+                return false;
             }
-        }
-
-        CompletionResult::stale_or_pending(fallback, CompletionOrigin::new(line, pos))
+            let hovered = hovered(&engine_state, &line, pos);
+            let preview =
+                super::preview::hover(&engine_state, &stack, hovered.as_ref(), width, &line, pos);
+            reply.send(preview);
+            true
+        }));
     }
 
-    fn poll_completion(&mut self) -> CompletionStatus {
-        let settled = self.drain_completed();
-
-        match self.worker.as_mut() {
-            Some(worker) if worker.pending.is_some() => {
-                if settled {
-                    worker.pending = None;
-                    CompletionStatus::Ready
-                } else {
-                    CompletionStatus::Pending
-                }
+    fn preview(
+        &mut self,
+        completions: &Completions,
+        index: usize,
+        width: u16,
+        reply: Reply<Preview>,
+    ) {
+        self.preview_width = width;
+        let engine_state = Arc::clone(&self.engine_state);
+        let stack = Arc::clone(&self.stack);
+        let completions = completions.clone();
+        let place = self.last_request.clone();
+        // A slow disk, or a closure, must not hold up the keystroke that asked.
+        self.preview_off_the_editor(Box::new(move || {
+            if !reply.is_current() {
+                return false;
             }
-            _ => CompletionStatus::Idle,
+            reply.send(super::preview::preview(
+                &engine_state,
+                &stack,
+                &completions,
+                index,
+                width,
+                place
+                    .as_ref()
+                    .map(|(line, cursor)| (line.as_str(), *cursor)),
+            ));
+            true
+        }));
+    }
+
+    fn preview_clicked(
+        &mut self,
+        completions: &Completions,
+        index: usize,
+        row: usize,
+    ) -> Option<Suggestion> {
+        let (line, cursor) = self.last_request.as_ref()?;
+        // The same layout as the preview that was drawn, which says which rows hold examples.
+        let (_, examples) = super::preview::preview_with_examples(
+            &self.engine_state,
+            &self.stack,
+            completions,
+            index,
+            self.preview_width,
+            Some((line, *cursor)),
+        );
+        let (_, code) = examples.iter().find(|(rows, _)| rows.contains(&row))?;
+        Some(super::examples::take(code, line, *cursor))
+    }
+
+    /// What the line can only go on with after the space just typed: a closure for `each`,
+    /// `= ` for `let x`, the parameters of a `def`.
+    fn opening(&mut self, line: &str, pos: usize) -> Option<Opening> {
+        if !self
+            .stack
+            .get_config(&self.engine_state)
+            .completions
+            .opening
+        {
+            return None;
+        }
+        let (text, cursor) = taking::what_must_follow(&self.engine_state, line, pos)?;
+        Some(Opening { text, cursor })
+    }
+
+    fn complete(&mut self, request: Request<'_>, reply: Reply<Completions>) {
+        self.last_request = Some((request.line.to_owned(), request.cursor));
+        // An empty line is the prompt waiting: every command there is would be offered to it
+        // unasked.
+        if !request.asked && request.line.trim().is_empty() {
+            reply.send(Completions::default());
+            return;
+        }
+        self.learn_usage(request.history);
+        let mut query = CompletionQuery::new(request.line, request.cursor);
+        query.asked = request.asked;
+
+        // Interactive completers run on the UI thread, which owns the
+        // terminal, and only when asked: typing never opens a picker.
+        if self
+            .engine(false)
+            .interactive_completer_at(query.typed(), query.cursor())
+        {
+            if request.asked {
+                reply.send(self.engine(false).answer(&query));
+            }
+            return;
+        }
+
+        let worker = self.worker.get_or_insert_with(|| {
+            Self::spawn_worker(
+                Arc::clone(&self.engine_state),
+                Arc::clone(&self.stack),
+                self.view.clone(),
+                self.parse_cache.clone(),
+                self.latest.clone(),
+            )
+        });
+        let job = Job {
+            query,
+            reply,
+            usage: self.cache.usage(),
+        };
+        if let Err(mpsc::SendError(job)) = worker.send(job) {
+            // The worker died (a completer closure panicked past its guard):
+            // answer here, and start another next time.
+            self.worker = None;
+            job.reply.send(self.engine(false).answer(&job.query));
         }
     }
 }
@@ -2449,6 +3075,7 @@ impl ReedlineCompleter for NuCompleter {
 #[cfg(test)]
 mod completer_tests {
     use super::*;
+    use nu_parser::parse;
 
     fn test_engine() -> Arc<EngineState> {
         let mut engine =
@@ -2490,41 +3117,12 @@ mod completer_tests {
         "ls é foo",
         "",
         " ",
+        // In a whole file a gap before later arguments is not the call's trailing slot.
+        "str trim -- foo",
+        "ls  foo",
+        "str trim  --char x bar",
+        "echo a  | str trim  -c x",
     ];
-
-    /// All sites must contain cursor.
-    #[test]
-    fn every_site_holds_the_cursor() {
-        let engine_state = test_engine();
-
-        for line in CORPUS {
-            for cursor in (0..=line.len()).filter(|at| line.is_char_boundary(*at)) {
-                let contents = &line[..cursor];
-                let mut working_set = StateWorkingSet::new(&engine_state);
-                let offset = working_set.next_span_start();
-                let block = parse(&mut working_set, Some("sweep"), contents.as_bytes(), false);
-                let buffer = Buffer {
-                    text: contents,
-                    offset,
-                };
-
-                let site = CompletionEngine::resolve_completion_site(
-                    &block,
-                    &working_set,
-                    buffer,
-                    contents,
-                );
-                assert!(
-                    touches(site.span, cursor + offset),
-                    "{line:?} at {cursor}: a {} site spans {}..{}, off the cursor at {}",
-                    site.kind.resolved().kind(),
-                    site.span.start,
-                    site.span.end,
-                    cursor + offset,
-                );
-            }
-        }
-    }
 
     /// `commandline complete --input` place.kind/index for the HackMD where-size cases.
     fn place_of(engine: &CompletionEngine, line: &str) -> (String, Option<i64>) {
@@ -2540,85 +3138,8 @@ mod completer_tests {
         (kind, index)
     }
 
-    /// HackMD issue 6: operator vs value vs trailing positional index of `where`.
-    #[test]
-    fn where_size_place_kind_matches_hackmd() {
-        let engine_state = test_engine();
-        let engine = CompletionEngine::new(&engine_state, &Stack::new());
-
-        assert_eq!(
-            place_of(&engine, "ls | where size >"),
-            ("operator".into(), None),
-            "cursor on `>` is an operator site"
-        );
-        assert_eq!(
-            place_of(&engine, "ls | where size > 1"),
-            ("positional".into(), Some(0)),
-            "cursor on the comparison value is where's condition, not a file"
-        );
-        assert_eq!(
-            place_of(&engine, "ls | where size > "),
-            ("positional".into(), Some(0)),
-            "trailing space after `>` is still where's only positional (index 0)"
-        );
-    }
-
-    /// Mid-token and mid-flag adversarial cases for place/token agreement.
-    #[test]
-    fn token_span_matches_place_target_for_flags_and_values() {
-        let engine_state = test_engine();
-        let engine = CompletionEngine::new(&engine_state, &Stack::new());
-
-        let check = |line: &str, cursor: usize, text: &str, start: usize| {
-            let input = engine.completer_input_at(line, cursor, DeclaredInputs::all());
-            let token = input.get_data_by_key("token").expect("token");
-            assert_eq!(
-                token.get_data_by_key("text").unwrap().as_str().unwrap(),
-                text,
-                "token.text for {line:?}@{cursor}"
-            );
-            assert_eq!(
-                token
-                    .get_data_by_key("span")
-                    .unwrap()
-                    .get_data_by_key("start")
-                    .unwrap()
-                    .as_int()
-                    .unwrap(),
-                start as i64,
-                "token.span.start for {line:?}@{cursor}"
-            );
-            let place = input.get_data_by_key("place").expect("place");
-            assert_eq!(
-                place
-                    .get_data_by_key("target")
-                    .unwrap()
-                    .get_data_by_key("start")
-                    .unwrap()
-                    .as_int()
-                    .unwrap(),
-                start as i64,
-                "place.target.start for {line:?}@{cursor}"
-            );
-        };
-
-        check("ls -al", 6, "-al", 3);
-        // Cursor mid-flag: only text up to the cursor is parsed, so the token is the prefix.
-        check("ls -al", 4, "-", 3);
-        check("ls -al", 5, "-a", 3);
-        check("str tri", 7, "tri", 4);
-        check("str tri", 5, "t", 4); // mid-token prefix
-        check("str tri", 6, "tr", 4);
-
-        // Mid-cursor where-size: prefix-parsed site matches place.target.
-        check("ls | where size > 1", 13, "si", 11); // mid-`size`
-        check("ls | where size > 1", 15, "size", 11);
-        check("ls | where size > 1", 17, ">", 16); // on operator
-        check("ls | where size > 1", 19, "1", 18); // on value
-        check("ls | where size > ", 18, "", 18); // trailing space after `>`
-    }
-
-    /// Token text/span equals target shown to completer.
+    /// Token text/span equals target shown to completer, at every cursor (a site that does not
+    /// hold the cursor fails a debug assertion), and the whole line completes there as a file.
     #[test]
     fn the_token_is_what_the_answer_replaces() {
         let engine_state = test_engine();
@@ -2636,6 +3157,7 @@ mod completer_tests {
 
         for line in CORPUS {
             for cursor in (0..=line.len()).filter(|at| line.is_char_boundary(*at)) {
+                let _ = engine.fetch_completions_within_file("sweep.nu", cursor, line);
                 let contents = &line[..cursor];
                 let input = engine.completer_input_at(contents, cursor, DeclaredInputs::all());
 
@@ -2662,79 +3184,23 @@ mod completer_tests {
         }
     }
 
-    fn q(s: &str) -> CompletionQuery {
-        CompletionQuery::new(s, s.len())
-    }
-
-    /// The token being extended starts at `start`; suggestions replace from there.
-    fn token(start: usize) -> reedline::Span {
-        reedline::Span::new(start, start)
-    }
-
-    /// Adversarial: bare `where` must stay a Call (not Garbage→File). `ls | where` is
-    /// command; `ls | where ` is positional 0 — same shape as `get`.
-    #[test]
-    fn pipeline_head_where_is_command_not_file() {
-        let engine_state = test_engine();
-        let engine = CompletionEngine::new(&engine_state, &Stack::new());
-        for line in ["ls | where", "ls | get", "ls | each", "ls | filter"] {
-            let (kind, _) = place_of(&engine, line);
-            assert_eq!(
-                kind, "command",
-                "{line:?} at EOL should be command head, got {kind}"
-            );
-        }
-        // Trailing space after where: first positional (condition), not bare File.
-        let (kind, index) = place_of(&engine, "ls | where ");
-        assert_eq!(kind, "positional", "ls | where  trailing: got {kind}");
-        assert_eq!(index, Some(0), "where condition is positional 0");
-    }
-
     /// RowConditionSlot prefers the signature's condition index, not raw arg counting —
     /// a leading path arg must not steal index 0 from the condition.
     #[test]
     fn row_condition_index_follows_signature_slot_not_arg_order() {
-        use nu_protocol::engine::{Call as EngineCall, Command, CommandType};
-        use nu_protocol::{Category, PipelineData, ShellError, Signature, SyntaxShape};
-
-        #[derive(Clone)]
-        struct MyWhere;
-        impl Command for MyWhere {
-            fn name(&self) -> &str {
-                "mywhere"
-            }
-            fn description(&self) -> &str {
-                "test: path then row condition"
-            }
-            fn signature(&self) -> Signature {
-                Signature::build(self.name())
-                    .required("path", SyntaxShape::Filepath, "path")
-                    .required("cond", SyntaxShape::RowCondition, "condition")
-                    .category(Category::Custom("test".into()))
-            }
-            fn run(
-                &self,
-                _engine_state: &EngineState,
-                _stack: &mut Stack,
-                _call: &EngineCall,
-                _input: PipelineData,
-            ) -> Result<PipelineData, ShellError> {
-                Ok(PipelineData::empty())
-            }
-            fn command_type(&self) -> CommandType {
-                CommandType::Builtin
-            }
-        }
+        use nu_protocol::{Signature, SyntaxShape};
 
         let mut engine_state =
             nu_command::add_shell_command_context(nu_cmd_lang::create_default_context());
-        {
-            let mut working_set = StateWorkingSet::new(&engine_state);
-            working_set.add_decl(Box::new(MyWhere));
-            engine_state
-                .merge_delta(working_set.render())
-                .expect("merge mywhere");
-        }
+        let mut working_set = StateWorkingSet::new(&engine_state);
+        working_set.add_decl(
+            Signature::build("mywhere")
+                .required("path", SyntaxShape::Filepath, "path")
+                .required("cond", SyntaxShape::RowCondition, "condition")
+                .predeclare(),
+        );
+        let delta = working_set.render();
+        engine_state.merge_delta(delta).expect("merge mywhere");
         let engine_state = Arc::new(engine_state);
         let engine = CompletionEngine::new(&engine_state, &Stack::new());
 
@@ -2755,74 +3221,6 @@ mod completer_tests {
         );
     }
 
-    /// Adversarial operators/units/nested pipeline places.
-    #[test]
-    fn where_operator_variants_and_downstream_get() {
-        let engine_state = test_engine();
-        let engine = CompletionEngine::new(&engine_state, &Stack::new());
-        assert_eq!(
-            place_of(&engine, "ls | where size >= 1"),
-            ("positional".into(), Some(0))
-        );
-        assert_eq!(
-            place_of(&engine, "ls | where size =="),
-            ("operator".into(), None)
-        );
-        assert_eq!(
-            place_of(&engine, "ls | where size == "),
-            ("positional".into(), Some(0))
-        );
-        assert_eq!(
-            place_of(&engine, "ls | where size > 1kb"),
-            ("positional".into(), Some(0))
-        );
-        assert_eq!(
-            place_of(&engine, "ls | where size > 1 | get name"),
-            ("positional".into(), Some(0))
-        );
-        assert_eq!(
-            place_of(&engine, "ls | where size > 1 | get "),
-            ("positional".into(), Some(0))
-        );
-        // Incomplete pipe is a command head.
-        assert_eq!(place_of(&engine, "ls |"), ("command".into(), None));
-        assert_eq!(place_of(&engine, "ls | "), ("command".into(), None));
-    }
-
-    #[test]
-    fn narrows_stays_within_one_token() {
-        assert!(q("ls foobar").narrows(&q("ls foo"), token(3)));
-
-        // Not narrowing: no new text, or text removed.
-        assert!(!q("ls foo").narrows(&q("ls foo"), token(3)));
-        assert!(!q("ls fo").narrows(&q("ls foo"), token(3)));
-
-        // Each boundary character starts a new token, which a cached entry cannot answer.
-        for narrowed in [
-            "ls foo|from",
-            "ls foo;ls",
-            "ls foo/bar",
-            "ls foo=1",
-            "ls foo,2",
-        ] {
-            assert!(
-                !q(narrowed).narrows(&q("ls foo"), token(3)),
-                "narrowed across a boundary: {narrowed:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn narrows_rejects_a_token_that_becomes_a_flag() {
-        // The empty slot after `from csv ` is answered at a point span; `--sep` adds no
-        // boundary, so only the flag check keeps it from following.
-        let base = q("from csv ");
-        assert!(!q("from csv --sep").narrows(&q("from csv "), token(base.cursor())));
-
-        // Extending a flag the user was already typing stays sound.
-        assert!(q("from csv --sep").narrows(&q("from csv --s"), token(9)));
-    }
-
     /// A cursor mid-char or past the end must not panic or split a char; `typed()` slices
     /// the buffer directly.
     #[test]
@@ -2839,25 +3237,13 @@ mod completer_tests {
         assert_eq!(empty.cursor(), 0);
     }
 
+    /// Runs `source` in `engine` and `stack`, and merges the environment it leaves.
     fn apply_source(engine: &mut EngineState, stack: &mut Stack, source: &[u8]) {
-        use nu_engine::eval_block;
-        use nu_protocol::{PipelineData, debugger::WithoutDebug};
-
-        let mut working_set = StateWorkingSet::new(engine);
-        let block = parse(&mut working_set, None, source, false);
-        assert!(
-            working_set.parse_errors.is_empty(),
-            "{:?}",
-            working_set.parse_errors
-        );
-        engine
-            .merge_delta(working_set.render())
-            .expect("merge_delta");
-        eval_block::<WithoutDebug>(engine, stack, &block, PipelineData::empty())
-            .expect("eval source");
+        apply_stack_local_source(engine, stack, source);
         engine.merge_env(stack).expect("merge_env");
     }
 
+    /// Runs `source` in `engine` and `stack`, leaving the environment on the stack.
     fn apply_stack_local_source(engine: &mut EngineState, stack: &mut Stack, source: &[u8]) {
         use nu_engine::eval_block;
         use nu_protocol::{PipelineData, debugger::WithoutDebug};
@@ -2876,58 +3262,107 @@ mod completer_tests {
             .expect("eval source");
     }
 
+    /// A line whose completion the cache keeps: `t ` asks a parameter completer that takes no
+    /// input, whose list does not depend on the token.
+    const KEPT_LINE: &str = "t ";
+
+    /// `engine` and `stack` with the `t` command and its completer defined.
+    fn with_t(engine: &EngineState, stack: &mut Stack) -> EngineState {
+        let mut engine = engine.clone();
+        apply_source(
+            &mut engine,
+            stack,
+            b"def comp [] { [apple banana] }\ndef t [x: string@comp] {}",
+        );
+        engine
+    }
+
+    /// How many custom answers this completer's cache holds in its environment.
+    fn kept(completer: &NuCompleter) -> usize {
+        completer.view.answers_kept()
+    }
+
     /// The worker runs on an isolated stack and must still produce identical results.
     #[test]
     fn background_result_matches_the_synchronous_engine() {
         let engine = test_engine();
         let mut completer = NuCompleter::new(engine.clone(), Arc::new(Stack::new()));
 
-        let sorted = |mut values: Vec<String>| {
-            values.sort();
-            values
-        };
-        let expected = sorted(
-            CompletionEngine::new(&engine, &Stack::new())
-                .fetch_completions_at("ls | c", 6)
-                .into_iter()
-                .map(|s| s.suggestion.value)
-                .collect(),
-        );
+        let mut expected: Vec<_> = CompletionEngine::new(&engine, &Stack::new())
+            .fetch_completions_for_editor("ls | c", 6)
+            .into_iter()
+            .map(|s| s.suggestion.value)
+            .collect();
+        expected.sort();
         assert!(expected.iter().any(|value| value == "cd"));
-
-        // Nothing is cached yet, so the first non-blocking call can only be pending.
-        assert!(completer.complete("ls | c", 6).is_pending());
-
-        let settled = sorted(
-            completer
-                .complete_blocking("ls | c", 6)
-                .iter()
-                .map(|s| s.value.clone())
-                .collect(),
-        );
+        let mut settled = values(&mut completer, "ls | c");
+        settled.sort();
         assert_eq!(expected, settled);
     }
 
+    /// The values `completer` offers at the end of `line`.
+    fn values(completer: &mut NuCompleter, line: &str) -> Vec<String> {
+        completer
+            .complete_blocking(line, line.len())
+            .iter()
+            .map(|suggestion| suggestion.value.clone())
+            .collect()
+    }
+
+    /// What a custom completer returned is kept, and narrowing the token ranks it again.
+    #[test]
+    fn a_custom_answer_is_kept_and_narrowed_again() {
+        let mut stack = Stack::new();
+        let engine = Arc::new(with_t(&test_engine(), &mut stack));
+        let mut completer = NuCompleter::new(engine, Arc::new(stack));
+        assert_eq!(kept(&completer), 0);
+
+        // Only the completer's own: `t` names a command, so `to csv` is not a reading of `t `.
+        assert_eq!(values(&mut completer, "t "), ["apple", "banana"]);
+        assert_eq!(kept(&completer), 1);
+        assert_eq!(values(&mut completer, "t ba"), ["banana"]);
+        assert_eq!(values(&mut completer, "t a"), ["apple", "banana"]);
+        // One answer served all three tokens.
+        assert_eq!(kept(&completer), 1);
+    }
+
+    /// A completer that is handed the token can answer differently for each, so it runs
+    /// every time.
+    #[test]
+    fn a_completer_that_reads_the_token_is_not_kept() {
+        let mut stack = Stack::new();
+        let mut engine = (*test_engine()).clone();
+        apply_source(
+            &mut engine,
+            &mut stack,
+            b"def comp [token: record] { [$\"($token.text)1\" $\"($token.text)2\"] }\n\
+              def t [x: string@comp] {}",
+        );
+        let mut completer = NuCompleter::new(Arc::new(engine), Arc::new(stack));
+        assert_eq!(values(&mut completer, "t x"), ["x1", "x2"]);
+        assert_eq!(kept(&completer), 0);
+    }
+
     /// A cache handed to a new per-prompt completer must still answer the previous prompt's
-    /// queries.
+    /// questions.
     #[test]
     fn cache_outlives_the_completer_that_filled_it() {
-        let engine = test_engine();
-        let cache = NarrowingCache::default();
+        let mut stack = Stack::new();
+        let engine = Arc::new(with_t(&test_engine(), &mut stack));
+        let stack = Arc::new(stack);
+        let cache = CompletionCache::default();
 
         let mut filling_prompt =
-            NuCompleter::with_cache(engine.clone(), Arc::new(Stack::new()), cache.clone());
-        let warmed = filling_prompt.complete_blocking("ls | c", 6);
-        assert!(warmed.iter().any(|s| s.value == "cd"));
+            NuCompleter::with_cache(engine.clone(), stack.clone(), cache.clone());
+        assert!(!filling_prompt.complete_blocking(KEPT_LINE, 2).is_empty());
         drop(filling_prompt);
 
-        let mut next_prompt = NuCompleter::with_cache(engine, Arc::new(Stack::new()), cache);
-        let answer = next_prompt.complete("ls | c", 6);
-        assert!(
-            matches!(answer, CompletionResult::Fresh { .. }),
-            "a carried-over cache entry should answer outright, got {answer:?}"
+        let next_prompt = NuCompleter::with_cache(engine, stack, cache);
+        assert_eq!(
+            kept(&next_prompt),
+            1,
+            "a carried-over answer should be there"
         );
-        assert!(answer.suggestions().iter().any(|s| s.value == "cd"));
     }
 
     /// ...but not across a `cd`/`$env.PATH` change, the reason [`CacheEnv`] exists.
@@ -2935,61 +3370,49 @@ mod completer_tests {
     fn cache_is_not_reused_in_a_different_environment() {
         use nu_protocol::Value;
 
-        let engine = test_engine();
-        let cache = NarrowingCache::default();
+        let mut stack = Stack::new();
+        let engine = Arc::new(with_t(&test_engine(), &mut stack));
+        let cache = CompletionCache::default();
 
         let mut filling_prompt =
-            NuCompleter::with_cache(engine.clone(), Arc::new(Stack::new()), cache.clone());
-        assert!(!filling_prompt.complete_blocking("ls | c", 6).is_empty());
+            NuCompleter::with_cache(engine.clone(), Arc::new(stack.clone()), cache.clone());
+        assert!(!filling_prompt.complete_blocking(KEPT_LINE, 2).is_empty());
 
-        let mut moved = Stack::new();
+        let mut moved = stack;
         moved.add_env_var(
             "PATH".into(),
             Value::string("/somewhere/else", Span::unknown()),
         );
-        let mut next_prompt = NuCompleter::with_cache(engine, Arc::new(moved), cache);
-        assert!(
-            next_prompt.complete("ls | c", 6).is_pending(),
-            "entries from another environment must not answer"
+        let next_prompt = NuCompleter::with_cache(engine, Arc::new(moved), cache);
+        assert_eq!(
+            kept(&next_prompt),
+            0,
+            "answers from another environment must not be served"
         );
     }
 
-    /// `foo r` + Tab, then `e` + Tab: the stale fallback narrows the cached `foo r` answer.
-    /// With a file in it as well, no fallback is given, so Tab can't insert `foo reb` and
-    /// drop `README.md` before the fresh answer arrives.
-    #[rstest::rstest]
-    #[case::file_and_subcommands(&[("README.md", 4), ("foo rebase", 0), ("foo rebuild", 0)], &[])]
-    #[case::subcommands_only(&[("foo rebase", 0), ("foo rebuild", 0)], &["foo rebase", "foo rebuild"])]
-    fn narrowed_fallback_needs_one_span(
-        #[case] cached: &[(&str, usize)],
-        #[case] expected: &[&str],
-    ) {
-        let environment = CacheEnv(0);
-        let cache = NarrowingCache::default();
-        cache.store(
-            CompletionQuery::new("foo r", 5),
-            environment,
-            cached
-                .iter()
-                .map(|&(value, start)| reedline::Suggestion {
-                    value: value.into(),
-                    span: reedline::Span::new(start, 5),
-                    ..Default::default()
-                })
-                .collect(),
-        );
+    /// What the cache answers may be out of date, which `debug complete` reports as its
+    /// `origin`; the completer's first answer is live.
+    #[test]
+    fn what_the_cache_answers_is_marked_as_cached() {
+        use crate::completions::Origin;
 
-        let fallback = cache.narrowed_fallback(
-            &CompletionQuery::new("foo re", 6),
-            environment,
-            &CompletionOptions::default(),
-        );
-        let values: Vec<_> = fallback.iter().map(|s| s.value.as_str()).collect();
-        assert_eq!(values, expected);
+        let mut stack = Stack::new();
+        let engine = with_t(&test_engine(), &mut stack);
+        let cache = CompletionCache::default();
+        let origins = || -> Vec<_> {
+            (CompletionEngine::new(&engine, &stack).caching_in(&cache))
+                .fetch_completions_at(KEPT_LINE, 2)
+                .into_iter()
+                .map(|found| found.origin)
+                .collect()
+        };
+        assert_eq!(origins(), [Origin::Live; 2]);
+        assert_eq!(origins(), [Origin::Cached; 2]);
     }
 
     /// Any `$env.config` assignment, including ones that are not completion
-    /// settings, must not keep serving the previous prompt's suggestions.
+    /// settings, must not keep serving the previous prompt's answers.
     #[rstest::rstest]
     #[case::external_completer(
         b"$env.config.completions.external.completer = {|spans| [from-second]}",
@@ -3007,14 +3430,15 @@ mod completer_tests {
             &mut stack,
             b"$env.config.completions.external.completer = {|spans| [from-first]}",
         );
+        let engine = with_t(&engine, &mut stack);
         let first_env = CacheEnv::of(&engine, &stack);
         let engine = Arc::new(engine);
         let stack = Arc::new(stack);
-        let cache = NarrowingCache::default();
+        let cache = CompletionCache::default();
 
         let mut filling_prompt =
             NuCompleter::with_cache(engine.clone(), stack.clone(), cache.clone());
-        assert!(!filling_prompt.complete_blocking("ls | c", 6).is_empty());
+        assert!(!filling_prompt.complete_blocking(KEPT_LINE, 2).is_empty());
         drop(filling_prompt);
 
         let mut engine = (*engine).clone();
@@ -3027,17 +3451,14 @@ mod completer_tests {
         );
 
         let mut next_prompt = NuCompleter::with_cache(Arc::new(engine), Arc::new(stack), cache);
-        assert!(
-            next_prompt.complete("ls | c", 6).is_pending(),
-            "entries computed under a previous config must not answer"
+        assert_eq!(
+            kept(&next_prompt),
+            0,
+            "answers computed under a previous config must not be served"
         );
 
         if let Some(expected) = expected_external {
-            let values: Vec<_> = next_prompt
-                .complete_blocking("extcommand x", 12)
-                .iter()
-                .map(|s| s.value.clone())
-                .collect();
+            let values = values(&mut next_prompt, "extcommand x");
             assert_eq!(values, [expected], "the newly assigned completer must run");
         }
     }
@@ -3047,9 +3468,11 @@ mod completer_tests {
     #[test]
     fn cache_is_not_reused_after_stack_local_config_changes() {
         let engine = test_engine();
-        let cache = NarrowingCache::default();
+        let cache = CompletionCache::default();
 
         let mut first_stack = Stack::new();
+        let engine = Arc::new(with_t(&engine, &mut first_stack));
+        let mut second_stack = first_stack.clone();
         first_stack.config = Some({
             let mut config = engine.get_config().as_ref().clone();
             config.float_precision = 5;
@@ -3058,25 +3481,24 @@ mod completer_tests {
 
         let mut filling_prompt =
             NuCompleter::with_cache(engine.clone(), Arc::new(first_stack), cache.clone());
-        assert!(!filling_prompt.complete_blocking("ls | c", 6).is_empty());
+        assert!(!filling_prompt.complete_blocking(KEPT_LINE, 2).is_empty());
         drop(filling_prompt);
 
-        let mut second_stack = Stack::new();
         second_stack.config = Some({
             let mut config = engine.get_config().as_ref().clone();
             config.float_precision = 6;
             Arc::new(config)
         });
 
-        let mut next_prompt = NuCompleter::with_cache(engine, Arc::new(second_stack), cache);
-        assert!(
-            next_prompt.complete("ls | c", 6).is_pending(),
-            "entries from another stack-local config must not answer"
+        let next_prompt = NuCompleter::with_cache(engine, Arc::new(second_stack), cache);
+        assert_eq!(
+            kept(&next_prompt),
+            0,
+            "answers from another stack-local config must not be served"
         );
     }
 
-    /// A stack-local external completer change must not keep serving the previous
-    /// completer's cached suggestions.
+    /// A stack-local external completer change must run the new completer.
     #[test]
     fn cache_is_not_reused_after_stack_local_external_completer_changes() {
         let mut engine = (*test_engine()).clone();
@@ -3093,125 +3515,323 @@ mod completer_tests {
             b"$env.config.completions.external.completer = {|buffer| [from-second]}",
         );
         let engine = Arc::new(engine);
-        let cache = NarrowingCache::default();
+        let cache = CompletionCache::default();
 
         let mut filling_prompt =
             NuCompleter::with_cache(engine.clone(), Arc::new(first_stack), cache.clone());
-        let first_values: Vec<_> = filling_prompt
-            .complete_blocking("extcommand x", 12)
-            .iter()
-            .map(|s| s.value.clone())
-            .collect();
-        assert_eq!(first_values, ["from-first"]);
+        assert_eq!(values(&mut filling_prompt, "extcommand x"), ["from-first"]);
         drop(filling_prompt);
 
         let mut next_prompt = NuCompleter::with_cache(engine, Arc::new(second_stack), cache);
-        assert!(
-            next_prompt.complete("extcommand x", 12).is_pending(),
-            "the cached result from the first stack-local completer must not answer"
-        );
-
-        let second_values: Vec<_> = next_prompt
-            .complete_blocking("extcommand x", 12)
-            .iter()
-            .map(|s| s.value.clone())
-            .collect();
-        assert_eq!(second_values, ["from-second"]);
+        assert_eq!(values(&mut next_prompt, "extcommand x"), ["from-second"]);
     }
 
-    /// `cache_size = 0` must disable the cache entirely, even a carried-over one.
+    /// `cache_size = 0` must keep nothing, even in a cache that was carried over.
     #[test]
     fn cache_size_zero_disables_the_cache() {
-        let mut engine = (*test_engine()).clone();
+        let mut stack = Stack::new();
+        let mut engine = with_t(&test_engine(), &mut stack);
         let mut config = engine.get_config().as_ref().clone();
         config.completions.cache_size = 0;
         engine.set_config(config);
         let engine = Arc::new(engine);
-        let cache = NarrowingCache::default();
+        let stack = Arc::new(stack);
+        let cache = CompletionCache::default();
 
         let mut filling_prompt =
-            NuCompleter::with_cache(engine.clone(), Arc::new(Stack::new()), cache.clone());
-        assert!(!filling_prompt.complete_blocking("ls | c", 6).is_empty());
-        drop(filling_prompt);
-
-        let mut next_prompt = NuCompleter::with_cache(engine, Arc::new(Stack::new()), cache);
-        assert!(
-            next_prompt.complete("ls | c", 6).is_pending(),
-            "a disabled cache must not answer a query it could have answered"
-        );
+            NuCompleter::with_cache(engine.clone(), stack.clone(), cache.clone());
+        assert!(!filling_prompt.complete_blocking(KEPT_LINE, 2).is_empty());
+        assert_eq!(kept(&filling_prompt), 0, "a disabled cache keeps nothing");
     }
 
     /// Stack-local `cache_size` changes should take effect before the config is merged
     /// into `EngineState`.
     #[test]
     fn stack_local_cache_size_zero_disables_the_cache() {
-        let engine = test_engine();
         let mut stack = Stack::new();
+        let engine = Arc::new(with_t(&test_engine(), &mut stack));
         stack.config = Some({
             let mut config = engine.get_config().as_ref().clone();
             config.completions.cache_size = 0;
             Arc::new(config)
         });
-        let cache = NarrowingCache::default();
+        let cache = CompletionCache::default();
 
         let mut disabled_prompt =
             NuCompleter::with_cache(engine.clone(), Arc::new(stack), cache.clone());
-        assert!(!disabled_prompt.complete_blocking("ls | c", 6).is_empty());
-        drop(disabled_prompt);
-
-        let mut next_prompt = NuCompleter::with_cache(engine, Arc::new(Stack::new()), cache);
-        assert!(
-            next_prompt.complete("ls | c", 6).is_pending(),
-            "a stack-local cache_size of zero must prevent storing carried-over entries"
-        );
+        assert!(!disabled_prompt.complete_blocking(KEPT_LINE, 2).is_empty());
+        assert_eq!(kept(&disabled_prompt), 0);
     }
 
-    /// A narrowed fallback keeps the producer's order rather than re-sorting.
+    /// An answer is kept only for the line before the token: another line is another question.
     #[test]
-    fn a_narrowed_fallback_keeps_the_producers_order() {
-        let mut engine =
-            nu_command::add_shell_command_context(nu_cmd_lang::create_default_context());
-        // An unsorted (`sort: false`) command-wide completer seeds the narrowing cache.
-        let src = "
-            def comp [token] { {completions: [zzz-two, zzz-one], options: {sort: false, filter: false}} }
-            @complete comp
-            def --wrapped my-cmd [...rest] {}";
-        let delta = {
-            let mut working_set = StateWorkingSet::new(&engine);
-            parse(&mut working_set, None, src.as_bytes(), false);
-            assert!(
-                working_set.parse_errors.is_empty(),
-                "{:?}",
-                working_set.parse_errors
-            );
-            working_set.render()
+    fn another_line_before_the_token_is_another_question() {
+        let mut stack = Stack::new();
+        let engine = Arc::new(with_t(&test_engine(), &mut stack));
+        let mut completer = NuCompleter::new(engine, Arc::new(stack));
+        assert!(!completer.complete_blocking("t ", 2).is_empty());
+        assert!(!completer.complete_blocking("echo (t ", 8).is_empty());
+        assert_eq!(kept(&completer), 2);
+    }
+
+    /// With the cursor at the end of the line, completing reads the parse that the highlighter
+    /// makes of it, and the highlighter then finds it already made; elsewhere in the line it
+    /// parses for itself. Either way the answer is the same.
+    #[test]
+    fn a_line_is_completed_from_the_highlighters_parse() {
+        let engine = test_engine();
+        let stack = Arc::new(Stack::new());
+        let highlighter = NuHighlighter::new(engine.clone(), stack.clone());
+        let mut sharing =
+            NuCompleter::new(engine.clone(), stack.clone()).share_parse_of(&highlighter);
+        let mut alone = NuCompleter::new(engine, stack);
+
+        let line = "ls | c";
+        assert!(!highlighter.parse_cache().holds(line));
+        let answer = sharing.complete_blocking(line, line.len());
+        assert!(highlighter.parse_cache().holds(line));
+        assert!(!answer.is_empty());
+        assert_eq!(answer, alone.complete_blocking(line, line.len()));
+
+        // A cursor with text after it parses the whole line differently from what is before it.
+        let line = "ls | cd x";
+        let answer = sharing.complete_blocking(line, 6);
+        assert!(!highlighter.parse_cache().holds(line));
+        assert_eq!(answer, alone.complete_blocking(line, 6));
+    }
+
+    /// The highlighter parses without loading modules; a line that has a `use` it did not load
+    /// is completed from a parse of its own.
+    #[test]
+    fn a_line_the_highlighter_could_not_parse_in_full_is_parsed_again() {
+        let engine = test_engine();
+        let stack = Arc::new(Stack::new());
+        let highlighter = NuHighlighter::new(engine.clone(), stack.clone());
+        let mut sharing =
+            NuCompleter::new(engine.clone(), stack.clone()).share_parse_of(&highlighter);
+        let mut alone = NuCompleter::new(engine, stack);
+
+        let line = "use std/assert; assert e";
+        let answer = sharing.complete_blocking(line, line.len());
+        assert!(highlighter.parse_cache().holds(line));
+        assert_eq!(answer, alone.complete_blocking(line, line.len()));
+    }
+
+    /// What the completer knows of each suggestion rides with its answer, by index, and the
+    /// panel draws it: kinds in their colours, paths under the directory they share, a
+    /// correction as what was typed and what was meant, the types of columns, and the fields a
+    /// custom completer returns beyond the known ones.
+    #[test]
+    fn the_panel_draws_what_the_completer_knows_of_each_suggestion() {
+        use crate::completion_panel::{nu_panel, tests::view};
+        use nu_ansi_term::{Color, Style};
+        use reedline::{Panel, View};
+        use std::path::MAIN_SEPARATOR as SEP;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        std::fs::create_dir_all(dir.path().join("src/completions")).expect("a directory");
+        std::fs::write(dir.path().join("src/repl.rs"), "").expect("a file");
+        let mut engine = (*test_engine()).clone();
+        let mut stack = Stack::new();
+        let cwd = Value::test_string(dir.path().to_string_lossy());
+        stack.add_env_var("PWD".into(), cwd);
+        apply_source(
+            &mut engine,
+            &mut stack,
+            b"def comp [] { [{value: main, remote: origin}, {value: topic}, {value: trunk, remote: fork, age: 2hr}] }
+              def t [x: string@comp] {}",
+        );
+        let completer = CompletionEngine::isolated(&engine, Arc::new(stack), true);
+        let answer = |line: &str| completer.answer(&CompletionQuery::new(line, line.len()));
+        let red = [("shape_internalcall".to_owned(), Value::test_string("red"))];
+        let config = Config {
+            color_config: red.into_iter().collect(),
+            ..Config::default()
         };
-        engine.merge_delta(delta).expect("merge_delta");
-        let engine = Arc::new(engine);
+        let mut panel = nu_panel(&Arc::new(config), Style::new());
+        fn coloured(completions: &Completions) -> View<'_> {
+            View {
+                use_ansi_coloring: true,
+                ..view(completions, None)
+            }
+        }
 
-        let cache = NarrowingCache::default();
-        let mut warming =
-            NuCompleter::with_cache(engine.clone(), Arc::new(Stack::new()), cache.clone());
-        let warmed: Vec<_> = warming
-            .complete_blocking("my-cmd zzz", 10)
-            .iter()
-            .map(|s| s.value.clone())
-            .collect();
-        assert_eq!(warmed, ["zzz-two", "zzz-one"], "producer order, unsorted");
-        drop(warming);
+        // A command in the colour the config gives it, a keyword in its own; the hint says what a
+        // command takes before what it is for.
+        let commands = answer("wher");
+        let rows = panel.render(&view(&commands, None));
+        assert_eq!(rows[1..3], ["│ where        │", "│ record where │"]);
+        let rows = panel.render(&coloured(&commands));
+        assert!(!rows[1].contains("\x1b[31m"), "{rows:?}");
+        assert!(
+            rows[2].contains(&Color::Red.paint("d").to_string()),
+            "{rows:?}"
+        );
+        let hint = panel.hint(&view(&commands, Some(0))).unwrap_or_default();
+        assert!(hint.starts_with("  <condition>  Filter values"), "{hint:?}");
 
-        // Narrowing one more character keeps that order instead of sorting.
-        let mut narrowing = NuCompleter::with_cache(engine, Arc::new(Stack::new()), cache);
-        let values: Vec<_> = narrowing
-            .complete("my-cmd zzz-", 11)
-            .suggestions()
-            .iter()
-            .map(|s| s.value.clone())
-            .collect();
-        assert_eq!(
-            values,
-            ["zzz-two", "zzz-one"],
-            "narrowed fallback must not re-sort"
+        let rows = panel.render(&view(&answer(&format!("ls src{SEP}")), None));
+        let top = format!("╭─ src{SEP} ───────╮");
+        let directory = format!("│ completions{SEP} │");
+        let below = ["│ repl.rs      │", "╰──────────────╯"];
+        assert_eq!(rows, [top.as_str(), directory.as_str(), below[0], below[1]]);
+
+        let fixed = answer("ls | wehre");
+        assert_eq!(panel.render(&view(&fixed, None))[1], "│ wehre → where │");
+        let struck = Style::new().strikethrough().paint("wehre").to_string();
+        assert!(panel.render(&coloured(&fixed))[1].contains(&struck));
+
+        let rows = panel.render(&view(&answer("{name: a, size: 160b} | get "), None));
+        assert_eq!(rows[1..3], ["│ name  string   │", "│ size  filesize │"]);
+
+        // The extra fields are columns in the order they were first seen.
+        let rows = panel.render(&view(&answer("t "), None));
+        let fields = [
+            "│ main   origin      │",
+            "│ topic              │",
+            "│ trunk  fork    2hr │",
+        ];
+        assert_eq!(rows[1..4], fields);
+        // An answer with no suggestions carries no data.
+        assert!(answer("t zzzz").data.is_none());
+    }
+
+    /// A completer over an engine that has `git checkout`, three examples of it, and a flag;
+    /// it has seen `git ch` completed with the cursor at its end and a preview drawn.
+    fn completer_with_examples() -> (NuCompleter, DeclId) {
+        let mut engine_state =
+            nu_command::add_shell_command_context(nu_cmd_lang::create_default_context());
+        let mut working_set = StateWorkingSet::new(&engine_state);
+        parse(
+            &mut working_set,
+            None,
+            br#"
+            # Switch branches.
+            @example "Create a branch" "git checkout -b <branch>"
+            @example "Create a branch from a ref" "git checkout -b <branch> <ref>"
+            @example "Go back" "git checkout -"
+            export extern "git checkout" [
+                --branch(-b): string # The new branch.
+                target?: string # What to check out.
+            ]"#,
+            false,
+        );
+        assert!(working_set.parse_errors.is_empty());
+        engine_state
+            .merge_delta(working_set.render())
+            .expect("merge_delta");
+        let decl_id = engine_state
+            .find_decl(b"git checkout", &[])
+            .expect("the command");
+        let mut stack = Stack::new();
+        let cwd = std::env::current_dir().expect("a current directory");
+        stack.add_env_var(
+            "PWD".into(),
+            Value::string(cwd.to_string_lossy(), Span::unknown()),
+        );
+        let mut completer = NuCompleter::new(Arc::new(engine_state), Arc::new(stack));
+        completer.last_request = Some(("git ch".into(), 6));
+        completer.preview_width = 70;
+        (completer, decl_id)
+    }
+
+    /// The answer with one suggestion, `value` as the details say.
+    fn one_suggestion(value: &str, detail: crate::completions::Detail) -> Completions {
+        Completions::new(vec![Suggestion {
+            value: value.into(),
+            ..Suggestion::default()
+        }])
+        .with_data(Details(vec![detail]))
+    }
+
+    #[test]
+    fn a_click_on_an_example_of_a_command_preview_takes_it_over_the_command() {
+        use crate::completions::Detail;
+        let (mut completer, decl_id) = completer_with_examples();
+        let completions = one_suggestion(
+            "git checkout",
+            Detail {
+                kind: Some(SuggestionKind::Command(
+                    CommandType::External,
+                    Some(decl_id),
+                )),
+                ..Detail::default()
+            },
+        );
+        let (shown, examples) = crate::completions::preview::preview_with_examples(
+            &completer.engine_state,
+            &completer.stack,
+            &completions,
+            0,
+            70,
+            None,
+        );
+        // The first two examples are folded in `rows`, the third is behind the fold.
+        assert_eq!(examples.len(), 3, "{shown:#?}");
+        assert!(examples[2].0.start >= shown.rows.len());
+
+        // The last row of an example block is its code.
+        for (rows, code) in &examples {
+            let taken = completer
+                .preview_clicked(&completions, 0, rows.end - 1)
+                .expect("an example");
+            assert_eq!(&taken.value, code);
+            assert_eq!((taken.span.start, taken.span.end), (0, 6));
+        }
+        let taken = completer
+            .preview_clicked(&completions, 0, examples[1].0.end - 1)
+            .expect("the second example");
+        assert_eq!(taken.value, "git checkout -b <branch> <ref>");
+        // The cursor is on the first placeholder, the end of `<branch>`.
+        assert_eq!(taken.cursor, Some("git checkout -b <branch>".len()));
+
+        // A row that is not an example, such as the blank between two, selects as before.
+        let between = (0..shown.rows.len() + shown.more.len())
+            .find(|row| examples.iter().all(|(rows, _)| !rows.contains(row)))
+            .expect("a row between examples");
+        assert!(
+            completer
+                .preview_clicked(&completions, 0, between)
+                .is_none()
+        );
+        assert!(completer.preview_clicked(&completions, 0, 999).is_none());
+    }
+
+    #[test]
+    fn a_click_under_a_flags_help_takes_an_example_that_uses_it() {
+        use crate::completions::Detail;
+        let (mut completer, decl_id) = completer_with_examples();
+        let completions = one_suggestion(
+            "--branch",
+            Detail {
+                kind: Some(SuggestionKind::Flag),
+                help_at: Some(Arc::new(HelpAt {
+                    command: HelpFor::Decl(decl_id),
+                    slot: Slot::Flag,
+                })),
+                ..Detail::default()
+            },
+        );
+        let (_, examples) = crate::completions::preview::preview_with_examples(
+            &completer.engine_state,
+            &completer.stack,
+            &completions,
+            0,
+            70,
+            None,
+        );
+        assert_eq!(examples.len(), 2);
+        for (rows, _) in &examples {
+            let taken = completer
+                .preview_clicked(&completions, 0, rows.end - 1)
+                .expect("an example");
+            assert!(taken.value.starts_with("git checkout -b "), "{taken:?}");
+        }
+        // The blank row between them is not one.
+        assert!(
+            completer
+                .preview_clicked(&completions, 0, examples[0].0.end)
+                .is_none()
         );
     }
 }

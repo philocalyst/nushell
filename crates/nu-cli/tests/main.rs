@@ -3,6 +3,7 @@
 mod commands;
 mod completions;
 mod highlight_use;
+mod hints;
 mod last_result;
 
 #[macro_use]

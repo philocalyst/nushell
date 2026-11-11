@@ -159,7 +159,7 @@ impl Hinter for ExternalHinter {
     }
 }
 
-fn first_hint_token(hint: &str) -> String {
+pub(super) fn first_hint_token(hint: &str) -> String {
     let mut reached_content = false;
     hint.split_word_bounds()
         .take_while(

@@ -170,8 +170,10 @@ fn file_completion_after_builtin_sigil_preserves_scope_and_arguments() {
 
 #[test]
 fn file_completion_for_wrapped_commands_ignores_the_untyped_suffix() {
-    let (_, _, engine_state, stack) = super::support::new_engine();
+    // A wrapped command names a program, so `fake-cmd` has to be on `PATH`.
+    let (_root, engine_state, stack) = super::support::new_program_engine(&["fake-cmd"]);
     let engine = CompletionEngine::new(&engine_state, &stack);
+    let program = format!("fake-cmd{}", std::env::consts::EXE_SUFFIX);
     for wrapper in ["sudo", "doas"] {
         for tail in ["", " one"] {
             let source = format!("{wrapper} fake-cZZ{tail}");
@@ -180,13 +182,13 @@ fn file_completion_for_wrapped_commands_ignores_the_untyped_suffix() {
             let suggestions = engine.fetch_completions_within_file("file.nu", cursor, &source);
             let suggestion = suggestions
                 .iter()
-                .find(|item| item.suggestion.value == "fake-cmd")
+                .find(|item| item.suggestion.value == program)
                 .unwrap_or_else(|| panic!("missing wrapped command completion for {source:?}"));
             let span = suggestion.suggestion.span;
             assert_eq!((span.start, span.end), (start, start + "fake-cZZ".len()));
             let mut accepted = source.clone();
             accepted.replace_range(span.start..span.end, &suggestion.suggestion.value);
-            assert_eq!(accepted, format!("{wrapper} fake-cmd{tail}"));
+            assert_eq!(accepted, format!("{wrapper} {program}{tail}"));
         }
     }
 }

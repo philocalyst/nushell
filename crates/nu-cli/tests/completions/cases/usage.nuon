@@ -1,0 +1,33 @@
+# What the history says the user uses ranks it above what ties with it, but never above a much
+# better match: arguments after the command they were given to, commands, and the directories the
+# user has been in lately.
+{
+  world: [alpha/ beta/ gamma/ file.txt]
+  prelude: r#'
+    def comp [] { [bench build rebench] }
+    def cargo [sub: string@comp] {}
+    def alpha-run [] {}
+    def alpha-sun [] {}
+    def branches [] { [dev main] }
+    def "mygit checkout" [branch: string@branches] {}
+    def prune [branch: string@branches] {}
+    def order [] { [first second third fourth] }
+    def tool [x: string@order] {}
+  '#
+  cases: [
+    {test: an_argument_used_often_ranks_above_one_that_ties_with_it, line: "cargo b", order: [bench build]}
+    {test: an_argument_used_often_ranks_above_one_that_ties_with_it, line: "cargo b", order: [build bench], history: ["cargo build --release" "cargo build --release" "cargo build --release" "cargo build --release" "cargo build --release" "cargo build --release" "cargo build --release" "cargo build --release"]}
+    {test: a_favourite_does_not_overturn_a_much_better_match, setup: "$env.many = (1..5000 | each { 'cargo rebench' })", lines: ["cargo bench" "cargo b"], first: bench, history_from: "$env.many"}
+    {test: a_command_used_often_ranks_above_one_that_ties_with_it, line: "alpha-", values: [alpha-run alpha-sun]}
+    {test: a_command_used_often_ranks_above_one_that_ties_with_it, line: "alpha-", values: [alpha-sun alpha-run], history: [alpha-sun alpha-sun alpha-sun alpha-sun]}
+    {test: an_argument_is_lifted_after_the_command_it_was_given_to_and_not_after_another, line: "mygit checkout ", order: [main dev], history: ["mygit checkout main" "prune dev" "mygit checkout main"]}
+    {test: an_argument_is_lifted_after_the_command_it_was_given_to_and_not_after_another, line: "prune ", order: [dev main], history: ["mygit checkout main" "prune dev" "mygit checkout main"]}
+    {test: with_nothing_typed_what_was_used_leads_and_the_rest_keeps_the_completers_order, line: "tool ", values: [first second third fourth]}
+    {test: with_nothing_typed_what_was_used_leads_and_the_rest_keeps_the_completers_order, line: "tool ", values: [fourth third first second], history: ["tool fourth" "tool third" "tool fourth"]}
+    {test: directories_are_led_by_where_the_user_has_been_lately, line: "cd ", order: [alpha/ beta/ gamma/]}
+    {test: directories_are_led_by_where_the_user_has_been_lately, line: "cd ", order: [beta/ gamma/ alpha/], lacks: [file.txt], history: [
+      {line: ls, cwd: alpha, ago: 2592000} {line: "ls -a", cwd: gamma, ago: 7200} {line: "ls -l", cwd: beta, ago: 60} {line: "ls -t", cwd: beta, ago: 50}
+    ]}
+    {test: directories_are_led_by_where_the_user_has_been_lately, line: "cd al", values: [alpha/], history: [{line: ls, cwd: alpha, ago: 2592000} {line: "ls -l", cwd: beta, ago: 60}]}
+  ]
+}

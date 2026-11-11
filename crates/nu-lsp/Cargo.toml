@@ -12,6 +12,7 @@ license.workspace = true
 nu-cli.workspace = true
 nu-glob.workspace = true
 nu-parser.workspace = true
+nu-path.workspace = true
 nu-protocol.workspace = true
 nu-utils.workspace = true
 nu-experimental.workspace = true 

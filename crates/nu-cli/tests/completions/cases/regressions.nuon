@@ -1,0 +1,45 @@
+# Regressions the completion rethink fixed, each as the line that showed it.
+{
+  world: [first.txt folder/ crates/cli/src/completer.rs crates/cli/src/completions/ crates/cmd-plugin/src/commands/]
+  cases: [
+    # `cd cr` in a repository offers the directory `crates/` first, and no multi-word command whose
+    # letters merely contain `cd cr` (`commandline get-cursor`); `str tri` finds `str trim`.
+    {test: cd_cr_puts_crates_first_and_offers_no_command, world: [crates/nu-cli/src/lib.rs .cargo/config.toml docs/a.md devdocs/b.md target/debug/x scripts/run.sh tests/t.rs Cargo.toml CLAUDE.md], line: "cd cr", first: crates/, lacks: ["commandline get-cursor" "commandline set-cursor"], paths: true}
+    {test: multi_word_command_names_match_word_by_word, line: "str tri", has: ["str trim"]}
+    # Known bugs, documented by the cases that will hold once they are fixed.
+    {test: known_bug_narrowing_falls_back_to_files, ignore: "`help alp` swaps the commands `help al` matched for the files", line: "help alp", values: []}
+    {test: known_bug_values_after_end_of_options, ignore: "after `--`, `t -- -` offers the flags and `t -- --am` no value", setup: "def comp [] { ['--amend' '-a' 'main'] }\ndef t [x: string@comp] {}", line: "t -- --am", has: [--amend]}
+    {test: known_bug_fuzzy_argument_site_offers_command_heads, ignore: "under fuzzy, `t ` also offers the commands `to csv`, ... over the command word", setup: "$env.config.completions.algorithm = 'fuzzy'\ndef comp [] { ['a-' 'a_'] }\ndef t [x: string@comp] {}", line: "t ", values: [a- a_]}
+    # Only the last word of a command name is matched fuzzily; the words before it name the command
+    # whose subcommands are offered, so `co f` never reaches `config flatten`.
+    {test: subcommands_keep_the_words_already_typed, setup: "def co [x?: string] {}; def 'co fix' [] {}; def 'co fetch-all' [] {}", line: "co f", has: ["co fix" "co fetch-all"], within: ["co fix" "co fetch-all"]}
+    {test: subcommands_keep_the_words_already_typed, line: "str rep", first: "str replace"}
+    # A directory named exactly is the one meant, however loosely what follows matches.
+    {test: a_directory_named_exactly_narrows_the_path, line: "open crates/cli/src/comp", set: [crates/cli/src/completer.rs crates/cli/src/completions/], paths: true}
+    # A completer's value that names a declared subcommand is that command: offered once, as one.
+    {test: a_value_naming_a_subcommand_is_that_command, setup: "def subs [] { [checkout cherry] }\nextern tool [command?: string@subs]\n# Switch branches.\nextern 'tool checkout' []", line: "tool ch", traced: "get shown | each {|s| $'($s.value):($s.kind)' } | sort", traced_is: ["checkout:command" "cherry:value"]}
+    # Files are offered where an argument may be a path; a completer that declines leaves the
+    # argument to its type.
+    {test: files_are_offered_only_where_a_path_may_go, setup: r#'
+      def typed [a?: string] {}
+      def number [a?: int] {}
+      def none [] {}
+      def declines [] { null }
+      def declined [a?: string@declines] {}
+    '#, lines: ["typed f" "number f" "none f" "str replace f" "declined f"], values: []}
+    {test: files_are_offered_only_where_a_path_may_go, setup: r#'
+      def untyped [a?] {}
+      def file [a?: path] {}
+      def either [a?: oneof<int, path>] {}
+      def --wrapped wrapper [...rest] {}
+      def declines [] { null }
+      def declined_path [a?: path@declines] {}
+    '#, lines: ["untyped f" "file f" "either f" "wrapper f" "start f" "declined_path f"], set: [first.txt folder/]}
+    {test: files_are_offered_only_where_a_path_may_go, setup: "def dir [a?: directory] {}", line: "dir f", values: [folder/]}
+    # With nothing typed a completer's own order means something, so it is kept, unless it asks
+    # for `sort: true`; typing ranks as usual.
+    {test: a_completers_order_is_kept_until_something_is_typed, setup: "def ordered [] { [beta alpha gamma] }\ndef keep [a?: string@ordered] {}", line: "keep ", values: [beta alpha gamma]}
+    {test: a_completers_order_is_kept_until_something_is_typed, setup: "def sorted [] { {options: {sort: true}, completions: [beta alpha gamma]} }\ndef sort [a?: string@sorted] {}", line: "sort ", values: [alpha beta gamma]}
+    {test: a_completers_order_is_kept_until_something_is_typed, setup: "def ordered [] { [beta alpha gamma] }\ndef keep [a?: string@ordered] {}", line: "keep a", first: alpha}
+  ]
+}
