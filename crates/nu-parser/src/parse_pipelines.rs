@@ -25,7 +25,10 @@ fn parse_redirection_target(
             file,
             append,
         } => RedirectionTarget::File {
-            expr: parse_value(working_set, *file, &SyntaxShape::Any, None),
+            expr: {
+                crate::probe::redirection(working_set, *connector, Some(*file));
+                parse_value(working_set, *file, &SyntaxShape::Any, None)
+            },
             append: *append,
             span: *connector,
         },
@@ -181,6 +184,7 @@ pub fn parse_block(
     if let Some(err) = err {
         working_set.error(err);
     }
+    crate::probe::statement(working_set, tokens, span, input_type);
 
     trace!("parsing block: {lite_block:?}");
 

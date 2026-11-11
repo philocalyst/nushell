@@ -28,7 +28,36 @@ impl Command for HelpCommands {
                 "String to find in command names, descriptions, and search terms.",
                 Some('f'),
             )
-            .input_output_types(vec![(Type::Nothing, Type::table())])
+            .input_output_types(vec![(
+                Type::Nothing,
+                Type::Table(
+                    [
+                        ("name", Type::String),
+                        ("category", Type::String),
+                        ("command_type", Type::String),
+                        ("description", Type::String),
+                        (
+                            "params",
+                            Type::Table(
+                                [
+                                    ("name", Type::String),
+                                    ("type", Type::String),
+                                    ("required", Type::Bool),
+                                    ("description", Type::String),
+                                ]
+                                .into(),
+                            ),
+                        ),
+                        (
+                            "input_output",
+                            Type::Table([("input", Type::String), ("output", Type::String)].into()),
+                        ),
+                        ("search_terms", Type::String),
+                        ("is_const", Type::Bool),
+                    ]
+                    .into(),
+                ),
+            )])
             .allow_variants_without_examples(true)
     }
 

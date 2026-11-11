@@ -4249,3 +4249,201 @@ pub fn parse_name_check_leaves_no_block_in_the_state() {
         blocks_after("alias foo = attr echo"),
     );
 }
+
+/// What the parser expects at a probed offset (`parse_probed`), on the lines completion meets.
+mod probe {
+    use super::*;
+    use nu_protocol::engine::{Expect, Probe};
+
+    /// Parses `line`, whose `⌶` marks the probed offset, with a few commands declared, and gives
+    /// the probe, its spans relative to the line, and the working set.
+    fn probe(line: &str) -> (Probe, String, EngineState) {
+        let at = line.find('⌶').unwrap_or(line.len());
+        let source = line.replace('⌶', "");
+        let mut engine_state = EngineState::new();
+        let mut working_set = StateWorkingSet::new(&engine_state);
+        working_set.add_decl(Box::new(Let));
+        working_set.add_decl(Box::new(Where));
+        working_set.add_decl(
+            Signature::build("open")
+                .required("path", SyntaxShape::Filepath, "")
+                .switch("raw", "", Some('r'))
+                .named("encoding", SyntaxShape::String, "", Some('e'))
+                .predeclare(),
+        );
+        working_set.add_decl(Signature::build("str").predeclare());
+        working_set.add_decl(
+            Signature::build("str trim")
+                .rest("paths", SyntaxShape::CellPath, "")
+                .predeclare(),
+        );
+        working_set.add_decl(
+            Signature::build("rows")
+                .input_output_types(vec![(
+                    Type::Nothing,
+                    Type::Table([("name", Type::String), ("size", Type::Filesize)].into()),
+                )])
+                .predeclare(),
+        );
+        let delta = working_set.render();
+        engine_state.merge_delta(delta).expect("merge");
+
+        let mut working_set = StateWorkingSet::new(&engine_state);
+        let start = working_set.next_span_start();
+        let (_, mut probe) = parse_probed(&mut working_set, None, source.as_bytes(), at);
+        let delta = working_set.render();
+        engine_state.merge_delta(delta).expect("merge");
+        probe.at -= start;
+        for found in &mut probe.found {
+            found.span = Span::new(found.span.start - start, found.span.end - start);
+            found.within = Span::new(found.within.start - start, found.within.end - start);
+        }
+        (probe, source, engine_state)
+    }
+
+    /// The innermost expectations at the probe in `line`, each as `what@text it replaces`.
+    fn innermost(line: &str) -> String {
+        let (probe, source, engine_state) = probe(line);
+        let name = |decl_id| engine_state.get_decl(decl_id).name().to_owned();
+        let found = probe.innermost().map(|found| {
+            let what = match &found.what {
+                Expect::Command { parent } => {
+                    format!("Command({})", parent.map(name).unwrap_or_default())
+                }
+                Expect::Flag { decl_id } => format!("Flag({})", name(*decl_id)),
+                Expect::FlagValue {
+                    decl_id,
+                    long,
+                    shape,
+                } => {
+                    format!("FlagValue({} {long} {shape})", name(*decl_id))
+                }
+                Expect::Positional {
+                    decl_id,
+                    index,
+                    shape,
+                } => {
+                    format!("Positional({} {index} {shape})", name(*decl_id))
+                }
+                Expect::Operator { lhs } => format!("Operator({})", lhs.ty),
+                Expect::Operand { lhs, operator } => format!("Operand({} {operator})", lhs.ty),
+                Expect::Member { head } => format!("Member({head})"),
+                other => format!("{other:?}"),
+            };
+            format!("{what}@{}", &source[found.span.start..found.span.end])
+        });
+        found.collect::<Vec<_>>().join("; ")
+    }
+
+    #[rstest]
+    #[case::a_gap_expects_the_next_positional_and_a_flag(
+        "open ⌶",
+        "Positional(open 0 path)@; Flag(open)@"
+    )]
+    #[case::a_word_is_the_positional_it_binds("open fi⌶", "Positional(open 0 path)@fi")]
+    #[case::a_flag_being_written("open --enc⌶", "Flag(open)@--enc")]
+    #[case::the_end_of_flags_is_a_flag("open --⌶", "Flag(open)@--")]
+    #[case::a_flag_value("open --encoding ⌶", "FlagValue(open encoding string)@")]
+    #[case::a_short_flag_value("open -e ⌶", "FlagValue(open encoding string)@")]
+    #[case::a_word_after_a_command_may_name_a_subcommand("str tr⌶", "Command(str)@str tr")]
+    #[case::a_command_name("op⌶", "Command()@op")]
+    #[case::an_external_command_name("^ca⌶", "Command()@ca")]
+    #[case::an_external_takes_any_argument("cargo b⌶", "ExternalArg { index: 0 }@b")]
+    #[case::a_command_after_a_pipe("rows | ⌶", "Command()@")]
+    #[case::a_command_at_the_start_of_a_closure("rows | where {|r| ⌶", "Command()@")]
+    #[case::no_command_right_against_a_brace(
+        "rows | where {⌶",
+        "Positional(where 0 oneof<condition, closure(any)>)@{"
+    )]
+    #[case::a_comparison_waits_for_its_operand("rows | where size > ⌶", "Operand(any >)@")]
+    #[case::an_operand_being_written("rows | where size > 1⌶", "Operand(any >)@1")]
+    #[case::a_finished_operand_waits_for_an_operator("rows | where size ⌶", "Operator(any)@")]
+    #[case::an_operator_being_written("rows | where size >⌶", "Operator(any)@>")]
+    #[case::an_unknown_operator_being_written("rows | where size bit-s⌶", "Operator(any)@bit-s")]
+    #[case::the_operand_of_not("rows | where not ⌶", "Negated@")]
+    #[case::a_member_knows_the_type_before_it(
+        "let x = {a: 1, b: {c: 2}}; $x.b.⌶",
+        "Member(record<c: int>)@"
+    )]
+    #[case::a_variable("let foo = 1; $f⌶", "Variable@$f")]
+    #[case::a_redirection_target("open out> ⌶", "Redirection@")]
+    #[case::a_redirection_target_being_written("rows out> fi⌶", "Redirection@fi")]
+    #[case::an_attribute_name("@ex⌶", "AttributeName@ex")]
+    #[case::what_an_attribute_decorates("@example; ⌶", "Command()@; Attributable@")]
+    fn what_the_parser_expects(#[case] line: &str, #[case] expected: &str) {
+        assert_eq!(innermost(line), expected);
+    }
+
+    #[test]
+    fn the_probe_knows_the_input_and_the_scope() {
+        let (probe, ..) = probe("let foo = rows; rows | where size > ⌶");
+        let rows = Type::Table([("name", Type::String), ("size", Type::Filesize)].into());
+        assert!(
+            probe.found.iter().any(|found| found.input == rows),
+            "{probe:?}"
+        );
+        assert!(
+            probe.scope.iter().any(|(name, _)| name == b"$foo"),
+            "{probe:?}"
+        );
+    }
+
+    #[test]
+    fn a_parse_without_a_probe_records_nothing() {
+        let engine_state = EngineState::new();
+        let mut working_set = StateWorkingSet::new(&engine_state);
+        let _ = parse(&mut working_set, None, b"open fi", true);
+        assert!(working_set.probe.is_none());
+    }
+}
+
+/// The corrections the parser knows for what other languages write (`ParseError::fix`).
+mod fixes {
+    use super::*;
+    use mock::Where;
+
+    /// The first fix the parse of `line` offers, as the text it replaces and its replacements.
+    fn first_fix(line: &str) -> Option<(String, Vec<&'static str>)> {
+        let engine_state = EngineState::new();
+        let mut working_set = StateWorkingSet::new(&engine_state);
+        working_set.add_decl(Box::new(Where));
+        working_set.add_decl(
+            Signature::build("rows")
+                .input_output_types(vec![(Type::Nothing, Type::table())])
+                .predeclare(),
+        );
+        let _ = parse(&mut working_set, None, line.as_bytes(), true);
+        working_set.parse_errors.iter().find_map(|error| {
+            let fix = error.fix()?;
+            let text =
+                String::from_utf8_lossy(working_set.get_span_contents(fix.span)).into_owned();
+            Some((text, fix.replacements))
+        })
+    }
+
+    #[rstest]
+    #[case("rows | where name is a", "is", "==")]
+    #[case("rows | where name === a", "===", "==")]
+    #[case("rows | where name = a", "=", "==")]
+    #[case("rows | where name contains a", "contains", "has")]
+    #[case("rows | where size % 2 == 0", "%", "mod")]
+    #[case("rows | where name == a && size > 1", "&&", "and")]
+    fn a_mistaken_operator_has_its_fix(#[case] line: &str, #[case] at: &str, #[case] meant: &str) {
+        let (text, replacements) = first_fix(line).expect("a fix");
+        assert_eq!(text, at);
+        assert_eq!(replacements.first(), Some(&meant));
+    }
+
+    #[test]
+    fn an_assignment_outside_a_condition_is_not_a_comparison() {
+        let engine_state = EngineState::new();
+        let mut working_set = StateWorkingSet::new(&engine_state);
+        working_set.add_decl(Box::new(mock::Mut));
+        let _ = parse(&mut working_set, None, b"mut x = 1; $x = 2", true);
+        assert!(
+            working_set.parse_errors.is_empty(),
+            "{:?}",
+            working_set.parse_errors
+        );
+    }
+}

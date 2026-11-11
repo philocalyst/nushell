@@ -17,11 +17,12 @@ impl Command for Rename {
                 (Type::record(), Type::record()),
                 (Type::table(), Type::table()),
             ])
-            .named(
-                "column",
-                SyntaxShape::record(),
-                "Column name to be changed.",
-                Some('c'),
+            .param(
+                Flag::new("column")
+                    .short('c')
+                    .arg(SyntaxShape::record())
+                    .desc("Column name to be changed.")
+                    .completion(Completion::Builtin(BuiltinCompletion::Column)),
             )
             .named(
                 "block",

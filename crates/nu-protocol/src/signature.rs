@@ -185,14 +185,67 @@ pub enum CommandWideCompleter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BuiltinCompletion {
     /// A `.nu` file or directory (`use`, `overlay use`, `source-env`); `std_virtual_path`
-    /// also offers the virtual `std/` modules (disabled for `source-env`).
-    NuFile { std_virtual_path: bool },
+    /// also offers the virtual `std/` modules (disabled for `source-env`). `exists` says the
+    /// argument must name a file that exists (`source-env`), unlike a module that may be
+    /// found by name or be virtual.
+    NuFile {
+        std_virtual_path: bool,
+        exists: bool,
+    },
     /// The exported members of an already-named module (`use spam <tab>`).
     ModuleExports,
     /// An environment variable name (`hide-env`).
     EnvVar,
     /// A command name; `internal_only` restricts to internal commands (`attr complete`).
     Command { internal_only: bool },
+    /// A column of the table or record piped into the command (`move`, `uniq-by`).
+    Column,
+    /// The id of a running process, found by its name too (`kill`).
+    Process,
+    /// A filesystem path. `exists` says the argument must name something that exists for the
+    /// command to work, which lets a history hint skip a line naming a missing path. With
+    /// `dirs` it must be a directory, and completion offers directories only. Without `dirs`
+    /// any file or directory will do and completion offers paths.
+    ///
+    /// When `last_is_target` is set on a rest parameter, its last argument names a destination
+    /// that need not exist (`cp`, `mv`): only the sources before it are required.
+    Path {
+        exists: bool,
+        dirs: bool,
+        last_is_target: bool,
+    },
+}
+
+/// What a command needs of a path argument that must exist, see
+/// [`BuiltinCompletion::required_path`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequiredPath {
+    /// The path must be a directory.
+    pub dirs: bool,
+    /// The last argument of a rest parameter is a destination, so it is exempt.
+    pub last_is_target: bool,
+}
+
+impl BuiltinCompletion {
+    /// The requirement this completion places on its argument's path, when it says the
+    /// argument must exist.
+    pub fn required_path(&self) -> Option<RequiredPath> {
+        match *self {
+            BuiltinCompletion::Path {
+                exists: true,
+                dirs,
+                last_is_target,
+            } => Some(RequiredPath {
+                dirs,
+                last_is_target,
+            }),
+            BuiltinCompletion::NuFile { exists: true, .. } => Some(RequiredPath {
+                dirs: false,
+                last_is_target: false,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -222,6 +275,10 @@ impl Completion {
                     BuiltinCompletion::ModuleExports => "<module-exports>",
                     BuiltinCompletion::EnvVar => "<env-var>",
                     BuiltinCompletion::Command { .. } => "<command-name>",
+                    BuiltinCompletion::Column => "<column>",
+                    BuiltinCompletion::Process => "<process>",
+                    BuiltinCompletion::Path { dirs: true, .. } => "<directory>",
+                    BuiltinCompletion::Path { dirs: false, .. } => "<path>",
                 },
                 span,
             ),
@@ -428,7 +485,63 @@ fn is_custom_structured_fallback(input: &Type, declared: &Type) -> bool {
     }
 }
 
+/// A signature as a usage reads, `str substring {flags} <range> ...(rest)`, kept in parts so
+/// that one parameter can be picked out: the name, `{flags}` when the command has any, then one
+/// part per positional parameter, required, optional and rest.
+#[derive(Debug, Clone)]
+pub struct Usage {
+    pub parts: Vec<String>,
+    first: usize,
+    positionals: usize,
+    rest: bool,
+}
+
+impl Usage {
+    /// The part of the `index`th positional parameter, the rest parameter past the others, or
+    /// `None` when the command takes no more.
+    pub fn positional_part(&self, index: usize) -> Option<usize> {
+        match index < self.positionals {
+            true => Some(self.first + index),
+            false => self.rest.then_some(self.first + self.positionals),
+        }
+    }
+}
+
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.parts.join(" "))
+    }
+}
+
 impl Signature {
+    /// How the signature reads as a usage, in parts (see [`Usage`]).
+    pub fn usage(&self) -> Usage {
+        let part = |arg: &PositionalArg, optional: bool| match &arg.shape {
+            SyntaxShape::Keyword(keyword, _) => {
+                format!("{} <{}>", String::from_utf8_lossy(keyword), arg.name)
+            }
+            _ if optional => arg.name.clone(),
+            _ => format!("<{}>", arg.name),
+        };
+        let mut parts = vec![self.name.clone()];
+        parts.extend((!self.named.is_empty()).then(|| "{flags}".to_owned()));
+        let first = parts.len();
+        parts.extend(self.required_positional.iter().map(|arg| part(arg, false)));
+        let optional = self.optional_positional.iter();
+        parts.extend(optional.map(|arg| format!("({})", part(arg, true))));
+        parts.extend(
+            self.rest_positional
+                .iter()
+                .map(|arg| format!("...({})", arg.name)),
+        );
+        Usage {
+            parts,
+            first,
+            positionals: self.required_positional.len() + self.optional_positional.len(),
+            rest: self.rest_positional.is_some(),
+        }
+    }
+
     /// Creates a new signature for a command with `name`
     pub fn new(name: impl Into<String>) -> Signature {
         Signature {
@@ -1031,6 +1144,10 @@ pub struct CustomExample {
     pub example: String,
     pub description: String,
     pub result: Option<Value>,
+    /// The flags and parameters the example is about, as `@example --for` names them: the help
+    /// shown where one of them is typed is this example.
+    #[nu_value(rename = "for")]
+    pub about: Option<Vec<String>>,
 }
 
 impl CustomExample {
@@ -1097,6 +1214,12 @@ impl Command for BlockCommand {
         self.examples
             .iter()
             .map(CustomExample::to_example)
+            .collect()
+    }
+
+    fn examples_about(&self) -> Vec<Vec<String>> {
+        (self.examples.iter())
+            .map(|example| example.about.clone().unwrap_or_default())
             .collect()
     }
 

@@ -62,7 +62,19 @@ impl Command for UCp {
             )
             .switch("debug", "Explain how a file is copied. Implies -v.", None)
             .switch("all", "Let glob patterns match hidden names (those starting with '.') at any depth.", Some('a'))
-            .rest("paths", SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]), "Copy SRC file/s to DEST.")
+            .param(
+                PositionalArg::new(
+                    "paths",
+                    SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]),
+                )
+                .desc("Copy SRC file/s to DEST.")
+                .completion(Completion::Builtin(BuiltinCompletion::Path {
+                        exists: true,
+                        dirs: false,
+                        last_is_target: true,
+                    }))
+                .rest(),
+            )
             .allow_variants_without_examples(true)
             .category(Category::FileSystem)
     }

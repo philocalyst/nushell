@@ -1,6 +1,8 @@
 use itertools::Itertools;
 use nu_engine::{command_prelude::*, env_to_strings};
-use nu_protocol::{ShellError, shell_error::generic::GenericError};
+use nu_protocol::{
+    BuiltinCompletion, Completion, PositionalArg, ShellError, shell_error::generic::GenericError,
+};
 use std::{
     ffi::{OsStr, OsString},
     process::Stdio,
@@ -25,7 +27,16 @@ impl Command for Start {
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build("start")
             .input_output_types(vec![(Type::Nothing, Type::Any)])
-            .required("path", SyntaxShape::String, "Path or URL to open.")
+            .param(
+                PositionalArg::new("path", SyntaxShape::String)
+                    .desc("Path or URL to open.")
+                    .completion(Completion::Builtin(BuiltinCompletion::Path {
+                        exists: false,
+                        dirs: false,
+                        last_is_target: false,
+                    }))
+                    .required(),
+            )
             .category(Category::FileSystem)
     }
 

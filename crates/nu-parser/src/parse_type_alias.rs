@@ -64,7 +64,7 @@ pub fn parse_type_alias(
 
     // Parse the name and `=` as a call only to see whether it asks for help, as `parse_alias`
     // does. Its errors are dropped because the layout is checked below.
-    let starting_error_count = working_set.parse_errors.len();
+    let starting_error_count = working_set.checkpoint();
     let ParsedInternalCall {
         call,
         output,
@@ -77,7 +77,7 @@ pub fn parse_type_alias(
         ArgumentParsingLevel::Full,
         None,
     );
-    working_set.parse_errors.truncate(starting_error_count);
+    working_set.rollback(starting_error_count);
 
     if call_kind == CallKind::Help {
         return (
@@ -175,9 +175,9 @@ pub fn parse_type_alias(
             }
             (None, [token]) => {
                 let bytes = working_set.get_span_contents(token.span).to_vec();
-                let starting_error_count = working_set.parse_errors.len();
+                let starting_error_count = working_set.checkpoint();
                 let parsed = parse_shape_name(working_set, &bytes, token.span);
-                (working_set.parse_errors.len() == starting_error_count).then_some(parsed)
+                (working_set.parse_errors.len() == starting_error_count.errors).then_some(parsed)
             }
             (None, [_, extra, ..]) => {
                 working_set.error(ParseError::ExtraTokens(Span::new(

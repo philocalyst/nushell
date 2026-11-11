@@ -29,18 +29,23 @@ impl Command for Move {
                 (Type::record(), Type::record()),
                 (Type::table(), Type::table()),
             ])
-            .rest("columns", SyntaxShape::String, "The columns to move.")
-            .named(
-                "after",
-                SyntaxShape::String,
-                "The column that will precede the columns moved.",
-                None,
+            .param(
+                PositionalArg::new("columns", SyntaxShape::String)
+                    .desc("The columns to move.")
+                    .completion(Completion::Builtin(BuiltinCompletion::Column))
+                    .rest(),
             )
-            .named(
-                "before",
-                SyntaxShape::String,
-                "The column that will be the next after the columns moved.",
-                None,
+            .param(
+                Flag::new("after")
+                    .arg(SyntaxShape::String)
+                    .desc("The column that will precede the columns moved.")
+                    .completion(Completion::Builtin(BuiltinCompletion::Column)),
+            )
+            .param(
+                Flag::new("before")
+                    .arg(SyntaxShape::String)
+                    .desc("The column that will be the next after the columns moved.")
+                    .completion(Completion::Builtin(BuiltinCompletion::Column)),
             )
             .switch("first", "Makes the columns be the first ones.", None)
             .switch("last", "Makes the columns be the last ones.", None)

@@ -15,7 +15,22 @@ impl Command for SysHost {
         Signature::build("sys host")
             .filter()
             .category(Category::System)
-            .input_output_types(vec![(Type::Nothing, Type::record())])
+            // A platform may lack some of these.
+            .input_output_types(vec![(
+                Type::Nothing,
+                Type::Record(
+                    [
+                        ("name", Type::String),
+                        ("os_version", Type::String),
+                        ("long_os_version", Type::String),
+                        ("kernel_version", Type::String),
+                        ("hostname", Type::String),
+                        ("uptime", Type::Duration),
+                        ("boot_time", Type::Date),
+                    ]
+                    .into(),
+                ),
+            )])
     }
 
     fn description(&self) -> &str {

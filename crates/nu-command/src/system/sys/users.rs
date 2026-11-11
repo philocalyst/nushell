@@ -13,7 +13,25 @@ impl Command for SysUsers {
     fn signature(&self) -> Signature {
         Signature::build("sys users")
             .category(Category::System)
-            .input_output_types(vec![(Type::Nothing, Type::table())])
+            .input_output_types(vec![(
+                Type::Nothing,
+                Type::Table(
+                    [
+                        // Windows identifies a user by a string.
+                        (
+                            "id",
+                            if cfg!(windows) {
+                                Type::String
+                            } else {
+                                Type::Int
+                            },
+                        ),
+                        ("name", Type::String),
+                        ("groups", Type::list(Type::String)),
+                    ]
+                    .into(),
+                ),
+            )])
     }
 
     fn description(&self) -> &str {

@@ -23,8 +23,8 @@ impl Command for Try {
                     SyntaxShape::Keyword(
                         b"catch".to_vec(),
                         Box::new(SyntaxShape::OneOf(vec![
+                            caught(),
                             SyntaxShape::Closure(None),
-                            SyntaxShape::Closure(Some(vec![SyntaxShape::Any])),
                         ])),
                     ),
                     SyntaxShape::Keyword(
@@ -43,8 +43,8 @@ impl Command for Try {
                     SyntaxShape::Keyword(
                         b"catch".to_vec(),
                         Box::new(SyntaxShape::OneOf(vec![
+                            caught(),
                             SyntaxShape::Closure(None),
-                            SyntaxShape::Closure(Some(vec![SyntaxShape::Any])),
                         ])),
                     ),
                     SyntaxShape::Keyword(
@@ -108,6 +108,22 @@ impl Command for Try {
             },
         ]
     }
+}
+
+/// What a `catch` closure is given: the error as a record, so that `$err.` completes and is typed.
+/// An external's failure also has an `exit_code`, which not every error has.
+fn caught() -> SyntaxShape {
+    let fields = [
+        ("msg", SyntaxShape::String),
+        ("debug", SyntaxShape::String),
+        ("raw", SyntaxShape::Error),
+        ("rendered", SyntaxShape::String),
+        ("details", SyntaxShape::Record(Vec::new().into())),
+    ];
+    let fields = fields
+        .map(|(name, shape)| (name.to_owned(), shape))
+        .to_vec();
+    SyntaxShape::Closure(Some(vec![SyntaxShape::Record(fields.into())]))
 }
 
 #[cfg(test)]

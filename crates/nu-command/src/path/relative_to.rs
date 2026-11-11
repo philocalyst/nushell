@@ -1,7 +1,10 @@
 use super::PathSubcommandArguments;
 use nu_engine::command_prelude::*;
 use nu_path::expand_to_real_path;
-use nu_protocol::{engine::StateWorkingSet, shell_error::generic::GenericError};
+use nu_protocol::{
+    BuiltinCompletion, Completion, PositionalArg, engine::StateWorkingSet,
+    shell_error::generic::GenericError,
+};
 use std::path::{Component, Path, PathBuf};
 
 struct Arguments {
@@ -28,10 +31,15 @@ impl Command for PathRelativeTo {
                     Type::List(Box::new(Type::String)),
                 ),
             ])
-            .required(
-                "path",
-                SyntaxShape::String,
-                "Path to express the input path relative to.",
+            .param(
+                PositionalArg::new("path", SyntaxShape::String)
+                    .desc("Path to express the input path relative to.")
+                    .completion(Completion::Builtin(BuiltinCompletion::Path {
+                        exists: false,
+                        dirs: false,
+                        last_is_target: false,
+                    }))
+                    .required(),
             )
             .switch(
                 "walk-up",

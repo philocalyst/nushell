@@ -19,7 +19,12 @@ impl Command for UniqBy {
                     Type::List(Box::new(Type::Any)),
                 ),
             ])
-            .rest("columns", SyntaxShape::Any, "The column(s) to filter by.")
+            .param(
+                PositionalArg::new("columns", SyntaxShape::Any)
+                    .desc("The column(s) to filter by.")
+                    .completion(Completion::Builtin(BuiltinCompletion::Column))
+                    .rest(),
+            )
             .switch(
                 "count",
                 "Return a table containing the distinct input values together with their counts.",

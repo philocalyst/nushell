@@ -14,10 +14,18 @@ impl Command for Source {
     fn signature(&self) -> Signature {
         Signature::build("source")
             .input_output_types(vec![(Type::Any, Type::Any)])
-            .required(
-                "filename",
-                SyntaxShape::OneOf(vec![SyntaxShape::Filepath, SyntaxShape::Nothing]),
-                "The filepath to the script file to source (`null` for no-op).",
+            .param(
+                PositionalArg::new(
+                    "filename",
+                    SyntaxShape::OneOf(vec![SyntaxShape::Filepath, SyntaxShape::Nothing]),
+                )
+                .desc("The filepath to the script file to source (`null` for no-op).")
+                .completion(Completion::Builtin(BuiltinCompletion::Path {
+                    exists: true,
+                    dirs: false,
+                    last_is_target: false,
+                }))
+                .required(),
             )
             .category(Category::Core)
     }

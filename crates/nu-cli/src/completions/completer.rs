@@ -2091,9 +2091,9 @@ impl<'engine> CompletionEngine<'engine> {
         context: &Context,
     ) -> Fetched {
         match kind {
-            BuiltinCompletion::NuFile { std_virtual_path } => {
-                DotNuCompletion { std_virtual_path }.fetch(context)
-            }
+            BuiltinCompletion::NuFile {
+                std_virtual_path, ..
+            } => DotNuCompletion { std_virtual_path }.fetch(context),
             BuiltinCompletion::ModuleExports => {
                 arg_value.complete_module_exports(context, context.working_set)
             }
@@ -2106,6 +2106,11 @@ impl<'engine> CompletionEngine<'engine> {
                 };
                 CommandCompletion::quoted(scope).fetch(context)
             }
+            // These only describe the argument for hints and the new completer; here the
+            // argument's shape decides what is offered.
+            BuiltinCompletion::Column
+            | BuiltinCompletion::Process
+            | BuiltinCompletion::Path { .. } => Fetched::absent(),
         }
     }
 

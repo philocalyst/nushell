@@ -115,6 +115,12 @@ pub fn default_color_config() -> HashMap<String, Value> {
         ("shape_variable", str("purple")),
         ("shape_vardecl", str("purple")),
         ("shape_raw_string", str("light_purple")),
+        // Values and syntax that the parser flattens as another shape. Truecolor, so that none is
+        // a colour of the prompt or of another shape.
+        ("shape_filesize", str("#d7875f")),
+        ("shape_duration", str("#5fafaf")),
+        ("shape_cell_path", str("#87afd7")),
+        ("shape_type", str("#87af87")),
         (
             "shape_garbage",
             rec(record! {

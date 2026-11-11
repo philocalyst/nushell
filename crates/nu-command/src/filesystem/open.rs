@@ -49,10 +49,18 @@ impl Command for Open {
                 // which aren't caught by the parser. see https://github.com/nushell/nushell/pull/14922 for more details
                 (Type::Any, Type::Any),
             ])
-            .rest(
-                "files",
-                SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]),
-                "The file(s) to open.",
+            .param(
+                PositionalArg::new(
+                    "files",
+                    SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]),
+                )
+                .desc("The file(s) to open.")
+                .completion(Completion::Builtin(BuiltinCompletion::Path {
+                    exists: true,
+                    dirs: false,
+                    last_is_target: false,
+                }))
+                .rest(),
             )
             .switch("raw", "Open file as raw binary.", Some('r'))
             .category(Category::FileSystem)

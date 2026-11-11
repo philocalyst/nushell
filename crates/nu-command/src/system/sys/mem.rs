@@ -13,7 +13,21 @@ impl Command for SysMem {
         Signature::build("sys mem")
             .filter()
             .category(Category::System)
-            .input_output_types(vec![(Type::Nothing, Type::record())])
+            .input_output_types(vec![(
+                Type::Nothing,
+                Type::Record(
+                    [
+                        ("total", Type::Filesize),
+                        ("free", Type::Filesize),
+                        ("used", Type::Filesize),
+                        ("available", Type::Filesize),
+                        ("swap total", Type::Filesize),
+                        ("swap free", Type::Filesize),
+                        ("swap used", Type::Filesize),
+                    ]
+                    .into(),
+                ),
+            )])
     }
 
     fn description(&self) -> &str {

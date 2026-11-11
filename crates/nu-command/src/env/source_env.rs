@@ -30,6 +30,8 @@ impl Command for SourceEnv {
                 .desc("The filepath to the script file to source the environment from (`null` for no-op).")
                 .completion(Completion::Builtin(BuiltinCompletion::NuFile {
                     std_virtual_path: false,
+                    // The file is read at parse time.
+                    exists: true,
                 })),
             ))
             .category(Category::Core)

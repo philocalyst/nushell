@@ -582,7 +582,11 @@ pub fn parse_run_expr(working_set: &mut StateWorkingSet, spans: &[Span]) -> Expr
     parse_run_expr_internal(working_set, spans, &lite_command)
 }
 
-pub fn parse_where_expr(working_set: &mut StateWorkingSet, spans: &[Span]) -> Expression {
+pub fn parse_where_expr(
+    working_set: &mut StateWorkingSet,
+    spans: &[Span],
+    input_type: Option<&Type>,
+) -> Expression {
     trace!("parsing: where");
 
     if !spans.is_empty() && working_set.get_span_contents(spans[0]) != b"where" {
@@ -601,6 +605,7 @@ pub fn parse_where_expr(working_set: &mut StateWorkingSet, spans: &[Span]) -> Ex
 
     let call = match working_set.find_decl(b"where") {
         Some(decl_id) => {
+            crate::probe::head(working_set, spans, 1, None, input_type);
             let ParsedInternalCall {
                 call,
                 output,
@@ -611,7 +616,7 @@ pub fn parse_where_expr(working_set: &mut StateWorkingSet, spans: &[Span]) -> Ex
                 &spans[1..],
                 decl_id,
                 ArgumentParsingLevel::Full,
-                None,
+                input_type,
             );
 
             if call_kind != CallKind::Valid {
@@ -638,7 +643,7 @@ pub fn parse_where_expr(working_set: &mut StateWorkingSet, spans: &[Span]) -> Ex
 }
 
 pub fn parse_where(working_set: &mut StateWorkingSet, lite_command: &LiteCommand) -> Pipeline {
-    let expr = parse_where_expr(working_set, &lite_command.parts);
+    let expr = parse_where_expr(working_set, &lite_command.parts, None);
     let redirection = lite_command
         .redirection
         .as_ref()

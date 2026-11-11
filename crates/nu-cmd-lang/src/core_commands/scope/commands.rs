@@ -10,7 +10,29 @@ impl Command for ScopeCommands {
 
     fn signature(&self) -> Signature {
         Signature::build("scope commands")
-            .input_output_types(vec![(Type::Nothing, Type::List(Box::new(Type::Any)))])
+            .input_output_types(vec![(
+                Type::Nothing,
+                Type::Table(
+                    [
+                        ("name", Type::String),
+                        ("category", Type::String),
+                        ("signatures", Type::record()),
+                        ("description", Type::String),
+                        ("examples", Type::list(Type::Any)),
+                        ("attributes", Type::list(Type::Any)),
+                        ("type", Type::String),
+                        ("is_sub", Type::Bool),
+                        ("is_const", Type::Bool),
+                        ("creates_scope", Type::Bool),
+                        ("extra_description", Type::String),
+                        ("search_terms", Type::String),
+                        ("complete", Type::Any),
+                        ("deprecation_info", Type::list(Type::Any)),
+                        ("decl_id", Type::Int),
+                    ]
+                    .into(),
+                ),
+            )])
             .allow_variants_without_examples(true)
             .category(Category::Core)
     }

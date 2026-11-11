@@ -41,6 +41,12 @@ impl Command for AttrExample {
                 "Expected output of example.",
                 None,
             )
+            .named(
+                "for",
+                SyntaxShape::List(Box::new(SyntaxShape::String)),
+                "The flags and parameters the example is about, such as `[--branch target]`: completion shows it where they are typed.",
+                None,
+            )
             .category(Category::Core)
     }
 
@@ -57,6 +63,7 @@ impl Command for AttrExample {
     ) -> Result<PipelineData, ShellError> {
         let description: Spanned<String> = call.req(engine_state, stack, 0)?;
         let result: Option<Value> = call.get_flag(engine_state, stack, "result")?;
+        let about: Option<Value> = call.get_flag(engine_state, stack, "for")?;
         let example_arg: Value = call.req(engine_state, stack, 1)?;
 
         let working_set = StateWorkingSet::new(engine_state);
@@ -69,6 +76,7 @@ impl Command for AttrExample {
             example_content,
             example_span,
             result,
+            about,
         )
     }
 
@@ -81,6 +89,7 @@ impl Command for AttrExample {
     ) -> Result<PipelineData, ShellError> {
         let description: Spanned<String> = call.req_const(working_set, stack, 0)?;
         let result: Option<Value> = call.get_flag_const(working_set, stack, "result")?;
+        let about: Option<Value> = call.get_flag_const(working_set, stack, "for")?;
         let example_arg: Value = call.req_const(working_set, stack, 1)?;
 
         let (example_content, example_span) =
@@ -92,6 +101,7 @@ impl Command for AttrExample {
             example_content,
             example_span,
             result,
+            about,
         )
     }
 
@@ -168,6 +178,7 @@ fn attr_example_record(
     example_content: String,
     example_span: Span,
     result: Option<Value>,
+    about: Option<Value>,
 ) -> Result<PipelineData, ShellError> {
     let mut rec = record! {
         "description" => Value::string(description.item, description.span),
@@ -175,6 +186,9 @@ fn attr_example_record(
     };
     if let Some(result) = result {
         rec.push("result", result);
+    }
+    if let Some(about) = about {
+        rec.push("for", about);
     }
 
     Ok(Value::record(rec, head).into_pipeline_data())
