@@ -19,7 +19,19 @@ impl Command for SysCpu {
                 Some('l'),
             )
             .category(Category::System)
-            .input_output_types(vec![(Type::Nothing, Type::table())])
+            .input_output_types(vec![(
+                Type::Nothing,
+                Type::Table(
+                    [
+                        ("name", Type::String),
+                        ("brand", Type::String),
+                        ("vendor_id", Type::String),
+                        ("freq", Type::Int),
+                        ("load_average", Type::String),
+                    ]
+                    .into(),
+                ),
+            )])
     }
 
     fn description(&self) -> &str {

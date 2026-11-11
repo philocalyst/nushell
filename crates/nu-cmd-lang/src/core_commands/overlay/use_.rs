@@ -30,6 +30,7 @@ impl Command for OverlayUse {
                 .desc("Module name to use overlay for (`null` for no-op).")
                 .completion(Completion::Builtin(BuiltinCompletion::NuFile {
                     std_virtual_path: true,
+                    exists: false,
                 })),
             ))
             .optional(

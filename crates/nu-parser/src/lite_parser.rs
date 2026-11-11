@@ -448,6 +448,16 @@ pub fn lite_parse(
                             command.pipe = Some(token.span);
                             pipeline.push(&mut command);
                         }
+                        // `&&` in a row condition is the `and` of other languages: the lexer
+                        // reported it, and the condition goes on through it.
+                        TokenContents::Pipe
+                            if working_set.get_span_contents(token.span) == b"&&"
+                                && command.parts.first().is_some_and(|head| {
+                                    working_set.get_span_contents(*head) == b"where"
+                                }) =>
+                        {
+                            command.push(token.span);
+                        }
                         TokenContents::Pipe => {
                             command.pipe = Some(token.span);
                             pipeline.push(&mut command);

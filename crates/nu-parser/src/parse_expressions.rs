@@ -32,8 +32,8 @@ use crate::{
 use itertools::Itertools;
 use log::trace;
 use nu_protocol::{
-    CompareTypes, IntoSpanned, ParseError, PositionalArg, Signature, Span, Spanned, SyntaxShape,
-    Type, TypeSet, VarId, ast::*, engine::StateWorkingSet,
+    CompareTypes, IntoSpanned, MISTAKEN_OPERATORS, ParseError, PositionalArg, Signature, Span,
+    Spanned, SyntaxShape, Type, TypeSet, VarId, ast::*, engine::StateWorkingSet,
 };
 use std::{collections::HashMap, sync::Arc};
 
@@ -56,7 +56,7 @@ pub fn is_math_expression_like(working_set: &mut StateWorkingSet, span: Span) ->
 /// The call site reads the head word this way before it looks it up as a command, so a name
 /// that this accepts can never be called: the value wins at the call site.
 pub(crate) fn is_literal_like(working_set: &mut StateWorkingSet, span: Span) -> bool {
-    let starting_error_count = working_set.parse_errors.len();
+    let starting_error_count = working_set.checkpoint();
 
     // A token that a literal parser accepts is a value. So is one it rejects as an invalid
     // literal of its kind (`9223372036854775808`, `2023-02-29`, `9223372036854775808ns`): parsing
@@ -72,9 +72,9 @@ pub(crate) fn is_literal_like(working_set: &mut StateWorkingSet, span: Span) -> 
         [parse_number, parse_filesize, parse_duration, parse_datetime];
     for parse_literal in literal_parsers {
         parse_literal(working_set, span);
-        let first_error = working_set.parse_errors.get(starting_error_count);
+        let first_error = working_set.parse_errors.get(starting_error_count.errors);
         let is_literal = first_error.is_none() || is_literal_error(first_error);
-        working_set.parse_errors.truncate(starting_error_count);
+        working_set.rollback(starting_error_count);
         if is_literal {
             return true;
         }
@@ -84,22 +84,22 @@ pub(crate) fn is_literal_like(working_set: &mut StateWorkingSet, span: Span) -> 
     // We need an additional negate match to check if the last error was unexpected
     // or more specifically, if it was `ParseError::InvalidBinaryString`.
     // If so, we suppress the error and stop parsing to the next (which is `parse_range()`).
-    if working_set.parse_errors.len() == starting_error_count {
+    if working_set.parse_errors.len() == starting_error_count.errors {
         return true;
     } else if !matches!(
         working_set.parse_errors.last(),
         Some(ParseError::Expected(_, _))
     ) {
-        working_set.parse_errors.truncate(starting_error_count);
+        working_set.rollback(starting_error_count);
         return true;
     }
-    working_set.parse_errors.truncate(starting_error_count);
+    working_set.rollback(starting_error_count);
 
     // A bound that is an invalid literal (`1..99999999999999999999`) makes a range too, as above.
     let is_range = has_range_operator(working_set.get_span_contents(span))
         && (parse_range(working_set, span).is_some()
-            || is_literal_error(working_set.parse_errors.get(starting_error_count)));
-    working_set.parse_errors.truncate(starting_error_count);
+            || is_literal_error(working_set.parse_errors.get(starting_error_count.errors)));
+    working_set.rollback(starting_error_count);
     is_range
 }
 
@@ -609,6 +609,8 @@ pub fn parse_match_block_expression(
 
     let mut output_matches = vec![];
     let mut output_type = Type::one_of([]);
+    // Whether the last arm has its pattern, its `=>` and its result, so that another may begin.
+    let mut complete = true;
 
     while position < output.len() {
         // Each match gets its own scope
@@ -616,6 +618,10 @@ pub fn parse_match_block_expression(
         working_set.enter_scope();
 
         // First parse the pattern
+        let previous = position
+            .checked_sub(1)
+            .map(|previous| output[previous].span);
+        crate::probe::match_pattern(working_set, previous, Some(output[position].span), span);
         let mut pattern = parse_pattern(working_set, output[position].span);
 
         position += 1;
@@ -628,6 +634,7 @@ pub fn parse_match_block_expression(
             ));
 
             working_set.exit_scope();
+            complete = false;
             break;
         }
 
@@ -729,11 +736,25 @@ pub fn parse_match_block_expression(
             );
 
             pattern.guard = Some(Box::new(guard));
-            position += if found { start + 1 } else { start };
+            // A guard that runs to the end still waits for its `=>` and its result.
+            if !found {
+                let end = Span::point(inner_span.end);
+                working_set.error(ParseError::Mismatch(
+                    "=>".into(),
+                    "end of input".into(),
+                    end,
+                ));
+                output_matches.push((pattern, Expression::garbage(working_set, end)));
+                working_set.exit_scope();
+                complete = false;
+                break;
+            }
+            position += start + 1;
             connector = working_set.get_span_contents(output[position].span);
         }
         // Then the `=>` arrow
-        if connector != b"=>" {
+        complete = connector == b"=>";
+        if !complete {
             working_set.error(ParseError::Mismatch(
                 "=>".into(),
                 "end of input".into(),
@@ -752,6 +773,7 @@ pub fn parse_match_block_expression(
             ));
 
             working_set.exit_scope();
+            complete = false;
             break;
         }
 
@@ -780,6 +802,11 @@ pub fn parse_match_block_expression(
         output_type = output_type.union(branch_output_type);
 
         output_matches.push((pattern, result));
+    }
+
+    // After the last arm, if it is complete, another may begin.
+    if complete {
+        crate::probe::match_pattern(working_set, output.last().map(|last| last.span), None, span);
     }
 
     let has_wildcard = output_matches.iter().any(|(pat, _)| pat.is_wildcard());
@@ -879,7 +906,6 @@ pub fn parse_closure_expression(
         _ => (None, 0),
     };
 
-    // TODO: Finish this
     if let SyntaxShape::Closure(Some(v)) = shape
         && let Some((sig, sig_span)) = &signature
     {
@@ -894,9 +920,22 @@ pub fn parse_closure_expression(
             ));
         }
 
-        for (expected, PositionalArg { name, shape, .. }) in
-            v.iter().zip(sig.required_positional.iter())
+        for (
+            expected,
+            PositionalArg {
+                name,
+                shape,
+                var_id,
+                ..
+            },
+        ) in v.iter().zip(sig.required_positional.iter())
         {
+            // An untyped parameter is what the command says it gives: `catch {|err| $err.msg }`.
+            if *shape == SyntaxShape::Any
+                && let Some(var_id) = var_id
+            {
+                working_set.set_variable_type(*var_id, expected.to_type());
+            }
             if expected != shape && *shape != SyntaxShape::Any {
                 working_set.error(ParseError::ParameterMismatchType(
                     name.to_owned(),
@@ -1143,19 +1182,19 @@ pub fn parse_value(
                     SyntaxShape::String,
                 ];
                 for shape in shapes.iter() {
-                    let starting_error_count = working_set.parse_errors.len();
+                    let starting_error_count = working_set.checkpoint();
 
                     let s = parse_value(working_set, span, shape, None);
 
-                    if starting_error_count == working_set.parse_errors.len() {
+                    if starting_error_count.errors == working_set.parse_errors.len() {
                         return s;
                     } else {
-                        match working_set.parse_errors.get(starting_error_count) {
+                        match working_set.parse_errors.get(starting_error_count.errors) {
                             Some(
                                 ParseError::Expected(_, _)
                                 | ParseError::ExpectedWithStringMsg(_, _),
                             ) => {
-                                working_set.parse_errors.truncate(starting_error_count);
+                                working_set.rollback(starting_error_count);
                                 continue;
                             }
                             _ => {
@@ -1234,6 +1273,7 @@ pub fn parse_assignment_expression(
         // parts are bound separately as each borrows `working_set` mutably.
         let lhs = parse_expression(working_set, lhs_spans, None);
         let operator = parse_assignment_operator(working_set, op_span);
+        crate::probe::missing_operand(working_set, &lhs, &operator, input_type);
         let rhs = garbage(working_set, Span::point(op_span.end));
         return Expression::new(
             working_set,
@@ -1361,91 +1401,20 @@ pub fn parse_operator(working_set: &mut StateWorkingSet, span: Span) -> Expressi
 
     let operator = match contents {
         contents if let Some(operator) = operator_from_bytes(contents) => operator,
+        // A condition written as other languages write it: the lexer reported `&&`, and `||`
+        // is reported here. Each is read as what it means.
+        b"&&" => Operator::Boolean(Boolean::And),
+        b"||" => {
+            working_set.error(ParseError::ShellOrOr(span));
+            Operator::Boolean(Boolean::Or)
+        }
         // WARNING: not actual operators below! Error handling only
-        pow @ (b"^" | b"pow") => {
-            working_set.error(ParseError::UnknownOperator(
-                match pow {
-                    b"^" => "^",
-                    b"pow" => "pow",
-                    _ => unreachable!(),
-                },
-                "Use '**' for exponentiation or 'bit-xor' for bitwise XOR.",
-                span,
-            ));
-            return garbage(working_set, span);
-        }
-        equality @ (b"is" | b"===") => {
-            working_set.error(ParseError::UnknownOperator(
-                match equality {
-                    b"is" => "is",
-                    b"===" => "===",
-                    _ => unreachable!(),
-                },
-                "Did you mean '=='?",
-                span,
-            ));
-            return garbage(working_set, span);
-        }
-        b"contains" => {
-            working_set.error(ParseError::UnknownOperator(
-                "contains",
-                "Did you mean 'has'?",
-                span,
-            ));
-            return garbage(working_set, span);
-        }
-        b"%" => {
-            working_set.error(ParseError::UnknownOperator(
-                "%",
-                "Did you mean 'mod'?",
-                span,
-            ));
-            return garbage(working_set, span);
-        }
-        b"&" => {
-            working_set.error(ParseError::UnknownOperator(
-                "&",
-                "Did you mean 'bit-and'?",
-                span,
-            ));
-            return garbage(working_set, span);
-        }
-        b"<<" => {
-            working_set.error(ParseError::UnknownOperator(
-                "<<",
-                "Did you mean 'bit-shl'?",
-                span,
-            ));
-            return garbage(working_set, span);
-        }
-        b">>" => {
-            working_set.error(ParseError::UnknownOperator(
-                ">>",
-                "Did you mean 'bit-shr'?",
-                span,
-            ));
-            return garbage(working_set, span);
-        }
-        bits @ (b"bits-and" | b"bits-xor" | b"bits-or" | b"bits-shl" | b"bits-shr") => {
-            working_set.error(ParseError::UnknownOperator(
-                match bits {
-                    b"bits-and" => "bits-and",
-                    b"bits-xor" => "bits-xor",
-                    b"bits-or" => "bits-or",
-                    b"bits-shl" => "bits-shl",
-                    b"bits-shr" => "bits-shr",
-                    _ => unreachable!(),
-                },
-                match bits {
-                    b"bits-and" => "Did you mean 'bit-and'?",
-                    b"bits-xor" => "Did you mean 'bit-xor'?",
-                    b"bits-or" => "Did you mean 'bit-or'?",
-                    b"bits-shl" => "Did you mean 'bit-shl'?",
-                    b"bits-shr" => "Did you mean 'bit-shr'?",
-                    _ => unreachable!(),
-                },
-                span,
-            ));
+        contents
+            if let Some((mistaken, _, help)) = MISTAKEN_OPERATORS
+                .iter()
+                .find(|(mistaken, ..)| *mistaken != "=" && mistaken.as_bytes() == contents) =>
+        {
+            working_set.error(ParseError::UnknownOperator(mistaken, help, span));
             return garbage(working_set, span);
         }
         op if is_assignment_operator(op) => {
@@ -1459,6 +1428,22 @@ pub fn parse_operator(working_set: &mut StateWorkingSet, span: Span) -> Expressi
     };
 
     Expression::new(working_set, Expr::Operator(operator), span, Type::Any)
+}
+
+/// `stack`, a math expression's operands and operators so far, folded into one expression as the
+/// end of [`parse_math_expression`] folds it, without its types checked.
+fn folded(mut stack: Vec<Expression>) -> Option<Expression> {
+    while stack.len() > 1 {
+        let (rhs, op, lhs) = (stack.pop()?, stack.pop()?, stack.pop()?);
+        let ty = match op.expr {
+            Expr::Operator(Operator::Comparison(_)) => Type::Bool,
+            _ => Type::Any,
+        };
+        let span = Span::append(lhs.span, rhs.span);
+        let binary = Expr::BinaryOp(Box::new(lhs), Box::new(op), Box::new(rhs));
+        stack.push(Expression::new_unknown(binary, span, ty));
+    }
+    stack.pop()
 }
 
 /// Expands the bare-word operands of a row-condition binary operation to `$it` cell paths.
@@ -1508,6 +1493,7 @@ fn parse_math_operand(
 
     if *idx == spans.len() {
         let end = spans[*idx - 1].end;
+        crate::probe::negated(working_set, spans[*idx - 1], input_type);
         working_set.error(ParseError::Expected("expression", Span::new(end, end)));
         return None;
     }
@@ -1601,9 +1587,30 @@ pub fn parse_math_expression(
     }
 
     expr_stack.push(lhs);
+    // An operator with nothing after it, which the probe reads as waiting for its operand.
+    let mut incomplete = false;
 
     while idx < spans.len() {
-        let op = parse_operator(working_set, spans[idx]);
+        // In a row condition `=` is a comparison written as other languages write it: it is
+        // reported with its fix, and read as `==`.
+        let op = match MISTAKEN_OPERATORS
+            .iter()
+            .find(|(mistaken, ..)| *mistaken == "=")
+        {
+            Some((mistaken, _, help))
+                if lhs_row_var_id.is_some()
+                    && working_set.get_span_contents(spans[idx]) == mistaken.as_bytes() =>
+            {
+                working_set.error(ParseError::UnknownOperator(mistaken, help, spans[idx]));
+                Expression::new(
+                    working_set,
+                    Expr::Operator(Operator::Comparison(Comparison::Equal)),
+                    spans[idx],
+                    Type::Any,
+                )
+            }
+            _ => parse_operator(working_set, spans[idx]),
+        };
 
         let op_prec = op.precedence();
 
@@ -1611,6 +1618,21 @@ pub fn parse_math_expression(
 
         if idx == spans.len() {
             // Handle broken math expr `1 +` etc
+            incomplete = true;
+            // An operator still being written joins the whole expression so far: after
+            // `size > 1b a⌶` it is a connector of the comparison.
+            let lhs = match op.expr {
+                Expr::Garbage => folded(expr_stack.clone()),
+                _ => expr_stack.last().cloned(),
+            };
+            if working_set.probe_at().is_some()
+                && let Some(mut lhs) = lhs
+            {
+                if let Some(row_var_id) = lhs_row_var_id {
+                    expand_to_cell_path(working_set, &mut lhs, row_var_id, input_type);
+                }
+                crate::probe::missing_operand(working_set, &lhs, &op, input_type);
+            }
             working_set.error(ParseError::IncompleteMathExpression(spans[idx - 1]));
 
             expr_stack.push(Expression::garbage(working_set, spans[idx - 1]));
@@ -1634,6 +1656,15 @@ pub fn parse_math_expression(
         else {
             return garbage(working_set, spans[spans.len() - 1]);
         };
+        if working_set.probe_at().is_some()
+            && let Some(lhs) = expr_stack.last()
+        {
+            let mut lhs = lhs.clone();
+            if let Some(row_var_id) = lhs_row_var_id {
+                expand_to_cell_path(working_set, &mut lhs, row_var_id, input_type);
+            }
+            crate::probe::operand(working_set, &lhs, &op, &rhs, input_type);
+        }
 
         // Parsing power must be right-associative unlike most operations which are left
         // Hence, we should not collapse if the last and current operations are both power
@@ -1714,9 +1745,13 @@ pub fn parse_math_expression(
         ));
     }
 
-    expr_stack
+    let expression = expr_stack
         .pop()
-        .expect("internal error: expression stack empty")
+        .expect("internal error: expression stack empty");
+    if !incomplete && !matches!(expression.expr, Expr::Garbage) {
+        crate::probe::after_operand(working_set, &expression, input_type);
+    }
+    expression
 }
 
 /// Command heads that `parse_expression` treats specially when they appear in a pipeline.
@@ -1756,7 +1791,7 @@ pub fn parse_expression(
 
         let point = equals + 1;
         let rhs_starts_with_dollar = name[point..].starts_with(b"$");
-        let starting_error_count = working_set.parse_errors.len();
+        let starting_error_count = working_set.checkpoint();
 
         let rhs = if spans[pos].start + point < spans[pos].end {
             let rhs_span = Span::new(spans[pos].start + point, spans[pos].end);
@@ -1777,11 +1812,11 @@ pub fn parse_expression(
         let lhs_span = Span::new(spans[pos].start, spans[pos].start + point - 1);
         let lhs = parse_string_strict(working_set, lhs_span);
 
-        if starting_error_count == working_set.parse_errors.len() {
+        if starting_error_count.errors == working_set.parse_errors.len() {
             shorthand.push((lhs, rhs));
             pos += 1;
         } else {
-            working_set.parse_errors.truncate(starting_error_count);
+            working_set.rollback(starting_error_count);
             break;
         }
     }
@@ -1791,9 +1826,12 @@ pub fn parse_expression(
         return garbage(working_set, Span::concat(spans));
     }
 
-    let output = if spans[pos..]
-        .iter()
-        .any(|span| is_assignment_operator(working_set.get_span_contents(*span)))
+    // `where name = a` is a comparison written as other languages write it, which the row
+    // condition reports and fixes, not an assignment to `where name`.
+    let output = if working_set.get_span_contents(spans[pos]) != b"where"
+        && spans[pos..]
+            .iter()
+            .any(|span| is_assignment_operator(working_set.get_span_contents(*span)))
     {
         parse_assignment_expression(working_set, &spans[pos..], input_type)
     } else if is_math_expression_like(working_set, spans[pos]) {
@@ -1856,7 +1894,7 @@ pub fn parse_expression(
                     parse_call(working_set, &spans[pos..], spans[0], input_type)
                 }
             }
-            HeadKind::Where => parse_where_expr(working_set, &spans[pos..]),
+            HeadKind::Where => parse_where_expr(working_set, &spans[pos..], input_type),
             HeadKind::Run => parse_run_expr(working_set, &spans[pos..]),
             #[cfg(feature = "plugin")]
             HeadKind::Plugin => {
@@ -1968,6 +2006,24 @@ pub fn parse_builtin_commands(
     }
 
     trace!("parsing: checking for keywords");
+    if lite_command.has_attributes() {
+        crate::probe::attributes(working_set, lite_command);
+    }
+    // These keywords are parsed without `parse_call`, which records a command's name.
+    if let Some(&first) = lite_command.command_parts().first()
+        && let keyword @ (b"def" | b"extern" | b"export" | b"export-env" | b"type" | b"let"
+        | b"const" | b"mut" | b"for" | b"alias" | b"module" | b"use") =
+            working_set.get_span_contents(first)
+    {
+        let parent = working_set.find_decl(keyword);
+        crate::probe::head(
+            working_set,
+            lite_command.command_parts(),
+            1,
+            parent,
+            input_type,
+        );
+    }
     let name = lite_command
         .command_parts()
         .first()
@@ -2237,6 +2293,7 @@ pub fn parse_record(working_set: &mut StateWorkingSet, span: Span) -> Expression
     if let Some(err) = err {
         working_set.error(err);
     }
+    crate::probe::record(working_set, span, &tokens);
 
     let mut output = vec![];
     let mut idx = 0;

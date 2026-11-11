@@ -216,9 +216,9 @@ pub fn parse_alias(
                 && first_bytes != b"match"
                 && is_math_expression_like(working_set, replacement_spans[0])
             {
-                let starting_error_count = working_set.parse_errors.len();
+                let starting_error_count = working_set.checkpoint();
                 let expr = parse_expression(working_set, replacement_spans, None);
-                working_set.parse_errors.truncate(starting_error_count);
+                working_set.rollback(starting_error_count);
 
                 working_set.error(ParseError::CantAliasExpression(
                     expr.expr.description().to_string(),
@@ -232,15 +232,15 @@ pub fn parse_alias(
                 return alias_pipeline;
             }
 
-            let starting_error_count = working_set.parse_errors.len();
+            let starting_error_count = working_set.checkpoint();
             working_set.search_predecls = false;
 
             let expr = parse_call(working_set, replacement_spans, replacement_spans[0], None);
 
             working_set.search_predecls = true;
 
-            if starting_error_count != working_set.parse_errors.len()
-                && let Some(e) = working_set.parse_errors.get(starting_error_count)
+            if starting_error_count.errors != working_set.parse_errors.len()
+                && let Some(e) = working_set.parse_errors.get(starting_error_count.errors)
             {
                 if let ParseError::MissingPositional(..)
                 | ParseError::MissingRequiredFlag(..)

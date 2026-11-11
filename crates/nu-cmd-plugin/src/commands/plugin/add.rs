@@ -2,8 +2,8 @@ use crate::util::{get_plugin_dirs, modify_plugin_file};
 use nu_engine::command_prelude::*;
 use nu_plugin_engine::{GetPlugin, PersistentPlugin};
 use nu_protocol::{
-    PluginGcConfig, PluginIdentity, PluginRegistryItem, RegisteredPlugin,
-    shell_error::generic::GenericError, shell_error::io::IoError,
+    BuiltinCompletion, Completion, PluginGcConfig, PluginIdentity, PluginRegistryItem,
+    PositionalArg, RegisteredPlugin, shell_error::generic::GenericError, shell_error::io::IoError,
 };
 use std::{path::PathBuf, sync::Arc};
 
@@ -31,10 +31,15 @@ impl Command for PluginAdd {
                 "Use an additional shell program (cmd, sh, python, etc.) to run the plugin.",
                 Some('s'),
             )
-            .required(
-                "filename",
-                SyntaxShape::String,
-                "Path to the executable for the plugin.",
+            .param(
+                PositionalArg::new("filename", SyntaxShape::String)
+                    .desc("Path to the executable for the plugin.")
+                    .completion(Completion::Builtin(BuiltinCompletion::Path {
+                        exists: false,
+                        dirs: false,
+                        last_is_target: false,
+                    }))
+                    .required(),
             )
             .category(Category::Plugin)
     }

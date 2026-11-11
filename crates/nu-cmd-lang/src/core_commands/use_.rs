@@ -31,6 +31,7 @@ impl Command for Use {
                 .desc("Module or module file (`null` for no-op).")
                 .completion(Completion::Builtin(BuiltinCompletion::NuFile {
                     std_virtual_path: true,
+                    exists: false,
                 })),
             ))
             .param(Parameter::Rest(

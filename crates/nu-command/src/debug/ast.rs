@@ -115,14 +115,14 @@ impl Command for Ast {
                     }),
                     Value::test_record(record! {
                         "content" => Value::test_string("type"),
-                        "shape" => Value::test_string("shape_string"),
+                        "shape" => Value::test_string("shape_cell_path"),
                         "span" => Value::test_record(record! {
                             "start" => Value::test_int(13),
                             "end" => Value::test_int(17),}),
                     }),
                     Value::test_record(record! {
                         "content" => Value::test_string("name"),
-                        "shape" => Value::test_string("shape_string"),
+                        "shape" => Value::test_string("shape_cell_path"),
                         "span" => Value::test_record(record! {
                             "start" => Value::test_int(18),
                             "end" => Value::test_int(22),}),

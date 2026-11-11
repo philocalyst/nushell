@@ -1,6 +1,7 @@
 use nu_engine::{command_prelude::*, find_in_dirs_env, get_dirs_var_from_call};
 use nu_parser::{parse, parse_module_block, parse_module_file_or_dir, unescape_unquote_string};
 use nu_protocol::{
+    BuiltinCompletion, Completion, PositionalArg,
     engine::{FileStack, StateWorkingSet},
     report_parse_error,
     shell_error::generic::GenericError,
@@ -27,7 +28,16 @@ impl Command for NuCheck {
                 (Type::Any, Type::Bool),
             ])
             // type is string to avoid automatically canonicalizing the path
-            .optional("path", SyntaxShape::String, "File path to parse.")
+            .param(
+                PositionalArg::new("path", SyntaxShape::String)
+                    .desc("File path to parse.")
+                    .completion(Completion::Builtin(BuiltinCompletion::Path {
+                        exists: false,
+                        dirs: false,
+                        last_is_target: false,
+                    }))
+                    .optional(),
+            )
             .switch("as-module", "Parse content as module.", Some('m'))
             .switch("debug", "Show error messages.", Some('d'))
             .category(Category::Strings)

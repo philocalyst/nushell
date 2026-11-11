@@ -18,7 +18,17 @@ impl Command for Which {
 
     fn signature(&self) -> Signature {
         Signature::build("which")
-            .input_output_types(vec![(Type::Nothing, Type::table())])
+            .input_output_types(vec![(
+                Type::Nothing,
+                Type::Table(
+                    [
+                        ("command", Type::String),
+                        ("path", Type::String),
+                        ("type", Type::String),
+                    ]
+                    .into(),
+                ),
+            )])
             .allow_variants_without_examples(true)
             .param(Parameter::Rest(
                 PositionalArg::new("applications", SyntaxShape::String)

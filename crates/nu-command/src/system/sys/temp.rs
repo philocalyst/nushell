@@ -13,7 +13,18 @@ impl Command for SysTemp {
         Signature::build("sys temp")
             .filter()
             .category(Category::System)
-            .input_output_types(vec![(Type::Nothing, Type::table())])
+            // `critical` is there for the components that report one.
+            .input_output_types(vec![(
+                Type::Nothing,
+                Type::Table(
+                    [
+                        ("unit", Type::String),
+                        ("temp", Type::Float),
+                        ("high", Type::Float),
+                    ]
+                    .into(),
+                ),
+            )])
     }
 
     fn description(&self) -> &str {

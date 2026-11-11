@@ -739,7 +739,10 @@ mod tests {
 
     #[rstest]
     #[case::pipeline_end("[1 2 3] | math sum", "→ number")]
-    #[case::after_a_pipe("ls | ", "→ table")]
+    #[case::after_a_pipe(
+        "ls | ",
+        "→ table<name: string, type: string, size: filesize, modified: datetime>"
+    )]
     #[case::after_a_semicolon("[1 2 3]; ", "")]
     #[case::semicolon_in_a_comment("[1 2 3] # a;b", "→ list<int>")]
     #[case::unknown("ls | get name", "")]

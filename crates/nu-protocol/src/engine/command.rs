@@ -96,6 +96,13 @@ pub trait Command: Send + Sync + CommandClone + Any {
         Vec::new()
     }
 
+    /// For each of [`Self::examples`], in order, the flags and parameters it is about, when it
+    /// says: the help a completion shows where one of them is typed is that example. Empty when
+    /// the examples do not say, and then what they are about is read from their code.
+    fn examples_about(&self) -> Vec<Vec<String>> {
+        Vec::new()
+    }
+
     // Related terms to help with command search
     fn search_terms(&self) -> Vec<&str> {
         vec![]

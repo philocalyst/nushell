@@ -3,7 +3,7 @@ use nu_protocol::{
     ast::{
         Argument, Block, Expr, Expression, ExternalArgument, ImportPatternMember, ListItem,
         MatchPattern, PathMember, Pattern, Pipeline, PipelineElement, PipelineRedirection,
-        RecordItem, RedirectionTarget,
+        RecordItem, RedirectionTarget, Unit,
     },
     engine::StateWorkingSet,
 };
@@ -49,10 +49,18 @@ pub enum FlatShape {
     Table,
     Variable(VarId),
     VarDecl(VarId),
+    /// A number with a filesize unit, `10kb`.
+    Filesize,
+    /// A number with a duration unit, `5sec`.
+    Duration,
+    /// A member of a cell path, `name` and `0` in `$x.name.0`.
+    CellPath,
+    /// A type in a signature, `int` and `string` in `oneof<int, string>`.
+    Type,
 }
 
 impl FlatShape {
-    pub fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             FlatShape::Binary => "shape_binary",
             FlatShape::Block => "shape_block",
@@ -89,6 +97,10 @@ impl FlatShape {
             FlatShape::Table => "shape_table",
             FlatShape::Variable(_) => "shape_variable",
             FlatShape::VarDecl(_) => "shape_vardecl",
+            FlatShape::Filesize => "shape_filesize",
+            FlatShape::Duration => "shape_duration",
+            FlatShape::CellPath => "shape_cell_path",
+            FlatShape::Type => "shape_type",
         }
     }
 }
@@ -96,6 +108,150 @@ impl FlatShape {
 impl Display for FlatShape {
     fn fmt(&self, f: &mut Formatter) -> Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// A member of a cell path, which is no string or int of its own.
+fn member(member: &PathMember) -> (Span, FlatShape) {
+    match *member {
+        PathMember::String { span, .. } | PathMember::Int { span, .. } => {
+            (span, FlatShape::CellPath)
+        }
+    }
+}
+
+/// What the next word of a signature is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// A parameter, after a comma or the bracket.
+    Name,
+    /// A type, after a colon or an arrow.
+    Type,
+    /// A default value, after an equals sign.
+    Value,
+}
+
+/// Whether `c` ends a word of a signature.
+fn ends_word(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ',' | ':' | '=' | '?' | '<' | '>' | '(' | ')' | '[' | ']')
+}
+
+/// The signature `text`, which starts at `start`, in pieces: a parameter is a name, a flag is a
+/// flag, each type is a type, and what joins them is an operator, so that the choices of a
+/// `oneof<int, string>` read as two types apart. A default value is the kind of value it is
+/// written as, and a comment is left out.
+fn flatten_signature(text: &str, start: usize, output: &mut Vec<(Span, FlatShape)>) {
+    let bytes = text.as_bytes();
+    let (mut at, mut angles, mut next) = (0, 0usize, Next::Name);
+    while at < text.len() {
+        let rest = &text[at..];
+        let byte = bytes[at];
+        let (len, shape) = match byte {
+            b'#' if at == 0 || bytes[at - 1].is_ascii_whitespace() => {
+                at += rest.find('\n').unwrap_or(rest.len());
+                continue;
+            }
+            b'"' | b'\'' | b'`' => {
+                // A string runs to its closing quote; in double quotes a backslash escapes one.
+                let mut chars = rest.char_indices().skip(1);
+                let mut len = rest.len();
+                while let Some((index, c)) = chars.next() {
+                    if byte == b'"' && c == '\\' {
+                        chars.next();
+                    } else if c as u32 == u32::from(byte) {
+                        len = index + 1;
+                        break;
+                    }
+                }
+                next = Next::Name;
+                (len, FlatShape::String)
+            }
+            b'-' if rest.starts_with("->") => {
+                next = Next::Type;
+                (2, FlatShape::Operator)
+            }
+            b'-' if next != Next::Value
+                && rest[1..].starts_with(|c: char| c == '-' || c.is_alphanumeric()) =>
+            {
+                let dashes = rest.len() - rest.trim_start_matches('-').len();
+                let name = rest[dashes..].find(ends_word);
+                (
+                    dashes + name.unwrap_or(rest.len() - dashes),
+                    FlatShape::Flag,
+                )
+            }
+            b'.' if rest.starts_with("...") => (3, FlatShape::Operator),
+            b':' => {
+                next = Next::Type;
+                (1, FlatShape::Signature)
+            }
+            b'=' => {
+                next = Next::Value;
+                (1, FlatShape::Operator)
+            }
+            b'<' => {
+                angles += 1;
+                (1, FlatShape::Operator)
+            }
+            b'>' => {
+                angles = angles.saturating_sub(1);
+                if angles == 0 {
+                    next = Next::Name;
+                }
+                (1, FlatShape::Operator)
+            }
+            // The commas between the choices of a type are told apart from those between
+            // parameters.
+            b',' | b'?' if angles > 0 || byte == b'?' => (1, FlatShape::Operator),
+            b',' => {
+                next = Next::Name;
+                (1, FlatShape::Signature)
+            }
+            _ if byte.is_ascii_whitespace() || matches!(byte, b'[' | b']' | b'(' | b')') => {
+                let blank = rest.len() - rest.trim_start().len();
+                (blank.max(1), FlatShape::Signature)
+            }
+            _ => {
+                let len = (rest.find(ends_word).filter(|&len| len > 0))
+                    .unwrap_or_else(|| rest.chars().next().map_or(1, char::len_utf8));
+                let word = &rest[..len];
+                // A name in a record type, `a` in `record<a: int>`, is followed by its colon.
+                let named = rest[len..].trim_start_matches([' ', '\t']).starts_with(':');
+                let shape = match next {
+                    Next::Value => {
+                        next = Next::Name;
+                        match word {
+                            "true" | "false" => FlatShape::Bool,
+                            "null" => FlatShape::Nothing,
+                            _ if word.starts_with('$') => FlatShape::Variable(VarId::new(0)),
+                            _ if word.parse::<i64>().is_ok() => FlatShape::Int,
+                            _ if word.starts_with(|c: char| {
+                                c.is_ascii_digit() || matches!(c, '-' | '.')
+                            }) && word.parse::<f64>().is_ok() =>
+                            {
+                                FlatShape::Float
+                            }
+                            // A number with a unit.
+                            _ if word.starts_with(|c: char| c.is_ascii_digit()) => FlatShape::Int,
+                            _ => FlatShape::Signature,
+                        }
+                    }
+                    Next::Type if !named => {
+                        // `list<int>` goes on with its types; a plain one ends the annotation.
+                        if angles == 0 && !rest[len..].starts_with('<') {
+                            next = Next::Name;
+                        }
+                        FlatShape::Type
+                    }
+                    Next::Name if angles > 0 && !named => FlatShape::Type,
+                    _ => FlatShape::Signature,
+                };
+                (len, shape)
+            }
+        };
+        let len = len.max(1);
+        output.push((Span::new(start + at, start + at + len), shape));
+        at += len;
     }
 }
 
@@ -414,22 +570,17 @@ fn flatten_expression_into(
                 flatten_expression_into(working_set, expr, output);
             }
         }
-        Expr::ValueWithUnit(value) => {
-            flatten_expression_into(working_set, &value.expr, output);
-            output.push((value.unit.span, FlatShape::String));
-        }
+        // A number and its unit are one value.
+        Expr::ValueWithUnit(value) => output.push(match value.unit.item {
+            Unit::Filesize(_) => (expr.span, FlatShape::Filesize),
+            _ => (expr.span, FlatShape::Duration),
+        }),
         Expr::CellPath(cell_path) => {
-            output.extend(cell_path.members.iter().map(|member| match *member {
-                PathMember::String { span, .. } => (span, FlatShape::String),
-                PathMember::Int { span, .. } => (span, FlatShape::Int),
-            }));
+            output.extend(cell_path.members.iter().map(member));
         }
         Expr::FullCellPath(cell_path) => {
             flatten_expression_into(working_set, &cell_path.head, output);
-            output.extend(cell_path.tail.iter().map(|member| match *member {
-                PathMember::String { span, .. } => (span, FlatShape::String),
-                PathMember::Int { span, .. } => (span, FlatShape::Int),
-            }));
+            output.extend(cell_path.tail.iter().map(member));
         }
         Expr::ImportPattern(import_pattern) => {
             output.push((import_pattern.head.span, FlatShape::String));
@@ -452,10 +603,10 @@ fn flatten_expression_into(
                 flatten_expression_into(working_set, f, output);
             }
             if let Some(s) = &range.next {
-                output.push((range.operator.next_op_span, FlatShape::Operator));
+                output.push((range.operator.next_op_span, FlatShape::Range));
                 flatten_expression_into(working_set, s, output);
             }
-            output.push((range.operator.span, FlatShape::Operator));
+            output.push((range.operator.span, FlatShape::Range));
             if let Some(t) = &range.to {
                 flatten_expression_into(working_set, t, output);
             }
@@ -610,7 +761,10 @@ fn flatten_expression_into(
             flatten_expression_into(working_set, &kw.expr, output);
         }
         Expr::Operator(_) => output.push((expr.span, FlatShape::Operator)),
-        Expr::Signature(_) => output.push((expr.span, FlatShape::Signature)),
+        Expr::Signature(_) => match std::str::from_utf8(working_set.get_span_contents(expr.span)) {
+            Ok(text) => flatten_signature(text, expr.span.start, output),
+            Err(_) => output.push((expr.span, FlatShape::Signature)),
+        },
         Expr::String(_) => output.push((expr.span, FlatShape::String)),
         Expr::RawString(_) => output.push((expr.span, FlatShape::RawString)),
         Expr::Table(table) => {

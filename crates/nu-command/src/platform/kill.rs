@@ -19,11 +19,11 @@ impl Command for Kill {
         let signature = Signature::build("kill")
             .input_output_types(vec![(Type::Nothing, Type::Any)])
             .allow_variants_without_examples(true)
-            .rest(
-                "pid",
-                SyntaxShape::Int,
-                "Process ids of processes that are to be killed.",
-            )
+            .param(Parameter::Rest(
+                PositionalArg::new("pid", SyntaxShape::Int)
+                    .desc("Process ids of processes that are to be killed.")
+                    .completion(Completion::Builtin(BuiltinCompletion::Process)),
+            ))
             .switch("force", "Forcefully kill the process.", Some('f'))
             .switch("quiet", "Won't print anything to the console.", Some('q'))
             .category(Category::Platform);

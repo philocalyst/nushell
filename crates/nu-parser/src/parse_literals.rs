@@ -301,11 +301,11 @@ pub fn parse_float(working_set: &mut StateWorkingSet, span: Span) -> Expression 
 }
 
 pub fn parse_number(working_set: &mut StateWorkingSet, span: Span) -> Expression {
-    let starting_error_count = working_set.parse_errors.len();
+    let starting_error_count = working_set.checkpoint();
 
     let result = parse_int(working_set, span);
     // An int too large for 64 bits isn't retried as a float, which would lose precision.
-    if working_set.parse_errors.len() == starting_error_count
+    if working_set.parse_errors.len() == starting_error_count.errors
         || matches!(
             read_int(working_set.get_span_contents(span)),
             IntLiteral::OutOfRange { .. }
@@ -315,14 +315,14 @@ pub fn parse_number(working_set: &mut StateWorkingSet, span: Span) -> Expression
     }
     // Any other token may still be a float. One with bad radix digits isn't, and ends as
     // "expected number", so that a word like `0xdump` can still name a command.
-    working_set.parse_errors.truncate(starting_error_count);
+    working_set.rollback(starting_error_count);
 
     let result = parse_float(working_set, span);
 
-    if starting_error_count == working_set.parse_errors.len() {
+    if starting_error_count.errors == working_set.parse_errors.len() {
         return result;
     }
-    working_set.parse_errors.truncate(starting_error_count);
+    working_set.rollback(starting_error_count);
 
     working_set.error(ParseError::Expected("number", span));
     garbage(working_set, span)
@@ -337,7 +337,7 @@ pub(crate) fn has_range_operator(token: &[u8]) -> bool {
 
 pub fn parse_range(working_set: &mut StateWorkingSet, span: Span) -> Option<Expression> {
     trace!("parsing: range");
-    let starting_error_count = working_set.parse_errors.len();
+    let starting_error_count = working_set.checkpoint();
 
     // Range follows the following syntax: [<from>][<next_operator><next>]<range_operator>[<to>]
     //   where <next_operator> is ".."
@@ -500,7 +500,7 @@ pub fn parse_range(working_set: &mut StateWorkingSet, span: Span) -> Option<Expr
         (None, span)
     };
 
-    if working_set.parse_errors.len() != starting_error_count {
+    if working_set.parse_errors.len() != starting_error_count.errors {
         return None;
     }
 
@@ -545,14 +545,14 @@ pub(crate) fn parse_dollar_expr(
     } else if contents.starts_with(b"$.") {
         parse_simple_cell_path(working_set, Span::new(span.start + 2, span.end))
     } else {
-        let starting_error_count = working_set.parse_errors.len();
+        let starting_error_count = working_set.checkpoint();
 
         if has_range_operator(contents)
             && let Some(expr) = parse_range(working_set, span)
         {
             expr
         } else {
-            working_set.parse_errors.truncate(starting_error_count);
+            working_set.rollback(starting_error_count);
             parse_full_cell_path(working_set, None, span, input_type)
         }
     }
@@ -627,7 +627,7 @@ pub fn parse_paren_expr(
     span: Span,
     shape: &SyntaxShape,
 ) -> Expression {
-    let starting_error_count = working_set.parse_errors.len();
+    let starting_error_count = working_set.checkpoint();
 
     if has_range_operator(working_set.get_span_contents(span))
         && let Some(expr) = parse_range(working_set, span)
@@ -635,7 +635,7 @@ pub fn parse_paren_expr(
         return expr;
     }
 
-    working_set.parse_errors.truncate(starting_error_count);
+    working_set.rollback(starting_error_count);
 
     if let SyntaxShape::Signature = shape {
         return parse_signature(working_set, span, false);
@@ -648,12 +648,12 @@ pub fn parse_paren_expr(
     let starting_scope_count = working_set.delta.scope.len();
     let fcp_expr = parse_full_cell_path(working_set, None, span, None);
     let fcp_error_count = working_set.parse_errors.len();
-    if fcp_error_count > starting_error_count {
-        let malformed_subexpr = working_set.parse_errors[starting_error_count..]
+    if fcp_error_count > starting_error_count.errors {
+        let malformed_subexpr = working_set.parse_errors[starting_error_count.errors..]
             .first()
             .is_some_and(is_unmatched_paren);
         if malformed_subexpr {
-            working_set.parse_errors.truncate(starting_error_count);
+            working_set.rollback(starting_error_count);
             while working_set.delta.scope.len() > starting_scope_count {
                 working_set.exit_scope();
             }
@@ -685,6 +685,16 @@ pub fn parse_brace_expr(
     // and then revisit the parsing.
 
     if span.end <= (span.start + 1) {
+        // A lone `{` where a record may go is a record with no keys yet, to the probe.
+        if !matches!(
+            shape,
+            SyntaxShape::Closure(_)
+                | SyntaxShape::Block
+                | SyntaxShape::MatchBlock
+                | SyntaxShape::RowCondition
+        ) {
+            crate::probe::record(working_set, span, &[]);
+        }
         working_set.error(ParseError::ExpectedWithStringMsg(
             format!("non-block value: {shape}"),
             span,
@@ -1094,10 +1104,10 @@ pub fn parse_cell_path(
         let single_char = rest.is_empty();
 
         if let TokenType::PathMember = expected_token {
-            let starting_error_count = working_set.parse_errors.len();
+            let starting_error_count = working_set.checkpoint();
 
             let expr = parse_int(working_set, path_element.span);
-            working_set.parse_errors.truncate(starting_error_count);
+            working_set.rollback(starting_error_count);
 
             match expr {
                 Expression {
@@ -1271,6 +1281,7 @@ pub fn parse_full_cell_path(
             trace!("parsing: $variable head of full cell path");
 
             let out = parse_variable_expr(working_set, head.span, input_type);
+            crate::probe::variable(working_set, head.span, input_type);
 
             tokens.next();
 
@@ -1291,6 +1302,7 @@ pub fn parse_full_cell_path(
         };
 
         let tail = parse_cell_path(working_set, tokens, expect_dot);
+        crate::probe::members(working_set, full_cell_span, &head, &tail, input_type);
         let ty = if !tail.is_empty() {
             if nu_experimental::CELL_PATH_TYPES.get() {
                 head.ty

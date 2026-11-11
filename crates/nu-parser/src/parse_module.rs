@@ -107,7 +107,7 @@ pub fn parse_export_in_block(
         "export type" => parse_type_alias(working_set, lite_command).0,
         _ => {
             if let Some(decl_id) = working_set.find_decl(full_name.as_bytes()) {
-                let starting_error_count = working_set.parse_errors.len();
+                let starting_error_count = working_set.checkpoint();
                 let ParsedInternalCall {
                     call,
                     output,
@@ -129,7 +129,7 @@ pub fn parse_export_in_block(
                         output,
                     )]);
                 }
-                working_set.parse_errors.truncate(starting_error_count);
+                working_set.rollback(starting_error_count);
                 working_set.error(ParseError::UnexpectedKeyword(
                     full_name.into(),
                     lite_command.parts[0],

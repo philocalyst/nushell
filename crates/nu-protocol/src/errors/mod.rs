@@ -16,7 +16,7 @@ pub use config::{ConfigError, ConfigWarning};
 pub use labeled_error::{
     DEFAULT_ERROR_CONTEXT, ErrorLabel, ErrorSource, LabeledError, truncated_source_window,
 };
-pub use parse_error::{DidYouMean, ParseError};
+pub use parse_error::{DidYouMean, Fix, MISTAKEN_OPERATORS, ParseError};
 pub use parse_warning::ParseWarning;
 pub use report_error::{
     ReportMode, Reportable, format_cli_error, report_parse_error, report_parse_warning,

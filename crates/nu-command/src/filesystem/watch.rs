@@ -77,10 +77,15 @@ impl Command for Watch {
                     ),
                 ),
             ])
-            .required(
-                "path",
-                SyntaxShape::Filepath,
-                "The path to watch. Can be a file or directory.",
+            .param(
+                PositionalArg::new("path", SyntaxShape::Filepath)
+                    .desc("The path to watch. Can be a file or directory.")
+                    .completion(Completion::Builtin(BuiltinCompletion::Path {
+                        exists: true,
+                        dirs: false,
+                        last_is_target: false,
+                    }))
+                    .required(),
             )
             .optional(
                 "closure",

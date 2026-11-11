@@ -37,12 +37,30 @@ impl Command for Du {
 
     fn signature(&self) -> Signature {
         Signature::build("du")
-            .input_output_types(vec![(Type::Nothing, Type::table())])
+            .input_output_types(vec![(
+                Type::Nothing,
+                Type::Table(
+                    [
+                        ("path", Type::String),
+                        ("apparent", Type::Filesize),
+                        ("physical", Type::Filesize),
+                    ]
+                    .into(),
+                ),
+            )])
             .allow_variants_without_examples(true)
-            .rest(
-                "path",
-                SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]),
-                "Starting directory.",
+            .param(
+                PositionalArg::new(
+                    "path",
+                    SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]),
+                )
+                .desc("Starting directory.")
+                .completion(Completion::Builtin(BuiltinCompletion::Path {
+                    exists: true,
+                    dirs: false,
+                    last_is_target: false,
+                }))
+                .rest(),
             )
             .switch(
                 "deref",

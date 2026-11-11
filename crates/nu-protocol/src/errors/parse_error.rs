@@ -775,7 +775,85 @@ pub enum ParseError {
     AttributeRequiresDefinition(#[label("must be followed by a definition")] Span),
 }
 
+/// Operators other languages have, what Nushell writes for them, and the help that says so. The
+/// parser reports one with [`ParseError::UnknownOperator`], and [`ParseError::fix`] offers the
+/// replacement.
+pub const MISTAKEN_OPERATORS: &[(&str, &str, &str)] = &[
+    (
+        "^",
+        "**",
+        "Use '**' for exponentiation or 'bit-xor' for bitwise XOR.",
+    ),
+    (
+        "pow",
+        "**",
+        "Use '**' for exponentiation or 'bit-xor' for bitwise XOR.",
+    ),
+    ("is", "==", "Did you mean '=='?"),
+    ("eq", "==", "Did you mean '=='?"),
+    ("equals", "==", "Did you mean '=='?"),
+    ("ne", "!=", "Did you mean '!='?"),
+    ("!==", "!=", "Did you mean '!='?"),
+    ("<>", "!=", "Did you mean '!='?"),
+    ("gt", ">", "Did you mean '>'?"),
+    ("lt", "<", "Did you mean '<'?"),
+    ("ge", ">=", "Did you mean '>='?"),
+    ("gte", ">=", "Did you mean '>='?"),
+    ("=>", ">=", "Did you mean '>='?"),
+    ("le", "<=", "Did you mean '<='?"),
+    ("lte", "<=", "Did you mean '<='?"),
+    ("=<", "<=", "Did you mean '<='?"),
+    ("matches", "=~", "Did you mean '=~'?"),
+    ("notin", "not-in", "Did you mean 'not-in'?"),
+    ("startswith", "starts-with", "Did you mean 'starts-with'?"),
+    ("endswith", "ends-with", "Did you mean 'ends-with'?"),
+    ("AND", "and", "Did you mean 'and'?"),
+    ("OR", "or", "Did you mean 'or'?"),
+    ("===", "==", "Did you mean '=='?"),
+    (
+        "=",
+        "==",
+        "Did you mean '=='? A condition compares, it does not assign.",
+    ),
+    ("contains", "has", "Did you mean 'has'?"),
+    ("%", "mod", "Did you mean 'mod'?"),
+    ("&", "bit-and", "Did you mean 'bit-and'?"),
+    ("<<", "bit-shl", "Did you mean 'bit-shl'?"),
+    (">>", "bit-shr", "Did you mean 'bit-shr'?"),
+    ("bits-and", "bit-and", "Did you mean 'bit-and'?"),
+    ("bits-xor", "bit-xor", "Did you mean 'bit-xor'?"),
+    ("bits-or", "bit-or", "Did you mean 'bit-or'?"),
+    ("bits-shl", "bit-shl", "Did you mean 'bit-shl'?"),
+    ("bits-shr", "bit-shr", "Did you mean 'bit-shr'?"),
+];
+
+/// What would resolve a [`ParseError`]: write one of `replacements` over `span`. The first is
+/// the likeliest; an editor offers them as corrections, marks `span`, and a language server
+/// turns them into quick fixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fix {
+    pub span: Span,
+    pub replacements: Vec<&'static str>,
+}
+
 impl ParseError {
+    /// The replacement that would resolve this error, when the parser knows one.
+    pub fn fix(&self) -> Option<Fix> {
+        let (span, replacements) = match self {
+            // `&&` ends a command in a shell, and joins conditions in other languages.
+            ParseError::ShellAndAnd(span) => (*span, vec!["and", ";"]),
+            ParseError::ShellOrOr(span) => (*span, vec!["or"]),
+            ParseError::UnknownOperator(operator, _, span) => {
+                let (_, meant, _) = MISTAKEN_OPERATORS
+                    .iter()
+                    .find(|(mistaken, ..)| mistaken == operator)?;
+                (*span, vec![*meant])
+            }
+            _ => return None,
+        };
+        Some(Fix { span, replacements })
+    }
+
     /// Span covering the first `len` bytes of `span` (clamped to `span.end`).
     ///
     /// Used when labeling a multi-byte construct's opening delimiter.

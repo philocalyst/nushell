@@ -27,6 +27,7 @@ impl Command for ExportUse {
                     .desc("Module or module file.")
                     .completion(Completion::Builtin(BuiltinCompletion::NuFile {
                         std_virtual_path: true,
+                        exists: false,
                     })),
             ))
             .param(Parameter::Rest(

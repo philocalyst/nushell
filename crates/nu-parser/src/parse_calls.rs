@@ -417,6 +417,7 @@ pub fn parse_external_call(
         .iter()
         .map(|&span| parse_external_arg(working_set, span))
         .collect();
+    crate::probe::external(working_set, head_span, &spans[1..]);
 
     Expression::new(
         working_set,
@@ -690,8 +691,12 @@ fn first_kw_idx(
         {
             for (span_idx, &span) in spans.iter().enumerate().skip(spans_idx) {
                 let contents = working_set.get_span_contents(span);
-
-                if contents == kw {
+                // Where the line is probed, a word still being written there is the keyword it
+                // begins (`if c { } el⌶`).
+                let typing = working_set.probe_at() == Some(span.end)
+                    && !contents.is_empty()
+                    && kw.starts_with(contents);
+                if contents == kw || typing {
                     return (Some(idx), span_idx);
                 }
             }
@@ -793,7 +798,7 @@ pub(crate) fn parse_oneof(
         .chain(possible_shapes.iter().filter(|shape| deferred(shape)));
     let starting_scope_count = working_set.delta.scope.len();
     for shape in ordered_shapes {
-        let starting_error_count = working_set.parse_errors.len();
+        let starting_error_count = working_set.checkpoint();
         let starting_warning_count = working_set.parse_warnings.len();
         let starting_compile_error_count = working_set.compile_errors.len();
         *spans_idx = starting_spans_idx;
@@ -802,7 +807,7 @@ pub(crate) fn parse_oneof(
             false => crate::parser::parse_value(working_set, spans[*spans_idx], shape, input_type),
         };
 
-        let new_errors = &working_set.parse_errors[starting_error_count..];
+        let new_errors = &working_set.parse_errors[starting_error_count.errors..];
         // no new errors found means success
         let Some(first_error_offset) = new_errors.iter().map(|e| e.span().start).min() else {
             return value;
@@ -840,8 +845,11 @@ pub(crate) fn parse_oneof(
         // Discard this attempt's errors, warnings and compile errors. A later shape parses the
         // same code again, or the attempt's closures go unused, so keeping them would report
         // duplicate or spurious problems. If every shape fails, the best guess's errors and
-        // warnings are restored below.
-        working_set.parse_errors.truncate(starting_error_count);
+        // warnings are restored below. What the probe recorded stays: each shape is a way the
+        // line may still be written.
+        working_set
+            .parse_errors
+            .truncate(starting_error_count.errors);
         working_set.parse_warnings.truncate(starting_warning_count);
         working_set
             .compile_errors
@@ -1156,7 +1164,7 @@ pub fn parse_internal_call(
     while spans_idx < spans.len() {
         let arg_span = spans[spans_idx];
 
-        let starting_error_count = working_set.parse_errors.len();
+        let starting_error_count = working_set.checkpoint();
 
         // If we've seen --, skip all flag parsing and go straight to positional parsing
         if !end_of_options {
@@ -1188,7 +1196,7 @@ pub fn parse_internal_call(
                 }
                 LongFlagParseResult::UnknownFlag(long_name) => {
                     if forwards_unknown_flag(working_set.get_span_contents(arg_span)) {
-                        working_set.parse_errors.truncate(starting_error_count);
+                        working_set.rollback(starting_error_count);
                         let arg = parse_unknown_arg(working_set, arg_span, &signature);
 
                         call.add_unknown(arg);
@@ -1207,7 +1215,7 @@ pub fn parse_internal_call(
 
         // Only try short flag parsing if we haven't seen -- yet
         if !end_of_options {
-            let starting_error_count = working_set.parse_errors.len();
+            let starting_error_count = working_set.checkpoint();
 
             // Check if we're on a short flag or group of short flags, if so, parse
             let short_flags = parse_short_flags(
@@ -1219,12 +1227,12 @@ pub fn parse_internal_call(
             );
 
             if let Some(short_flags) = short_flags {
-                if working_set.parse_errors[starting_error_count..]
+                if working_set.parse_errors[starting_error_count.errors..]
                     .iter()
                     .any(|x| matches!(x, ParseError::UnknownFlag(_, _, _, _)))
                     && forwards_unknown_flag(working_set.get_span_contents(arg_span))
                 {
-                    working_set.parse_errors.truncate(starting_error_count);
+                    working_set.rollback(starting_error_count);
                     let arg = parse_unknown_arg(working_set, arg_span, &signature);
 
                     call.add_unknown(arg);
@@ -1436,6 +1444,13 @@ pub fn parse_internal_call(
         // Parse a positional arg if there is one
         if let Some(positional) = signature.get_positional(positional_idx) {
             let end = calculate_end_span(working_set, &signature, spans, spans_idx, positional_idx);
+            crate::probe::cut_short(
+                working_set,
+                &positional.shape,
+                &spans[spans_idx..],
+                end.saturating_sub(spans_idx),
+                input_type,
+            );
 
             // Missing arguments before next keyword
             if end == spans_idx {
@@ -1515,7 +1530,7 @@ pub fn parse_internal_call(
                     // release, nor would it be appropriate to include in a patch release.
                     let expr = match special_cmd {
                         Some(SpecialCmd::Def) if &positional.name == "block" => {
-                            let starting_error_count = working_set.parse_errors.len();
+                            let starting_error_count = working_set.checkpoint();
 
                             let out = crate::parse_expressions::parse_closure_expression(
                                 working_set,
@@ -1529,7 +1544,7 @@ pub fn parse_internal_call(
                             } else {
                                 // on failure, we fallback to the normal code path to keep errors
                                 // the same as before this hack
-                                working_set.parse_errors.truncate(starting_error_count);
+                                working_set.rollback(starting_error_count);
                                 parse_multispan_value(
                                     working_set,
                                     &spans[..end],
@@ -1661,6 +1676,15 @@ pub fn parse_internal_call(
             working_set.warning(warning);
         });
 
+    crate::probe::call(
+        working_set,
+        command_span,
+        spans,
+        &call,
+        &signature,
+        input_type,
+    );
+
     if signature.creates_scope {
         working_set.exit_scope();
     }
@@ -1720,6 +1744,7 @@ pub fn parse_call(
     // resolution, even when an internal command with the same name exists.
     if call_sigil == Some(b'^') {
         trace!("parsing: forced external call");
+        crate::probe::head(working_set, resolution_spans, 1, None, input_type);
         return parse_external_call(working_set, resolution_spans, call_span);
     }
 
@@ -1773,6 +1798,13 @@ pub fn parse_call(
     } else {
         find_longest_decl(working_set, resolution_spans)
     };
+    crate::probe::head(
+        working_set,
+        &resolution_spans[cmd_start..],
+        pos.saturating_sub(cmd_start).max(1),
+        maybe_decl_id,
+        input_type,
+    );
 
     if let Some(decl_id) = maybe_decl_id {
         // Before the internal parsing we check if there is no let or alias declarations
@@ -1805,6 +1837,7 @@ pub fn parse_call(
 
                 let mut head = head.clone();
                 head.span = Span::concat(&resolution_spans[cmd_start..pos]); // replacing the spans preserves syntax highlighting
+                crate::probe::external(working_set, head.span, &resolution_spans[pos..]);
 
                 let mut final_args = args.clone().into_vec();
                 for arg_span in &resolution_spans[pos..] {
@@ -1869,13 +1902,16 @@ pub fn parse_call(
         trace!("parsing: range {bytes:?}");
         if let (Some(b'.'), Some(b'.')) = (bytes.first(), bytes.get(1)) {
             trace!("-- found leading range indicator");
-            let starting_error_count = working_set.parse_errors.len();
+            let starting_error_count = working_set.checkpoint();
 
             if let Some(range_expr) = crate::parser::parse_range(working_set, spans[0]) {
                 trace!("-- successfully parsed range");
+                if let Some(&word) = spans.get(1) {
+                    crate::probe::operator_word(working_set, &range_expr, word, input_type);
+                }
                 return range_expr;
             }
-            working_set.parse_errors.truncate(starting_error_count);
+            working_set.rollback(starting_error_count);
         }
         trace!("parsing: external call");
 

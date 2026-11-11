@@ -168,6 +168,12 @@ impl Command for KnownExternal {
             .map(CustomExample::to_example)
             .collect()
     }
+
+    fn examples_about(&self) -> Vec<Vec<String>> {
+        (self.examples.iter())
+            .map(|example| example.about.clone().unwrap_or_default())
+            .collect()
+    }
 }
 
 /// Transform the args from an `ast::Call` onto a `run-external` call

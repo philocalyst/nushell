@@ -4,9 +4,10 @@ use crate::{
     TypeAlias, TypeAliasId, TypeSet, Value, VarId, VirtualPathId,
     ast::Block,
     engine::{
-        BoundNames, BracketTable, CachedFile, Command, CommandType, EngineState, OverlayFrame,
-        ScopeBindings, ScopeFrame, StateDelta, Variable, VirtualPath, Visibility, VisibilityStack,
-        description::build_desc, engine_state::FileHint, signature_cache::SignatureCache,
+        BoundNames, BracketTable, CachedFile, Command, CommandType, EngineState, Expect, Expected,
+        OverlayFrame, Probe, ScopeBindings, ScopeFrame, StateDelta, Variable, VirtualPath,
+        Visibility, VisibilityStack, description::build_desc, engine_state::FileHint,
+        signature_cache::SignatureCache,
     },
 };
 use core::panic;
@@ -24,6 +25,14 @@ use crate::{PluginIdentity, PluginRegistryItem, RegisteredPlugin};
 ///
 /// This working set is created by the parser as a way of handling declarations and scope changes that
 /// may later be merged or dropped (and not merged) depending on the needs of the code calling the parser.
+/// A point of a parse to go back to: see [`StateWorkingSet::checkpoint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Checkpoint {
+    /// How many errors were reported.
+    pub errors: usize,
+    expects: usize,
+}
+
 pub struct StateWorkingSet<'a> {
     pub permanent_state: &'a EngineState,
     pub delta: StateDelta,
@@ -55,6 +64,9 @@ pub struct StateWorkingSet<'a> {
     /// has closed the body's scope, so the closure parser leaves the closure with this span
     /// uncompiled instead of compiling it a first time.
     pub def_body_span: Option<Span>,
+    /// The offset the parser is asked about, and what it expected there (see
+    /// [`Probe`](crate::engine::Probe)). `None` for an ordinary parse, which records nothing.
+    pub probe: Option<Box<Probe>>,
     /// The index in `delta.files` of the file the last span lookup found (see
     /// [`Self::get_span_contents`]).
     last_file_hit: FileHint,
@@ -82,8 +94,100 @@ impl<'a> StateWorkingSet<'a> {
             lex_once: true,
             bracket_tables: vec![],
             def_body_span: None,
+            probe: None,
             last_file_hit: FileHint::default(),
         }
+    }
+
+    /// The probed offset, when this parse has a probe.
+    /// Where the parse is: its errors and the probe's records so far, to go back to with
+    /// [`rollback`](Self::rollback) when an attempt at a reading is abandoned, so that neither
+    /// outlives the attempt.
+    pub fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            errors: self.parse_errors.len(),
+            expects: self.probe.as_ref().map_or(0, |probe| probe.found.len()),
+        }
+    }
+
+    /// Goes back to `checkpoint`, forgetting the errors and records made since.
+    pub fn rollback(&mut self, checkpoint: Checkpoint) {
+        self.parse_errors.truncate(checkpoint.errors);
+        if let Some(probe) = self.probe.as_mut() {
+            probe.found.truncate(checkpoint.expects);
+        }
+    }
+
+    pub fn probe_at(&self) -> Option<usize> {
+        self.probe.as_ref().map(|probe| probe.at)
+    }
+
+    /// Records that `what` may be written at the probe, replacing `span`, as part of the
+    /// construct `within` that `input` flows into. Nothing happens without a probe, when `span`
+    /// does not touch it, or when `within` is in another source; `what` is only built when it is
+    /// recorded. The first time
+    /// something is recorded, the variables in scope are recorded with it.
+    pub fn expect(
+        &mut self,
+        span: Span,
+        within: Span,
+        input: Option<&Type>,
+        what: impl FnOnce() -> Expect,
+    ) {
+        let Some(probe) = self.probe.as_deref() else {
+            return;
+        };
+        if !crate::engine::probe::touches(span, probe.at)
+            || !crate::engine::probe::touches(probe.source, within.start)
+        {
+            return;
+        }
+        let scope = self
+            .probe
+            .as_ref()
+            .is_some_and(|probe| probe.scope.is_empty())
+            .then(|| self.visible_variables());
+        if let Some(probe) = self.probe.as_mut() {
+            if let Some(scope) = scope {
+                probe.scope = scope;
+            }
+            let found = Expected {
+                span,
+                within: Span::new(within.start.min(span.start), within.end.max(span.end)),
+                input: input.cloned().unwrap_or(Type::Any),
+                what: what(),
+            };
+            // A construct the parser reads twice says the same thing twice.
+            if !probe.found.contains(&found) {
+                probe.found.push(found);
+            }
+        }
+    }
+
+    /// The variables visible where the parser is, innermost first, each name once: what
+    /// [`find_variable`](Self::find_variable) would find for each of them.
+    pub fn visible_variables(&self) -> Vec<(Vec<u8>, VarId)> {
+        let mut removed_overlays = vec![];
+        let mut overlay_frames = Vec::new();
+        for scope_frame in self.delta.scope.iter().rev() {
+            overlay_frames.extend(scope_frame.active_overlays(&mut removed_overlays).rev());
+        }
+        overlay_frames.extend(
+            self.permanent_state
+                .active_overlays(&removed_overlays)
+                .rev(),
+        );
+
+        let mut seen = HashSet::new();
+        let mut visible = Vec::new();
+        for overlay_frame in overlay_frames {
+            for (name, var_id) in &overlay_frame.vars {
+                if seen.insert(name.clone()) && self.find_variable(name) == Some(*var_id) {
+                    visible.push((name.clone(), *var_id));
+                }
+            }
+        }
+        visible
     }
 
     pub fn permanent(&self) -> &EngineState {

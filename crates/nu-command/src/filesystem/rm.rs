@@ -50,7 +50,19 @@ impl Command for Rm {
                     ),
                 ),
             ])
-            .rest("paths", SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]), "The file paths(s) to remove.")
+            .param(
+                PositionalArg::new(
+                    "paths",
+                    SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]),
+                )
+                .desc("The file paths(s) to remove.")
+                .completion(Completion::Builtin(BuiltinCompletion::Path {
+                        exists: true,
+                        dirs: false,
+                        last_is_target: false,
+                    }))
+                .rest(),
+            )
             .switch(
                 "trash",
                 "Move to the platform's trash instead of permanently deleting. not used on android and ios.",

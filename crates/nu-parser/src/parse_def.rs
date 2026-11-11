@@ -134,11 +134,11 @@ pub fn parse_def_predecl(working_set: &mut StateWorkingSet, spans: &[Span]) {
         }
     }
 
-    let starting_error_count = working_set.parse_errors.len();
+    let starting_error_count = working_set.checkpoint();
 
     working_set.enter_scope();
     let sig = parse_full_signature(working_set, &spans[signature_pos..], is_extern);
-    working_set.parse_errors.truncate(starting_error_count);
+    working_set.rollback(starting_error_count);
     working_set.exit_scope();
 
     let Some(mut signature) = sig.as_signature() else {
@@ -194,7 +194,7 @@ pub fn parse_for(working_set: &mut StateWorkingSet, lite_command: &LiteCommand) 
         return garbage(working_set, spans[0]);
     };
 
-    let starting_error_count = working_set.parse_errors.len();
+    let starting_error_count = working_set.checkpoint();
     working_set.enter_scope();
     let ParsedInternalCall {
         call,
@@ -211,7 +211,7 @@ pub fn parse_for(working_set: &mut StateWorkingSet, lite_command: &LiteCommand) 
 
     if working_set
         .parse_errors
-        .get(starting_error_count..)
+        .get(starting_error_count.errors..)
         .is_none_or(|new_errors| {
             new_errors
                 .iter()
@@ -481,7 +481,7 @@ fn parse_def_inner(
         return garbage_result(working_set);
     }
 
-    let starting_error_count = working_set.parse_errors.len();
+    let starting_error_count = working_set.checkpoint();
     // The body is the last word; this compiles it below, after closing its scope.
     let outer_def_body_span =
         std::mem::replace(&mut working_set.def_body_span, rest_spans.last().copied());
@@ -501,7 +501,7 @@ fn parse_def_inner(
 
     if working_set
         .parse_errors
-        .get(starting_error_count..)
+        .get(starting_error_count.errors..)
         .is_none_or(|new_errors| {
             new_errors
                 .iter()

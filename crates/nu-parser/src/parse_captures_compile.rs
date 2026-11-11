@@ -815,6 +815,19 @@ fn capture_binding_is_current(working_set: &StateWorkingSet, var_id: VarId, span
     working_set.find_variable(name) == Some(var_id)
 }
 
+/// Adds `contents` as the file `fname` (`source` without a name) and gives its span: that of the
+/// file already there when it is the same one.
+pub(crate) fn add_source(
+    working_set: &mut StateWorkingSet,
+    fname: Option<&str>,
+    contents: &[u8],
+) -> Span {
+    let fname = fname.map(nu_path::expand_to_real_path);
+    let fname = fname.as_deref().map(|p| p.to_string_lossy());
+    let file_id = working_set.add_file(fname.as_deref().unwrap_or("source"), contents);
+    working_set.get_span_for_file(file_id)
+}
+
 fn parse_with_block_cache(
     working_set: &mut StateWorkingSet,
     fname: Option<&str>,
@@ -824,14 +837,7 @@ fn parse_with_block_cache(
 ) -> Arc<Block> {
     trace!("parse");
 
-    let file_id = {
-        let fname = fname.map(nu_path::expand_to_real_path);
-        let fname = fname.as_deref().map(|p| p.to_string_lossy());
-        let name = fname.as_deref().unwrap_or("source");
-        working_set.add_file(name, contents)
-    };
-
-    let new_span = working_set.get_span_for_file(file_id);
+    let new_span = add_source(working_set, fname, contents);
 
     // Reuse when scoped-ness matches and free vars still bind to these VarIds. An unscoped block's
     // names are bound again where they're missing, as in `do { source x.nu }; source x.nu`.

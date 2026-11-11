@@ -24,7 +24,16 @@ impl Command for Cd {
         Signature::build("cd")
             .input_output_types(vec![(Type::Nothing, Type::Nothing)])
             .switch("physical", "Use the physical directory structure; resolve symbolic links before processing instances of ..", Some('P'))
-            .optional("path", SyntaxShape::Directory, "The path to change to.")
+            .param(
+                PositionalArg::new("path", SyntaxShape::Directory)
+                    .desc("The path to change to.")
+                    .completion(Completion::Builtin(BuiltinCompletion::Path {
+                        exists: true,
+                        dirs: true,
+                        last_is_target: false,
+                    }))
+                    .optional(),
+            )
             .allow_variants_without_examples(true)
             .category(Category::FileSystem)
     }

@@ -157,10 +157,34 @@ impl Command for Ls {
 
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build("ls")
-            .input_output_types(vec![(Type::Nothing, Type::table())])
+            // `--long` adds columns that depend on the platform.
+            .input_output_types(vec![(
+                Type::Nothing,
+                Type::Table(
+                    [
+                        ("name", Type::String),
+                        ("type", Type::String),
+                        ("size", Type::Filesize),
+                        ("modified", Type::Date),
+                    ]
+                    .into(),
+                ),
+            )])
             // LsGlobPattern is similar to string, it won't auto-expand
             // and we use it to track if the user input is quoted.
-            .rest("pattern", SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]), "The glob pattern to use.")
+            .param(
+                PositionalArg::new(
+                    "pattern",
+                    SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]),
+                )
+                .desc("The glob pattern to use.")
+                .completion(Completion::Builtin(BuiltinCompletion::Path {
+                        exists: true,
+                        dirs: false,
+                        last_is_target: false,
+                    }))
+                .rest(),
+            )
             .switch("all", "Show hidden files.", Some('a'))
             .switch(
                 "long",
